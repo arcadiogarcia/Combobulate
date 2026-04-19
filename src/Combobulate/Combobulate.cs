@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using Combobulate.Caching;
 using Combobulate.Parsing;
 
 #if WINAPPSDK
@@ -67,7 +68,37 @@ public sealed class Combobulate : Control
             nameof(Model),
             typeof(ObjModel),
             typeof(Combobulate),
-            new PropertyMetadata(null, (d, _) => ((Combobulate)d).Rebuild()));
+            new PropertyMetadata(null, (d, _) => ((Combobulate)d).OnModelChanged()));
+
+    /// <summary>
+    /// File path or registered <see cref="ObjCache"/> key identifying the OBJ to render.
+    ///
+    /// <para>
+    /// Resolution: a value matching a key registered via <see cref="ObjCache.Register(string, ObjModel)"/>
+    /// or <see cref="ObjCache.GetOrAdd(string, System.Func{ObjModel})"/> wins; otherwise the value is
+    /// treated as a file path. The first request parses and caches; subsequent requests
+    /// (from this or any other control) reuse the cached <see cref="ObjGeometry"/>.
+    /// </para>
+    ///
+    /// <para>
+    /// Setting <see cref="Source"/> assigns <see cref="Model"/> to the cached model. Setting
+    /// <see cref="Model"/> directly bypasses the keyed cache but still benefits from the
+    /// per-instance geometry cache, so reusing one <c>ObjModel</c> reference across many
+    /// controls only does the per-quad model-space prep once.
+    /// </para>
+    /// </summary>
+    public string? Source
+    {
+        get => (string?)GetValue(SourceProperty);
+        set => SetValue(SourceProperty, value);
+    }
+
+    public static readonly DependencyProperty SourceProperty =
+        DependencyProperty.Register(
+            nameof(Source),
+            typeof(string),
+            typeof(Combobulate),
+            new PropertyMetadata(null, (d, e) => ((Combobulate)d).OnSourceChanged((string?)e.NewValue)));
 
     /// <summary>
     /// Multiplier applied to model-space positions when computing pixel-space transforms.
@@ -231,6 +262,46 @@ public sealed class Combobulate : Control
         Rebuild();
     }
 
+    private void OnModelChanged()
+    {
+        // Drop any stale per-instance geometry reference; it will be re-fetched on Rebuild.
+        _geometry = null;
+        Rebuild();
+    }
+
+    private void OnSourceChanged(string? newValue)
+    {
+        if (string.IsNullOrWhiteSpace(newValue))
+        {
+            // Clearing Source leaves Model untouched on purpose so callers can mix
+            // direct Model assignment with optional source-driven loading.
+            return;
+        }
+
+        try
+        {
+            var geometry = ObjCache.Resolve(newValue!);
+            _geometry = geometry;
+            // Setting Model triggers OnModelChanged → null _geometry → Rebuild re-resolves.
+            // Cache it on the instance first so the immediate Rebuild reuses our lookup
+            // without going through the cache a second time.
+            var cached = geometry;
+            Model = cached.Model;
+            // OnModelChanged cleared _geometry; restore so Rebuild skips the lookup.
+            _geometry = cached;
+            Rebuild();
+        }
+        catch (Exception)
+        {
+            // Surface failures by clearing the model. Callers can listen to Model changes
+            // or check ObjCache directly for richer diagnostics.
+            _geometry = null;
+            Model = null;
+        }
+    }
+
+    private ObjGeometry? _geometry;
+
     private void Rebuild()
     {
         if (_compositor == null || _root == null) return;
@@ -244,10 +315,17 @@ public sealed class Combobulate : Control
         var model = Model;
         if (model == null || model.Quads.Count == 0) return;
 
-        var scale = (float)ModelScale;
+        // Resolve cached geometry. ObjCache.ForModel is a ConditionalWeakTable lookup —
+        // O(1) amortized — so reusing the same ObjModel across many controls and across
+        // every rotation tick costs nothing beyond the first build.
+        var geometry = _geometry;
+        if (geometry == null || !ReferenceEquals(geometry.Model, model))
+        {
+            geometry = ObjCache.ForModel(model);
+            _geometry = geometry;
+        }
 
-        // Center the model in the host using the centroid of all referenced positions.
-        var center = ComputeCenter(model);
+        var scale = (float)ModelScale;
 
         var hostOriginX = (float)(_host?.ActualWidth ?? 0) / 2f;
         var hostOriginY = (float)(_host?.ActualHeight ?? 0) / 2f;
@@ -264,34 +342,24 @@ public sealed class Combobulate : Control
         // adjacent faces with very different centroids — e.g. a book's page-top
         // edge whose y=±0.7 centroid swings further in view-Z than a cover's
         // z=±0.1 centroid under any non-trivial pitch).
-        var visible = new List<VisibleQuad>(model.Quads.Count);
+        var cachedQuads = geometry.Quads;
+        var visible = new List<VisibleQuad>(cachedQuads.Length);
 
-        for (int i = 0; i < model.Quads.Count; i++)
+        for (int i = 0; i < cachedQuads.Length; i++)
         {
-            var quad = model.Quads[i];
-            if (!TryGetCorner(model, quad.V0, out var p0) ||
-                !TryGetCorner(model, quad.V1, out var p1) ||
-                !TryGetCorner(model, quad.V2, out var p2) ||
-                !TryGetCorner(model, quad.V3, out var p3))
-            {
-                continue;
-            }
+            var cq = cachedQuads[i];
 
-            var v0 = (p0 - center) * scale + origin;
-            var v1 = (p1 - center) * scale + origin;
-            var v3 = (p3 - center) * scale + origin;
+            // Back-face cull using the cached model-space normal — no per-render normal math.
+            var viewNormal = Vector3.TransformNormal(cq.Normal, rotation);
+            if (viewNormal.Z <= 0) continue;
+
+            var v0 = cq.V0 * scale + origin;
+            var v1 = cq.V1 * scale + origin;
+            var v3 = cq.V3 * scale + origin;
 
             var xAxis = v1 - v0;
             var yAxis = v3 - v0;
-            var zAxis = Vector3.Cross(xAxis, yAxis);
-            if (zAxis.LengthSquared() <= 0) continue;
-
-            // Back-face cull in view space (rotation applied; translation/perspective
-            // don't affect the normal direction for visibility purposes).
-            var viewNormal = Vector3.TransformNormal(Vector3.Normalize(zAxis), rotation);
-            if (viewNormal.Z <= 0) continue;
-
-            zAxis = Vector3.Normalize(zAxis);
+            var zAxis = Vector3.Normalize(Vector3.Cross(xAxis, yAxis));
 
             // Maps unit-square local point (x, y, z, 1) → world via row-major basis.
             var transform = new Matrix4x4(
@@ -302,20 +370,11 @@ public sealed class Combobulate : Control
 
             var sprite = _compositor.CreateSpriteVisual();
             sprite.Size = new Vector2(1f, 1f);
-            sprite.Brush = _compositor.CreateColorBrush(ColorForIndex(i));
+            sprite.Brush = _compositor.CreateColorBrush(cq.Color);
             sprite.TransformMatrix = transform;
 
-            // Store model-space corners (relative to center) and the model-space
-            // outward normal for the topology-aware sort below. Also keep the
-            // view-space centroid Z as a tiebreaker for unconstrained pairs.
-            var mc0 = p0 - center;
-            var mc1 = p1 - center;
-            var mc2 = p2 - center;
-            var mc3 = p3 - center;
-            var modelCentroid = (mc0 + mc1 + mc2 + mc3) * 0.25f;
-            var modelNormal = Vector3.Normalize(Vector3.Cross(p1 - p0, p3 - p0));
-            var viewCentroidZ = Vector3.Transform(modelCentroid, rotation).Z;
-            visible.Add(new VisibleQuad(sprite, mc0, mc1, mc2, mc3, modelCentroid, modelNormal, viewCentroidZ));
+            var viewCentroidZ = Vector3.Transform(cq.Centroid, rotation).Z;
+            visible.Add(new VisibleQuad(sprite, cq.V0, cq.V1, cq.V2, cq.V3, cq.Centroid, cq.Normal, viewCentroidZ));
         }
 
         // Topology-aware painter's sort. For each pair of visible quads (a, b),
@@ -445,71 +504,5 @@ public sealed class Combobulate : Control
         }
 
         return result;
-    }
-
-    private static bool TryGetCorner(ObjModel model, ObjVertex vertex, out Vector3 position)
-    {
-        var idx = vertex.PositionIndex;
-        if (idx < 0 || idx >= model.Positions.Count)
-        {
-            position = default;
-            return false;
-        }
-
-        var p = model.Positions[idx];
-        position = new Vector3(p.X, p.Y, p.Z);
-        return true;
-    }
-
-    private static Vector3 ComputeCenter(ObjModel model)
-    {
-        if (model.Positions.Count == 0) return Vector3.Zero;
-
-        var sum = Vector3.Zero;
-        var count = 0;
-        foreach (var quad in model.Quads)
-        {
-            AccumulateCorner(model, quad.V0, ref sum, ref count);
-            AccumulateCorner(model, quad.V1, ref sum, ref count);
-            AccumulateCorner(model, quad.V2, ref sum, ref count);
-            AccumulateCorner(model, quad.V3, ref sum, ref count);
-        }
-        return count == 0 ? Vector3.Zero : sum / count;
-    }
-
-    private static void AccumulateCorner(ObjModel model, ObjVertex v, ref Vector3 sum, ref int count)
-    {
-        if (v.PositionIndex < 0 || v.PositionIndex >= model.Positions.Count) return;
-        var p = model.Positions[v.PositionIndex];
-        sum += new Vector3(p.X, p.Y, p.Z);
-        count++;
-    }
-
-    /// <summary>Deterministic pleasant color from a quad index.</summary>
-    private static Color ColorForIndex(int i)
-    {
-        // Golden-angle hue spacing for good separation across many quads.
-        var hue = (i * 0.61803398875f) % 1f;
-        return HsvToRgb(hue, 0.65f, 0.95f);
-    }
-
-    private static Color HsvToRgb(float h, float s, float v)
-    {
-        var i = (int)(h * 6f);
-        var f = h * 6f - i;
-        var p = v * (1f - s);
-        var q = v * (1f - f * s);
-        var t = v * (1f - (1f - f) * s);
-        float r, g, b;
-        switch (i % 6)
-        {
-            case 0: r = v; g = t; b = p; break;
-            case 1: r = q; g = v; b = p; break;
-            case 2: r = p; g = v; b = t; break;
-            case 3: r = p; g = q; b = v; break;
-            case 4: r = t; g = p; b = v; break;
-            default: r = v; g = p; b = q; break;
-        }
-        return Color.FromArgb(255, (byte)(r * 255), (byte)(g * 255), (byte)(b * 255));
     }
 }

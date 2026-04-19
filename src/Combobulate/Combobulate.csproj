@@ -127,6 +127,8 @@
   <ItemGroup>
     <Compile Include="Combobulate.cs" />
     <Compile Include="GlobalUsings.cs" />
+    <Compile Include="Caching\ObjCache.cs" />
+    <Compile Include="Caching\ObjGeometry.cs" />
     <Compile Include="Parsing\ObjModel.cs" />
     <Compile Include="Parsing\ObjParser.cs" />
     <Compile Include="Parsing\ObjParseResult.cs" />

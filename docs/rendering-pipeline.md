@@ -211,3 +211,76 @@ actually drawn.
   kind, so adding image brushes per quad is a small change.
 - **Per-quad transforms are affine.** Non-parallelogram quads are
   approximated; for fully general planar quads a homography would be needed.
+- **Rotation must change on the UI thread.** See the next section.
+
+## Composition-thread animations
+
+Composition animations (`ExpressionAnimation`, `KeyFrameAnimation`,
+`InputAnimation`, etc.) run on the **compositor thread** and update visual
+properties between UI-thread frames. They are the standard way to get smooth,
+60+ fps animation without UI-thread jank.
+
+This control's design has a critical assumption that breaks under such
+animations: **back-face culling and the painter's sort both run inside
+`Rebuild()` using a snapshot of `RotationX/Y/Z` taken on the UI thread**. If
+rotation is being animated by the compositor (e.g. via an `ExpressionAnimation`
+driving `_root.RotationAngleInDegrees`), the UI thread is never told the value
+changed, `Rebuild()` is never re-invoked, and the displayed image will exhibit
+the same depth artefacts that the topological sort exists to prevent — visibly
+wrong occlusion for as long as the animation runs.
+
+Three mitigation strategies, in increasing order of effort:
+
+### A. Tick the rebuild from `CompositionTarget.Rendering`
+
+Subscribe to `CompositionTarget.Rendering` and re-run `Rebuild()` every
+frame while an animation is in flight. The UI-thread cost is one full
+re-creation of every `SpriteVisual` per frame — acceptable for the small
+quad counts this control targets (cubes, books, simple prisms) but a hard
+ceiling on model complexity. To make this affordable, `Rebuild()` would need
+to be split into:
+
+- A persistent quad cache keyed by `ObjQuad` index (sprite + brush + basis
+  transform are all rotation-invariant).
+- A per-frame "re-cull and re-sort" pass that toggles `IsVisible` and reorders
+  siblings without disposing anything.
+
+This is the smallest change and the most likely first step.
+
+### B. Make culling rotation-independent and tolerate sort lag
+
+If you can accept double-sided rendering, emit *both* faces of every quad at
+load time (or have the model do so explicitly, as `samples/book.obj` already
+does for its covers and spine). That removes the rotation dependency from
+culling. The painter's sort still depends on rotation, but you can either:
+
+- Run the sort on the UI thread at a low rate (e.g. 30 Hz via a
+  `DispatcherTimer`) and accept brief mis-orderings, or
+- Pick a **rotation-invariant ordering** that's correct for your specific
+  model topology — e.g. for a closed convex hull, any consistent CCW outward
+  ordering is correct because culling alone resolves visibility.
+
+This works well for animations that don't change the topological ordering
+mid-flight (small wobbles, hover effects, page-flip-style rotations confined
+to one axis) but degrades for free-tumbling.
+
+### C. Move to a true 3D pipeline
+
+For arbitrary continuous animation with correct depth at every frame, the
+right primitive is a real z-buffer. Options on Windows:
+
+- **`SceneVisual`** (Microsoft.UI.Composition.Scenes / Windows.UI.Composition.Scenes):
+  proper 3D meshes with depth testing, runs on the compositor thread, and
+  composition animations *do* drive it correctly without UI-thread involvement.
+  Closest semantic match but the API is a substantial step up from
+  `SpriteVisual`.
+- **Win2D / Direct2D on a `CanvasSwapChainPanel`** with manual depth handling.
+- **Direct3D via `SwapChainPanel`** for full control.
+
+Once a model is large enough to need composition-thread animation it is
+probably also large enough to justify one of these.
+
+> The current implementation is intentionally `SpriteVisual`-based because
+> that gives the cheapest path from "OBJ on disk" to "thing on screen" using
+> only the XAML composition surface, with no graphics interop. The
+> composition-animation limitation is the price of that simplicity.
