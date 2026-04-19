@@ -91,16 +91,33 @@ jobs:
             -OutputDirectory artifacts
 
       - name: Push to NuGet.org
+        id: nuget_push
         shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)) {
+            Write-Host "::warning::NUGET_API_KEY repository secret is not set; skipping NuGet push. The GitHub Release will still be created with the .nupkg attached."
+            exit 0
+          }
+          $hadFailure = $false
           Get-ChildItem artifacts\*.nupkg | ForEach-Object {
+            Write-Host "Pushing $($_.Name)…"
             dotnet nuget push $_.FullName `
-              --api-key ${{ secrets.NUGET_API_KEY }} `
+              --api-key $env:NUGET_API_KEY `
               --source https://api.nuget.org/v3/index.json `
               --skip-duplicate
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::dotnet nuget push exited with $LASTEXITCODE for $($_.Name)."
+              $hadFailure = $true
+            }
+          }
+          if ($hadFailure) {
+            Write-Host "::warning::One or more packages failed to push to NuGet.org. The GitHub Release will still be created."
           }
 
       - name: Create GitHub Release
+        if: always()
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
