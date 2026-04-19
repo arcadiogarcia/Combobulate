@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Combobulate</id>
+    <version>$version$</version>
+    <authors>Arcadio Garcia</authors>
+    <license type="expression">MIT</license>
+    <projectUrl>https://github.com/arcadiogarcia/Combobulate</projectUrl>
+    <repository type="git" url="https://github.com/arcadiogarcia/Combobulate" />
+    <description>A XAML controls library for UWP and WinUI 3 / Windows App SDK.</description>
+    <tags>uwp winui3 winappsdk xaml controls</tags>
+    <readme>docs\README.md</readme>
+    <dependencies>
+      <group targetFramework="UAP10.0.19041" />
+      <group targetFramework="net10.0-windows10.0.19041.0">
+        <dependency id="Microsoft.WindowsAppSDK" version="1.7.250401001" exclude="Build,Analyzers" />
+      </group>
+    </dependencies>
+  </metadata>
+  <files>
+    <!-- README -->
+    <file src="README.md" target="docs\README.md" />
+
+    <!-- UWP (uap10.0.19041) -->
+    <file src="src\Combobulate\bin\Release\Combobulate.dll" target="lib\uap10.0.19041" />
+    <file src="src\Combobulate\bin\Release\Combobulate.pri" target="lib\uap10.0.19041" />
+    <file src="src\Combobulate\bin\Release\Combobulate\**" target="lib\uap10.0.19041\Combobulate" />
+
+    <!-- WinUI 3 / Windows App SDK – compile reference + resources (net10.0-windows10.0.19041.0) -->
+    <file src="src\Combobulate.WinAppSdk\bin\x64\Release\net10.0-windows10.0.19041.0\Combobulate.dll" target="lib\net10.0-windows10.0.19041.0" />
+    <file src="src\Combobulate.WinAppSdk\bin\x64\Release\net10.0-windows10.0.19041.0\Combobulate.xml" target="lib\net10.0-windows10.0.19041.0" />
+    <file src="src\Combobulate.WinAppSdk\bin\x64\Release\net10.0-windows10.0.19041.0\Combobulate.pri" target="lib\net10.0-windows10.0.19041.0" />
+    <file src="src\Combobulate.WinAppSdk\bin\x64\Release\net10.0-windows10.0.19041.0\Combobulate\**" target="lib\net10.0-windows10.0.19041.0\Combobulate" />
+
+    <!-- WinUI 3 / Windows App SDK – x64 runtime -->
+    <file src="src\Combobulate.WinAppSdk\bin\x64\Release\net10.0-windows10.0.19041.0\Combobulate.dll" target="runtimes\win-x64\lib\net10.0-windows10.0.19041.0" />
+
+    <!-- WinUI 3 / Windows App SDK – ARM64 runtime -->
+    <file src="src\Combobulate.WinAppSdk\bin\ARM64\Release\net10.0-windows10.0.19041.0\Combobulate.dll" target="runtimes\win-arm64\lib\net10.0-windows10.0.19041.0" />
+  </files>
+</package>

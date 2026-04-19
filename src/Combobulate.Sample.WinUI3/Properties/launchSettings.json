@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "Combobulate.Sample.WinUI3 (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "Combobulate.Sample.WinUI3 (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

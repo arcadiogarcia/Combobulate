@@ -1,0 +1,90 @@
+<Window
+    x:Class="Combobulate.Sample.WinUI3.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:c="using:Combobulate"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Title="Combobulate Sample (WinUI 3)">
+
+    <Grid Padding="24" RowSpacing="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0"
+                   Text="Combobulate — OBJ quads via composition"
+                   Style="{ThemeResource TitleTextBlockStyle}"/>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="12">
+            <Button x:Name="LoadObjButton"
+                    Content="Load OBJ…"
+                    Click="LoadObjButton_Click"/>
+            <Button Content="Reset cube" Click="ResetCube_Click"/>
+            <Button Content="Reset rotation" Click="ResetRotation_Click"/>
+            <TextBlock x:Name="StatusText"
+                       VerticalAlignment="Center"
+                       Opacity="0.7"
+                       Text="Loaded: built-in cube"/>
+        </StackPanel>
+
+        <c:Combobulate x:Name="combobulate"
+                       Grid.Row="2"
+                       ModelScale="120"
+                       Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
+                       BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                       BorderThickness="1"/>
+
+        <StackPanel Grid.Row="3" Spacing="4">
+            <Grid ColumnSpacing="16">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <TextBlock Grid.Column="0" Text="Pitch (X)" VerticalAlignment="Center"/>
+                <Slider Grid.Column="1"
+                        Minimum="-180" Maximum="180"
+                        Value="{x:Bind combobulate.RotationX, Mode=TwoWay}"
+                        StepFrequency="1"
+                        TickFrequency="45" TickPlacement="Outside"/>
+
+                <TextBlock Grid.Column="2" Text="Yaw (Y)" VerticalAlignment="Center"/>
+                <Slider Grid.Column="3"
+                        Minimum="-180" Maximum="180"
+                        Value="{x:Bind combobulate.RotationY, Mode=TwoWay}"
+                        StepFrequency="1"
+                        TickFrequency="45" TickPlacement="Outside"/>
+
+                <TextBlock Grid.Column="4" Text="Roll (Z)" VerticalAlignment="Center"/>
+                <Slider Grid.Column="5"
+                        Minimum="-180" Maximum="180"
+                        Value="{x:Bind combobulate.RotationZ, Mode=TwoWay}"
+                        StepFrequency="1"
+                        TickFrequency="45" TickPlacement="Outside"/>
+            </Grid>
+
+            <Grid ColumnSpacing="16">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="Zoom" VerticalAlignment="Center"/>
+                <Slider x:Name="ZoomSlider"
+                        Grid.Column="1"
+                        Minimum="10" Maximum="500"
+                        Value="{x:Bind combobulate.ModelScale, Mode=TwoWay}"
+                        StepFrequency="1"
+                        TickFrequency="50" TickPlacement="Outside"/>
+            </Grid>
+        </StackPanel>
+    </Grid>
+</Window>

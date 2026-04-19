@@ -1,0 +1,51 @@
+# Minimal book model for Combobulate.
+# Geometry: 1.0 (W) x 1.4 (H) x 0.2 (D), centered at origin.
+# Page block is inset by 0.04 in X/Y and 0.02 in Z, so the covers and spine protrude.
+# All quads are wound so the cross product (V1-V0) x (V3-V0) points outward, which
+# matches the renderer's culling rule.
+
+# --- Cover vertices (z = +/- 0.1) ---
+v -0.5 -0.7  0.1   # 1  front bottom-left
+v  0.5 -0.7  0.1   # 2  front bottom-right
+v  0.5  0.7  0.1   # 3  front top-right
+v -0.5  0.7  0.1   # 4  front top-left
+v -0.5 -0.7 -0.1   # 5  back  bottom-left
+v  0.5 -0.7 -0.1   # 6  back  bottom-right
+v  0.5  0.7 -0.1   # 7  back  top-right
+v -0.5  0.7 -0.1   # 8  back  top-left
+
+# --- Inset page-block vertices (z = +/- 0.099 so the page edges meet the inside of the covers; xy inset 0.04, except x=-0.5 stays flush with spine) ---
+v  0.46 -0.66  0.099  # 9   page-block front bottom-right
+v  0.46  0.66  0.099  # 10  page-block front top-right
+v -0.5   0.66  0.099  # 11  page-block front top-left   (flush with spine)
+v -0.5  -0.66  0.099  # 12  page-block front bottom-left (flush with spine)
+v  0.46 -0.66 -0.099  # 13  page-block back  bottom-right
+v  0.46  0.66 -0.099  # 14  page-block back  top-right
+v -0.5   0.66 -0.099  # 15  page-block back  top-left
+v -0.5  -0.66 -0.099  # 16  page-block back  bottom-left
+
+# --- Front cover (doubled) ---
+# outside, normal +Z
+f 1 2 3 4
+# inside, normal -Z
+f 4 3 2 1
+
+# --- Back cover (doubled) ---
+# outside, normal -Z
+f 5 8 7 6
+# inside, normal +Z
+f 6 7 8 5
+
+# --- Spine (doubled, left side x = -0.5) ---
+# outside, normal -X
+f 1 4 8 5
+# inside,  normal +X
+f 5 8 4 1
+
+# --- Pages (3 inset faces closing the right/top/bottom of the volume) ---
+# fore-edge (right page face), normal +X
+f 9 13 14 10
+# top page edge, normal +Y
+f 11 10 14 15
+# bottom page edge, normal -Y
+f 9 12 16 13
