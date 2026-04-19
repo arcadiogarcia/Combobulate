@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
+using Combobulate.Caching;
 using Combobulate.Parsing;
 using Microsoft.UI.Dispatching;
 using Newtonsoft.Json.Linq;
@@ -83,21 +84,18 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
         if (!File.Exists(path))
             return ActionResult.Fail("validation_error", $"File not found: {path}");
 
-        string text;
-        try { text = await File.ReadAllTextAsync(path); }
-        catch (Exception ex) { return ActionResult.Fail("execution_error", $"Read failed: {ex.Message}"); }
+        ObjGeometry geometry;
+        try { geometry = ObjCache.GetOrLoadFile(path); }
+        catch (Exception ex) { return ActionResult.Fail("execution_error", $"Load failed: {ex.Message}"); }
 
-        var result = ObjParser.Parse(text);
-        if (result.Model.Quads.Count == 0)
-            return ActionResult.Fail("execution_error", $"No quads parsed ({result.Errors.Count} errors).");
+        if (geometry.Model.Quads.Count == 0)
+            return ActionResult.Fail("execution_error", "No quads parsed.");
 
         return await RunOnUi(() =>
         {
-            combobulate.Model = result.Model;
+            combobulate.Model = geometry.Model;
             var name = Path.GetFileName(path);
-            StatusText.Text = result.Errors.Count == 0
-                ? $"Loaded: {name} ({result.Model.Quads.Count} quads)"
-                : $"Loaded: {name} ({result.Model.Quads.Count} quads, {result.Errors.Count} skipped)";
+            StatusText.Text = $"Loaded: {name} ({geometry.Quads.Length} quads, cached)";
         });
     }
 

@@ -14,6 +14,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <TextBlock Grid.Row="0"
@@ -39,7 +40,42 @@
                        BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
                        BorderThickness="1"/>
 
-        <StackPanel Grid.Row="3" Spacing="4">
+        <!--
+            Thumbnail strip. Each thumbnail is a separate Combobulate control bound
+            to the *same* ObjModel via x:Bind. ObjCache.ForModel uses a
+            ConditionalWeakTable keyed on the model reference, so the heavy
+            per-quad geometry build runs only once and is reused across all four
+            controls — no re-parse, no re-prep when the main model changes.
+        -->
+        <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+            <c:Combobulate Width="96" Height="96" ModelScale="35"
+                           RotationX="-25" RotationY="35" RotationZ="0"
+                           Model="{x:Bind combobulate.Model, Mode=OneWay}"
+                           Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
+                           BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                           BorderThickness="1"/>
+            <c:Combobulate Width="96" Height="96" ModelScale="35"
+                           RotationX="20" RotationY="-30" RotationZ="0"
+                           Model="{x:Bind combobulate.Model, Mode=OneWay}"
+                           Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
+                           BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                           BorderThickness="1"/>
+            <c:Combobulate Width="96" Height="96" ModelScale="35"
+                           RotationX="0" RotationY="60" RotationZ="15"
+                           Model="{x:Bind combobulate.Model, Mode=OneWay}"
+                           Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
+                           BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                           BorderThickness="1"/>
+            <!-- Source-driven thumbnail: stays on the cached "cube" key regardless of main view. -->
+            <c:Combobulate Width="96" Height="96" ModelScale="35"
+                           RotationX="-15" RotationY="-15" RotationZ="0"
+                           Source="cube"
+                           Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
+                           BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                           BorderThickness="1"/>
+        </StackPanel>
+
+        <StackPanel Grid.Row="4" Spacing="4">
             <Grid ColumnSpacing="16">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>

@@ -278,18 +278,10 @@ public sealed class Combobulate : Control
             return;
         }
 
+        ObjGeometry geometry;
         try
         {
-            var geometry = ObjCache.Resolve(newValue!);
-            _geometry = geometry;
-            // Setting Model triggers OnModelChanged → null _geometry → Rebuild re-resolves.
-            // Cache it on the instance first so the immediate Rebuild reuses our lookup
-            // without going through the cache a second time.
-            var cached = geometry;
-            Model = cached.Model;
-            // OnModelChanged cleared _geometry; restore so Rebuild skips the lookup.
-            _geometry = cached;
-            Rebuild();
+            geometry = ObjCache.Resolve(newValue!);
         }
         catch (Exception)
         {
@@ -297,6 +289,21 @@ public sealed class Combobulate : Control
             // or check ObjCache directly for richer diagnostics.
             _geometry = null;
             Model = null;
+            return;
+        }
+
+        // Pre-seed _geometry so the upcoming Rebuild — whether triggered by Model
+        // changing here or by the explicit call below when Model is unchanged —
+        // skips the per-instance cache lookup.
+        _geometry = geometry;
+        if (!ReferenceEquals(Model, geometry.Model))
+        {
+            Model = geometry.Model; // triggers OnModelChanged → Rebuild
+            _geometry = geometry;   // OnModelChanged nulled it; restore
+        }
+        else
+        {
+            Rebuild();
         }
     }
 

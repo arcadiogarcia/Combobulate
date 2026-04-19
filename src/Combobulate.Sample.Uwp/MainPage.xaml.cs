@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using Combobulate.Caching;
 using Combobulate.Parsing;
 using Windows.Storage;
 using Windows.Storage.Pickers;
@@ -10,16 +11,27 @@ namespace Combobulate.Sample.Uwp;
 
 public sealed partial class MainPage : Page
 {
+    /// <summary>Stable cache key for the built-in cube. Used by both code and XAML (Source="cube").</summary>
+    private const string CubeKey = "cube";
+
     public MainPage()
     {
         this.InitializeComponent();
+
+        // Path 1 — keyed cache for an app-supplied model. Parse + register once at startup;
+        // every later request (including XAML `Source="cube"` thumbnails) reuses the cached
+        // ObjGeometry. Repeated "Reset cube" clicks below do zero parsing.
+        ObjCache.GetOrAdd(CubeKey, () => ObjParser.Parse(CubeObj).Model);
+
         LoadCube();
     }
 
     private void LoadCube()
     {
-        combobulate.Model = ObjParser.Parse(CubeObj).Model;
-        StatusText.Text = "Loaded: built-in cube";
+        // Resolve from the keyed cache. The first call built the geometry; this just
+        // hands the same ObjModel back to the control.
+        combobulate.Model = ObjCache.TryGet(CubeKey)!.Model;
+        StatusText.Text = $"Loaded: built-in cube (cache key '{CubeKey}')";
     }
 
     private void ResetCube_Click(object sender, RoutedEventArgs e) => LoadCube();
@@ -44,19 +56,32 @@ public sealed partial class MainPage : Page
             var file = await picker.PickSingleFileAsync();
             if (file == null) return;
 
-            var text = await FileIO.ReadTextAsync(file);
-            var result = ObjParser.Parse(text);
-
-            if (result.Model.Quads.Count == 0)
+            // Path 2 — file-path cache. Reads + parses on first access; subsequent loads
+            // of the same path return the cached geometry, transparently re-parsing only
+            // if LastWriteTimeUtc or length has changed on disk.
+            //
+            // UWP picker hands us a StorageFile whose Path may not be readable directly
+            // by File APIs (broker-mediated); fall back to FileIO + GetOrAddText keyed
+            // on the path so the cache still amortizes repeat picks of the same file.
+            ObjGeometry geometry;
+            try
             {
-                StatusText.Text = $"{file.Name}: no quads found ({result.Errors.Count} errors)";
+                geometry = ObjCache.GetOrLoadFile(file.Path);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                var text = await FileIO.ReadTextAsync(file);
+                geometry = ObjCache.GetOrAddText(file.Path, text);
+            }
+
+            if (geometry.Model.Quads.Count == 0)
+            {
+                StatusText.Text = $"{file.Name}: no quads found";
                 return;
             }
 
-            combobulate.Model = result.Model;
-            StatusText.Text = result.Errors.Count == 0
-                ? $"Loaded: {file.Name} ({result.Model.Quads.Count} quads)"
-                : $"Loaded: {file.Name} ({result.Model.Quads.Count} quads, {result.Errors.Count} skipped)";
+            combobulate.Model = geometry.Model;
+            StatusText.Text = $"Loaded: {file.Name} ({geometry.Quads.Length} quads, cached)";
         }
         catch (Exception ex)
         {
