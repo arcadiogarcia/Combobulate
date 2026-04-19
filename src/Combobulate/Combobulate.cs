@@ -376,12 +376,20 @@ public sealed class Combobulate : Control
                 if (a == b) continue;
                 var qa = quads[a];
 
-                // a is "behind" b iff every vertex of a is on the negative side
-                // of b's plane.
-                if (Vector3.Dot(qa.V0 - qb.Centroid, qb.Normal) < -eps &&
-                    Vector3.Dot(qa.V1 - qb.Centroid, qb.Normal) < -eps &&
-                    Vector3.Dot(qa.V2 - qb.Centroid, qb.Normal) < -eps &&
-                    Vector3.Dot(qa.V3 - qb.Centroid, qb.Normal) < -eps)
+                // a is "behind" b iff every vertex of a lies on or behind b's
+                // plane (signed distance <= +eps) AND at least one vertex is
+                // strictly behind (< -eps). The "<=" tolerance is essential
+                // for adjacent perpendicular faces that share an edge — those
+                // shared vertices have signed distance ≈ 0, which would fail a
+                // strict "< -eps" test and leave the pair unordered, causing
+                // the centroid-Z fallback to mis-order them (e.g. a book's
+                // page-bottom edge vs its spine).
+                var d0 = Vector3.Dot(qa.V0 - qb.Centroid, qb.Normal);
+                var d1 = Vector3.Dot(qa.V1 - qb.Centroid, qb.Normal);
+                var d2 = Vector3.Dot(qa.V2 - qb.Centroid, qb.Normal);
+                var d3 = Vector3.Dot(qa.V3 - qb.Centroid, qb.Normal);
+                if (d0 <= eps && d1 <= eps && d2 <= eps && d3 <= eps &&
+                    (d0 < -eps || d1 < -eps || d2 < -eps || d3 < -eps))
                 {
                     if (!edge[a, b])
                     {
