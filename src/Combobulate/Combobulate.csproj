@@ -126,10 +126,19 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Combobulate.cs" />
-    <Compile Include="Combobulate3D.cs" />
+    <Compile Include="CombobulateSceneVisual.cs" />
     <Compile Include="GlobalUsings.cs" />
+    <Compile Include="MaterialMode.cs" />
+    <Compile Include="Caching\MaterialResolver.cs" />
     <Compile Include="Caching\ObjCache.cs" />
     <Compile Include="Caching\ObjGeometry.cs" />
+    <Compile Include="Caching\ObjMaterial.cs" />
+    <Compile Include="Caching\ObjMaterialPack.cs" />
+    <Compile Include="Caching\ObjTextureSource.cs" />
+    <Compile Include="Parsing\MtlMaterial.cs" />
+    <Compile Include="Parsing\MtlParser.cs" />
+    <Compile Include="Parsing\MtlParseResult.cs" />
+    <Compile Include="Parsing\MtlTextureRef.cs" />
     <Compile Include="Parsing\ObjModel.cs" />
     <Compile Include="Parsing\ObjParser.cs" />
     <Compile Include="Parsing\ObjParseResult.cs" />

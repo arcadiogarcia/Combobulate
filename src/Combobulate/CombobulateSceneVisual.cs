@@ -65,7 +65,7 @@ namespace Combobulate;
 /// </list>
 /// </para>
 /// </summary>
-public sealed class Combobulate3D : Control
+public sealed class CombobulateSceneVisual : Control
 {
     private const string PartHost = "PART_Host";
 
@@ -78,9 +78,9 @@ public sealed class Combobulate3D : Control
     private SceneNode? _modelNode;
     private ObjGeometry? _geometry;
 
-    public Combobulate3D()
+    public CombobulateSceneVisual()
     {
-        this.DefaultStyleKey = typeof(Combobulate3D);
+        this.DefaultStyleKey = typeof(CombobulateSceneVisual);
         Loaded += OnLoaded;
         Unloaded += OnUnloaded;
         SizeChanged += OnSizeChanged;
@@ -100,8 +100,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(Model),
             typeof(ObjModel),
-            typeof(Combobulate3D),
-            new PropertyMetadata(null, (d, _) => ((Combobulate3D)d).OnModelChanged()));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(null, (d, _) => ((CombobulateSceneVisual)d).OnModelChanged()));
 
     /// <summary>File path or registered <see cref="ObjCache"/> key. See <see cref="Combobulate.Source"/>.</summary>
     public string? Source
@@ -114,8 +114,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(Source),
             typeof(string),
-            typeof(Combobulate3D),
-            new PropertyMetadata(null, (d, e) => ((Combobulate3D)d).OnSourceChanged((string?)e.NewValue)));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(null, (d, e) => ((CombobulateSceneVisual)d).OnSourceChanged((string?)e.NewValue)));
 
     /// <summary>Multiplier applied to model-space positions.</summary>
     public double ModelScale
@@ -128,8 +128,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(ModelScale),
             typeof(double),
-            typeof(Combobulate3D),
-            new PropertyMetadata(100.0, (d, _) => ((Combobulate3D)d).RebuildMesh()));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(100.0, (d, _) => ((CombobulateSceneVisual)d).RebuildMesh()));
 
     /// <summary>Honored as a no-op; the Scene rasterizer projects orthographically.</summary>
     public bool EnablePerspective
@@ -142,7 +142,7 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(EnablePerspective),
             typeof(bool),
-            typeof(Combobulate3D),
+            typeof(CombobulateSceneVisual),
             new PropertyMetadata(true));
 
     public double RotationX
@@ -155,8 +155,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(RotationX),
             typeof(double),
-            typeof(Combobulate3D),
-            new PropertyMetadata(0.0, (d, _) => ((Combobulate3D)d).UpdateOrientation()));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(0.0, (d, _) => ((CombobulateSceneVisual)d).UpdateOrientation()));
 
     public double RotationY
     {
@@ -168,8 +168,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(RotationY),
             typeof(double),
-            typeof(Combobulate3D),
-            new PropertyMetadata(0.0, (d, _) => ((Combobulate3D)d).UpdateOrientation()));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(0.0, (d, _) => ((CombobulateSceneVisual)d).UpdateOrientation()));
 
     public double RotationZ
     {
@@ -181,8 +181,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(RotationZ),
             typeof(double),
-            typeof(Combobulate3D),
-            new PropertyMetadata(0.0, (d, _) => ((Combobulate3D)d).UpdateOrientation()));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(0.0, (d, _) => ((CombobulateSceneVisual)d).UpdateOrientation()));
 
     /// <summary>HDR multiplier applied to the per-face EmissiveFactor.</summary>
     public double EmissiveBoost
@@ -195,8 +195,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(EmissiveBoost),
             typeof(double),
-            typeof(Combobulate3D),
-            new PropertyMetadata(0.0, (d, _) => ((Combobulate3D)d).RebuildMesh()));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(0.0, (d, _) => ((CombobulateSceneVisual)d).RebuildMesh()));
 
     /// <summary>Scale applied to BaseColorFactor (0 = pure-emissive look).</summary>
     public double BaseColorScale
@@ -209,8 +209,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(BaseColorScale),
             typeof(double),
-            typeof(Combobulate3D),
-            new PropertyMetadata(1.0, (d, _) => ((Combobulate3D)d).RebuildMesh()));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(1.0, (d, _) => ((CombobulateSceneVisual)d).RebuildMesh()));
 
     public double MetallicFactor
     {
@@ -222,8 +222,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(MetallicFactor),
             typeof(double),
-            typeof(Combobulate3D),
-            new PropertyMetadata(0.0, (d, _) => ((Combobulate3D)d).RebuildMesh()));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(0.0, (d, _) => ((CombobulateSceneVisual)d).RebuildMesh()));
 
     public double RoughnessFactor
     {
@@ -235,8 +235,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(RoughnessFactor),
             typeof(double),
-            typeof(Combobulate3D),
-            new PropertyMetadata(1.0, (d, _) => ((Combobulate3D)d).RebuildMesh()));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(1.0, (d, _) => ((CombobulateSceneVisual)d).RebuildMesh()));
 
     /// <summary>If true, negate Z when projecting (changes which faces are front).</summary>
     public bool FlipZ
@@ -249,8 +249,8 @@ public sealed class Combobulate3D : Control
         DependencyProperty.Register(
             nameof(FlipZ),
             typeof(bool),
-            typeof(Combobulate3D),
-            new PropertyMetadata(false, (d, _) => ((Combobulate3D)d).RebuildMesh()));
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(false, (d, _) => ((CombobulateSceneVisual)d).RebuildMesh()));
 
     #endregion
 

@@ -176,6 +176,37 @@ public sealed class Combobulate : Control
             typeof(Combobulate),
             new PropertyMetadata(0.0, (d, _) => ((Combobulate)d).OnRotationChanged()));
 
+    /// <summary>
+    /// Optional explicit material pack. When non-null this wins over
+    /// <see cref="ObjCache.TryGetMaterials(string)"/> and any auto-loaded <c>mtllib</c>.
+    /// </summary>
+    public ObjMaterialPack? Materials
+    {
+        get => (ObjMaterialPack?)GetValue(MaterialsProperty);
+        set => SetValue(MaterialsProperty, value);
+    }
+
+    public static readonly DependencyProperty MaterialsProperty =
+        DependencyProperty.Register(
+            nameof(Materials),
+            typeof(ObjMaterialPack),
+            typeof(Combobulate),
+            new PropertyMetadata(null, (d, _) => ((Combobulate)d).Rebuild()));
+
+    /// <summary>Controls how materials are resolved. Defaults to <see cref="MaterialMode.Auto"/>.</summary>
+    public MaterialMode MaterialMode
+    {
+        get => (MaterialMode)GetValue(MaterialModeProperty);
+        set => SetValue(MaterialModeProperty, value);
+    }
+
+    public static readonly DependencyProperty MaterialModeProperty =
+        DependencyProperty.Register(
+            nameof(MaterialMode),
+            typeof(MaterialMode),
+            typeof(Combobulate),
+            new PropertyMetadata(MaterialMode.Auto, (d, _) => ((Combobulate)d).Rebuild()));
+
     #endregion
 
     protected override void OnApplyTemplate()
@@ -275,6 +306,8 @@ public sealed class Combobulate : Control
         {
             // Clearing Source leaves Model untouched on purpose so callers can mix
             // direct Model assignment with optional source-driven loading.
+            _sourceKey = null;
+            _sourceDirectory = null;
             return;
         }
 
@@ -287,9 +320,23 @@ public sealed class Combobulate : Control
         {
             // Surface failures by clearing the model. Callers can listen to Model changes
             // or check ObjCache directly for richer diagnostics.
+            _sourceKey = null;
+            _sourceDirectory = null;
             _geometry = null;
             Model = null;
             return;
+        }
+
+        _sourceKey = newValue;
+        try
+        {
+            _sourceDirectory = System.IO.File.Exists(newValue!)
+                ? System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(newValue!))
+                : null;
+        }
+        catch
+        {
+            _sourceDirectory = null;
         }
 
         // Pre-seed _geometry so the upcoming Rebuild — whether triggered by Model
@@ -308,6 +355,8 @@ public sealed class Combobulate : Control
     }
 
     private ObjGeometry? _geometry;
+    private string? _sourceKey;
+    private string? _sourceDirectory;
 
     private void Rebuild()
     {
@@ -331,6 +380,23 @@ public sealed class Combobulate : Control
             geometry = ObjCache.ForModel(model);
             _geometry = geometry;
         }
+
+        // Resolve material pack: explicit Materials DP > registered key > auto mtllib > none.
+        ObjMaterialPack? pack = null;
+        if (MaterialMode != MaterialMode.UseFallback)
+        {
+            pack = Materials
+                ?? (_sourceKey != null ? ObjCache.TryGetMaterials(_sourceKey) : null);
+            if (pack == null && model.MaterialLibraries.Count > 0)
+            {
+                try { pack = ObjCache.GetOrLoadMtlForModel(model, _sourceDirectory); }
+                catch { pack = null; }
+            }
+            if (pack != null && MaterialMode == MaterialMode.UseDiffuse)
+                pack = StripTextures(pack);
+        }
+
+        var resolved = MaterialResolver.Resolve(_compositor!, geometry, pack);
 
         var scale = (float)ModelScale;
 
@@ -377,7 +443,7 @@ public sealed class Combobulate : Control
 
             var sprite = _compositor.CreateSpriteVisual();
             sprite.Size = new Vector2(1f, 1f);
-            sprite.Brush = _compositor.CreateColorBrush(cq.Color);
+            sprite.Brush = resolved.Bindings[i].Brush;
             sprite.TransformMatrix = transform;
 
             var viewCentroidZ = Vector3.Transform(cq.Centroid, rotation).Z;
@@ -396,6 +462,34 @@ public sealed class Combobulate : Control
         {
             _root.Children.InsertAtTop(q.Sprite);
         }
+    }
+
+    private static ObjMaterialPack StripTextures(ObjMaterialPack pack)
+    {
+        var dict = new Dictionary<string, ObjMaterial>(StringComparer.Ordinal);
+        foreach (var (name, mat) in pack.Materials)
+        {
+            dict[name] = new ObjMaterial
+            {
+                Name = mat.Name,
+                DiffuseColor = mat.DiffuseColor,
+                DiffuseTexture = null,
+                UvScale = mat.UvScale,
+                UvOffset = mat.UvOffset,
+                ClampUv = mat.ClampUv,
+            };
+        }
+        var fb = pack.Fallback;
+        ObjMaterial? newFb = fb == null ? null : new ObjMaterial
+        {
+            Name = fb.Name,
+            DiffuseColor = fb.DiffuseColor,
+            DiffuseTexture = null,
+            UvScale = fb.UvScale,
+            UvOffset = fb.UvOffset,
+            ClampUv = fb.ClampUv,
+        };
+        return new ObjMaterialPack(dict, newFb);
     }
 
     private readonly struct VisibleQuad

@@ -23,8 +23,19 @@
 
         <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="12">
             <Button Content="Load OBJ…" Click="LoadObjButton_Click"/>
+            <Button Content="Load book sample" Click="LoadBook_Click"/>
             <Button Content="Reset cube" Click="ResetCube_Click"/>
             <Button Content="Reset rotation" Click="ResetRotation_Click"/>
+            <ComboBox x:Name="MaterialModeBox" SelectionChanged="MaterialModeBox_SelectionChanged">
+                <ComboBoxItem Content="Auto" IsSelected="True"/>
+                <ComboBoxItem Content="UseFallback"/>
+                <ComboBoxItem Content="UseDiffuse"/>
+            </ComboBox>
+            <ToggleSwitch x:Name="ExternalRotationToggle"
+                          OnContent="External (composition)"
+                          OffContent="Internal (control DPs)"
+                          Toggled="ExternalRotationToggle_Toggled"
+                          ToolTipService.ToolTip="When ON, rotation sliders apply a Composition TransformMatrix to the controls' outer Visuals. The controls themselves stay at identity — so the SpriteVisual painter sort never re-runs."/>
             <TextBlock x:Name="StatusText"
                        VerticalAlignment="Center"
                        Opacity="0.7"
@@ -57,7 +68,7 @@
                            BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
                            BorderThickness="1"/>
 
-            <c:Combobulate3D x:Name="combobulate3D"
+            <c:CombobulateSceneVisual x:Name="combobulateSceneVisual"
                              Grid.Column="1" Grid.Row="1"
                              ModelScale="{x:Bind combobulate.ModelScale, Mode=OneWay}"
                              RotationX="{x:Bind combobulate.RotationX, Mode=OneWay}"
@@ -116,23 +127,26 @@
                 </Grid.ColumnDefinitions>
 
                 <TextBlock Grid.Column="0" Text="Pitch (X)" VerticalAlignment="Center"/>
-                <Slider Grid.Column="1"
+                <Slider x:Name="PitchSlider"
+                        Grid.Column="1"
                         Minimum="-180" Maximum="180"
-                        Value="{x:Bind combobulate.RotationX, Mode=TwoWay}"
+                        ValueChanged="Rotation_ValueChanged"
                         StepFrequency="1"
                         TickFrequency="45" TickPlacement="Outside"/>
 
                 <TextBlock Grid.Column="2" Text="Yaw (Y)" VerticalAlignment="Center"/>
-                <Slider Grid.Column="3"
+                <Slider x:Name="YawSlider"
+                        Grid.Column="3"
                         Minimum="-180" Maximum="180"
-                        Value="{x:Bind combobulate.RotationY, Mode=TwoWay}"
+                        ValueChanged="Rotation_ValueChanged"
                         StepFrequency="1"
                         TickFrequency="45" TickPlacement="Outside"/>
 
                 <TextBlock Grid.Column="4" Text="Roll (Z)" VerticalAlignment="Center"/>
-                <Slider Grid.Column="5"
+                <Slider x:Name="RollSlider"
+                        Grid.Column="5"
                         Minimum="-180" Maximum="180"
-                        Value="{x:Bind combobulate.RotationZ, Mode=TwoWay}"
+                        ValueChanged="Rotation_ValueChanged"
                         StepFrequency="1"
                         TickFrequency="45" TickPlacement="Outside"/>
             </Grid>

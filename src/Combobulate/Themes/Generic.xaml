@@ -19,12 +19,12 @@
         </Setter>
     </Style>
 
-    <Style TargetType="c:Combobulate3D">
+    <Style TargetType="c:CombobulateSceneVisual">
         <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
         <Setter Property="VerticalContentAlignment" Value="Stretch"/>
         <Setter Property="Template">
             <Setter.Value>
-                <ControlTemplate TargetType="c:Combobulate3D">
+                <ControlTemplate TargetType="c:CombobulateSceneVisual">
                     <Border Background="{TemplateBinding Background}"
                             BorderBrush="{TemplateBinding BorderBrush}"
                             BorderThickness="{TemplateBinding BorderThickness}">

@@ -57,7 +57,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
 }"),
         new ActionDescriptor(
             name: "SetMaterial",
-            description: "Adjusts SceneVisual (Combobulate3D) material/render parameters at runtime so they can be tuned without rebuilding. Any omitted property keeps its current value. emissiveBoost: HDR multiplier on EmissiveFactor (try 1-10). baseColorScale: multiplier on BaseColorFactor (0 = pure-emissive). metallic/roughness: PBR factors. flipZ: toggle Z-axis negation in the projection (changes which faces are front-facing).",
+            description: "Adjusts CombobulateSceneVisual material/render parameters at runtime so they can be tuned without rebuilding. Any omitted property keeps its current value. emissiveBoost: HDR multiplier on EmissiveFactor (try 1-10). baseColorScale: multiplier on BaseColorFactor (0 = pure-emissive). metallic/roughness: PBR factors. flipZ: toggle Z-axis negation in the projection (changes which faces are front-facing).",
             parameterSchema: @"{
   ""type"": ""object"",
   ""properties"": {
@@ -78,7 +78,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
         {
             case "LoadObjFromPath": return DispatchLoadObjFromPathAsync(parametersJson);
             case "SetRotation": return DispatchSetRotationAsync(parametersJson);
-            case "ResetRotation": return RunOnUi(() => { combobulate.RotationX = 0; combobulate.RotationY = 0; combobulate.RotationZ = 0; });
+            case "ResetRotation": return RunOnUi(() => { PitchSlider.Value = 0; YawSlider.Value = 0; RollSlider.Value = 0; });
             case "ResetCube": return RunOnUi(LoadCube);
             case "SetZoom": return DispatchSetZoomAsync(parametersJson);
             case "SetMaterial": return DispatchSetMaterialAsync(parametersJson);
@@ -107,7 +107,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
 
         return await RunOnUi(() =>
         {
-            combobulate.Model = geometry.Model;
+            combobulate.Source = path;
             var name = Path.GetFileName(path);
             StatusText.Text = $"Loaded: {name} ({geometry.Quads.Length} quads, cached)";
         });
@@ -121,9 +121,9 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
 
         return RunOnUi(() =>
         {
-            if (p["x"] != null) combobulate.RotationX = p["x"]!.Value<double>();
-            if (p["y"] != null) combobulate.RotationY = p["y"]!.Value<double>();
-            if (p["z"] != null) combobulate.RotationZ = p["z"]!.Value<double>();
+            if (p["x"] != null) PitchSlider.Value = p["x"]!.Value<double>();
+            if (p["y"] != null) YawSlider.Value = p["y"]!.Value<double>();
+            if (p["z"] != null) RollSlider.Value = p["z"]!.Value<double>();
         });
     }
 
@@ -150,13 +150,13 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
         {
             // Apply to both renderers' ModelScale-equivalent material on the
             // 3D pane. The sprite renderer (combobulate) ignores these.
-            if (p["emissiveBoost"] != null) combobulate3D.EmissiveBoost = p["emissiveBoost"]!.Value<double>();
-            if (p["baseColorScale"] != null) combobulate3D.BaseColorScale = p["baseColorScale"]!.Value<double>();
-            if (p["metallic"] != null) combobulate3D.MetallicFactor = p["metallic"]!.Value<double>();
-            if (p["roughness"] != null) combobulate3D.RoughnessFactor = p["roughness"]!.Value<double>();
-            if (p["flipZ"] != null) combobulate3D.FlipZ = p["flipZ"]!.Value<bool>();
+            if (p["emissiveBoost"] != null) combobulateSceneVisual.EmissiveBoost = p["emissiveBoost"]!.Value<double>();
+            if (p["baseColorScale"] != null) combobulateSceneVisual.BaseColorScale = p["baseColorScale"]!.Value<double>();
+            if (p["metallic"] != null) combobulateSceneVisual.MetallicFactor = p["metallic"]!.Value<double>();
+            if (p["roughness"] != null) combobulateSceneVisual.RoughnessFactor = p["roughness"]!.Value<double>();
+            if (p["flipZ"] != null) combobulateSceneVisual.FlipZ = p["flipZ"]!.Value<bool>();
             // Also push the same zoom to the 3D pane for convenience.
-            combobulate3D.ModelScale = combobulate.ModelScale;
+            combobulateSceneVisual.ModelScale = combobulate.ModelScale;
         });
     }
 

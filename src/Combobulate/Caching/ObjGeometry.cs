@@ -73,7 +73,14 @@ public sealed class ObjGeometry
             var centroid = (mc0 + mc1 + mc2 + mc3) * 0.25f;
             var normal = Vector3.Normalize(Vector3.Cross(p1 - p0, p3 - p0));
 
-            list.Add(new CachedQuad(i, mc0, mc1, mc2, mc3, centroid, normal, ColorForIndex(i)));
+            // Default UVs: unit square (mirrors the SpriteVisual unit-square local space).
+            var uv0 = GetUv(model, quad.V0, new Vector2(0, 0));
+            var uv1 = GetUv(model, quad.V1, new Vector2(1, 0));
+            var uv2 = GetUv(model, quad.V2, new Vector2(1, 1));
+            var uv3 = GetUv(model, quad.V3, new Vector2(0, 1));
+
+            list.Add(new CachedQuad(i, mc0, mc1, mc2, mc3, centroid, normal,
+                ColorForIndex(i), quad.Material, uv0, uv1, uv2, uv3));
         }
 
         return new ObjGeometry(model, center, list.ToArray());
@@ -101,6 +108,14 @@ public sealed class ObjGeometry
         var p = model.Positions[v.PositionIndex];
         sum += new Vector3(p.X, p.Y, p.Z);
         count++;
+    }
+
+    private static Vector2 GetUv(ObjModel model, ObjVertex v, Vector2 fallback)
+    {
+        if (v.TexCoordIndex is not int idx) return fallback;
+        if (idx < 0 || idx >= model.TexCoords.Count) return fallback;
+        var t = model.TexCoords[idx];
+        return new Vector2(t.X, t.Y);
     }
 
     private static bool TryGetCorner(ObjModel model, ObjVertex vertex, out Vector3 position)
@@ -148,13 +163,16 @@ public sealed class ObjGeometry
 public readonly struct CachedQuad
 {
     public CachedQuad(int sourceIndex, Vector3 v0, Vector3 v1, Vector3 v2, Vector3 v3,
-        Vector3 centroid, Vector3 normal, Color color)
+        Vector3 centroid, Vector3 normal, Color fallbackColor,
+        string? materialName, Vector2 uv0, Vector2 uv1, Vector2 uv2, Vector2 uv3)
     {
         SourceIndex = sourceIndex;
         V0 = v0; V1 = v1; V2 = v2; V3 = v3;
         Centroid = centroid;
         Normal = normal;
-        Color = color;
+        FallbackColor = fallbackColor;
+        MaterialName = materialName;
+        Uv0 = uv0; Uv1 = uv1; Uv2 = uv2; Uv3 = uv3;
     }
 
     /// <summary>Index into <see cref="ObjModel.Quads"/>.</summary>
@@ -171,6 +189,18 @@ public readonly struct CachedQuad
     /// <summary>Outward face normal (model space, normalized).</summary>
     public Vector3 Normal { get; }
 
-    /// <summary>Deterministic color assigned to this quad.</summary>
-    public Color Color { get; }
+    /// <summary>Per-quad fallback color used when no material is bound.</summary>
+    public Color FallbackColor { get; }
+
+    /// <summary>Original Color accessor preserved for back-compat.</summary>
+    [Obsolete("Use FallbackColor.")]
+    public Color Color => FallbackColor;
+
+    /// <summary>The <c>usemtl</c> name in effect for this quad, or null.</summary>
+    public string? MaterialName { get; }
+
+    public Vector2 Uv0 { get; }
+    public Vector2 Uv1 { get; }
+    public Vector2 Uv2 { get; }
+    public Vector2 Uv3 { get; }
 }

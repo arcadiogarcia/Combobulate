@@ -38,54 +38,27 @@ samples/
 ## Getting Started
 
 1. Add the `Combobulate` NuGet package to your UWP or WinUI 3 app.
-2. Place a `Combobulate` control in your XAML:
+2. Drop a `.obj` file into your app (e.g. `Assets/book.obj`, marked as
+   `Content` so it ships with the package).
+3. Place a `Combobulate` control in your XAML and point `Source` at the file:
 
    ```xml
    <Page xmlns:c="using:Combobulate">
-       <c:Combobulate x:Name="Viewer"
+       <c:Combobulate Source="ms-appx:///Assets/book.obj"
                       ModelScale="200"
                       RotationX="-30"
-                      RotationY="40"
-                      RotationZ="0" />
+                      RotationY="40" />
    </Page>
    ```
 
-3. Parse an `.obj` file and assign the resulting model:
+That's it — no code-behind required. The control parses the `.obj` on demand,
+caches it process-wide, and auto-loads any `mtllib` referenced by the file
+(textures resolved relative to the `.obj`).
 
-   ```csharp
-   using Combobulate.Parsing;
-
-   var text = await FileIO.ReadTextAsync(
-       await StorageFile.GetFileFromPathAsync(@"C:\path\to\book.obj"));
-   var result = ObjParser.Parse(text);
-   Viewer.Model = result.Model;        // partial model on parse error
-   foreach (var err in result.Errors)  // optional: inspect parse diagnostics
-       System.Diagnostics.Debug.WriteLine(err);
-   ```
-
-That's it — the control rebuilds its visual tree whenever `Model`,
-`ModelScale`, or any rotation property changes.
-
-### Supported `.obj` subset
-
-- `v x y z` — vertex positions
-- `f a b c d` — **quad** faces (4 indices, 1-based, positive or negative)
-- Vertex normals/UVs in `f` entries (`a/b/c`) are accepted but ignored
-
-Faces must be **quads** (triangles and n-gons are reported as parse errors).
-Wind each face so that `(V1 - V0) × (V3 - V0)` points outward — that's the
-direction the renderer treats as front-facing for back-face culling.
-
-See [`samples/book.obj`](samples/book.obj) for a worked example.
-
-### Control properties
-
-| Property | Type | Notes |
-| --- | --- | --- |
-| `Model` | `ObjModel?` | Set from `ObjParser.Parse(...).Model` |
-| `ModelScale` | `double` | Pixels per model unit (default `100`) |
-| `EnablePerspective` | `bool` | Adds a perspective `M34` to the host transform |
-| `RotationX` / `RotationY` / `RotationZ` | `double` | Euler angles in degrees |
+For everything else — loading from arbitrary paths or streams, supplying
+custom textures per face, live-updating pixels, the full property reference,
+the supported `.obj` / `.mtl` subset, and the caching model — see
+[**docs/usage.md**](docs/usage.md).
 
 ## Releasing
 

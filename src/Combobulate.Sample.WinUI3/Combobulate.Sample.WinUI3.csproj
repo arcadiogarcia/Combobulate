@@ -12,6 +12,9 @@
     <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <SelfContained>true</SelfContained>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)'=='' AND '$(Platform)'=='x64'">win-x64</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)'=='' AND '$(Platform)'=='x86'">win-x86</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)'=='' AND '$(Platform)'=='ARM64'">win-arm64</RuntimeIdentifier>
     <WindowsPackageType>MSIX</WindowsPackageType>
     <EnableMsixTooling>true</EnableMsixTooling>
     <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
@@ -36,5 +39,12 @@
 
   <ItemGroup>
     <Content Include="Assets\**\*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\samples\book.obj" Link="samples\book.obj" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\samples\book.mtl" Link="samples\book.mtl" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\samples\cover.png" Link="samples\cover.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\samples\pages.png" Link="samples\pages.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

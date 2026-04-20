@@ -1,0 +1,19 @@
+# Materials for samples/book.obj
+# - cover: leather-toned brown with a subtle grain texture
+# - pages: cream paper with horizontal lines
+
+newmtl cover
+Ka 0.10 0.05 0.02
+Kd 0.40 0.20 0.10
+Ks 0.20 0.18 0.15
+Ns 12.0
+illum 2
+map_Kd cover.png
+
+newmtl pages
+Ka 0.30 0.29 0.27
+Kd 0.95 0.93 0.85
+Ks 0.05 0.05 0.05
+Ns 4.0
+illum 2
+map_Kd pages.png
