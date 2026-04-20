@@ -246,6 +246,9 @@ controls also expose a composition-native API:
 public void SetExternalRotation(ExpressionAnimation rotationDegrees);
 public void ClearExternalRotation();
 public void RebuildForExternalRotation(Vector3 rotationDegrees);
+public void RequestRebuildForExternalRotation(Vector3 rotationDegrees);
+public void EnableAutoRefresh(Func<Vector3> rotationSampler);
+public void DisableAutoRefresh();
 ```
 
 `rotationDegrees` is any `ExpressionAnimation` whose result is a `Vector3`
@@ -309,6 +312,41 @@ composition thread — so the caller must supply it. This is the manual
 mitigation referenced in the [composition-thread animations
 section](rendering-pipeline.md#composition-thread-animations) of the
 rendering pipeline doc.
+
+### Coalescing high-frequency rebuild requests
+
+If rotation samples arrive faster than the UI thread can absorb (e.g.
+streamed from a non-UI thread or fired from many overlapping events),
+`RequestRebuildForExternalRotation` records the latest value and schedules
+a single rebuild on the UI thread; further calls before that rebuild runs
+update the pending value but do not enqueue additional work. It is
+thread-safe and non-blocking.
+
+```csharp
+// Safe to call from any thread, at any rate:
+combobulate.RequestRebuildForExternalRotation(latestRotation);
+```
+
+### Auto-refresh
+
+When the rotation expression is driven by `time` or another always-changing
+input, `EnableAutoRefresh` does the per-frame snapshot for you. The sampler
+runs on the UI thread once per composition frame and its return value is
+fed straight into `RebuildForExternalRotation`:
+
+```csharp
+// Caller still owns the property set the expression reads from; we just
+// re-sample the same value on the UI thread for cull / paint-order:
+combobulate.EnableAutoRefresh(() => latestRotationOnUiThread);
+
+// later:
+combobulate.DisableAutoRefresh();
+```
+
+Steady-state cost per tick (`Combobulate` only) is one back-face cull pass
+plus, on frames where the painter order changes, the sibling reorder. Per-quad
+sprites are pooled across rebuilds so there are no per-tick composition
+allocations.
 
 `ClearExternalRotation` detaches the expression and reverts to the
 DP-driven path.

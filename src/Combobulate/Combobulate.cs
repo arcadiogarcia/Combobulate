@@ -220,6 +220,8 @@ public sealed class Combobulate : Control
 
     private void OnUnloaded(object sender, RoutedEventArgs e)
     {
+        DisableAutoRefresh();
+        ClearSpritePool();
         if (_host != null)
             ElementCompositionPreview.SetElementChildVisual(_host, null);
         _root?.Dispose();
@@ -518,6 +520,29 @@ public sealed class Combobulate : Control
     private string? _sourceKey;
     private string? _sourceDirectory;
 
+    // --- Per-instance render-state cache, keyed off the active geometry. -----
+    // Sprites are created once per quad and reused across rebuilds; rotation only
+    // toggles IsVisible and (when needed) sibling order.
+    private SpriteVisual?[]? _spritePool;
+    private bool[]? _lastVisible;
+    private int[] _lastOrder = Array.Empty<int>();
+    private ObjGeometry? _spritePoolGeometry;
+    private float _spritePoolScale;
+    private float _spritePoolHostW;
+    private float _spritePoolHostH;
+    private object? _spritePoolPackKey;
+    private ResolvedQuadMaterials? _spritePoolBindings;
+    private int[]? _visibleScratch;
+    private int[]? _slotScratch;
+
+    // Coalescing for RequestRebuildForExternalRotation.
+    private Vector3 _pendingExternalRotation;
+    private int _externalRebuildScheduled; // 0 = idle, 1 = scheduled
+
+    // Auto-refresh subscription state.
+    private Func<Vector3>? _autoRefreshSampler;
+    private EventHandler<object>? _renderingHandler;
+
     /// <summary>
     /// Refreshes the per-quad <c>SpriteVisual</c> children (back-face cull
     /// and painter-sort) for the supplied rotation, in degrees. Intended for
@@ -544,23 +569,120 @@ public sealed class Combobulate : Control
         Rebuild(rotation);
     }
 
+    /// <summary>
+    /// Thread-safe, coalescing variant of <see cref="RebuildForExternalRotation(Vector3)"/>.
+    /// Records the latest rotation and schedules a single rebuild on the UI thread; if
+    /// further calls arrive before that rebuild runs, only the most recent value is used.
+    /// Useful when feeding rotation samples from a non-UI thread or at a higher rate than
+    /// the UI can absorb.
+    /// </summary>
+    public void RequestRebuildForExternalRotation(Vector3 rotationDegrees)
+    {
+        _pendingExternalRotation = rotationDegrees;
+        if (System.Threading.Interlocked.Exchange(ref _externalRebuildScheduled, 1) != 0) return;
+
+#if WINAPPSDK
+        var dispatcher = this.DispatcherQueue;
+#else
+        var dispatcher = this.Dispatcher;
+#endif
+        if (dispatcher == null)
+        {
+            // No dispatcher attached yet (control not loaded). Drop the schedule flag and
+            // bail; the next Loaded → Rebuild() will pick up live state from the DPs.
+            System.Threading.Interlocked.Exchange(ref _externalRebuildScheduled, 0);
+            return;
+        }
+
+#if WINAPPSDK
+        dispatcher.TryEnqueue(() =>
+        {
+            System.Threading.Interlocked.Exchange(ref _externalRebuildScheduled, 0);
+            RebuildForExternalRotation(_pendingExternalRotation);
+        });
+#else
+        var _ = dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+        {
+            System.Threading.Interlocked.Exchange(ref _externalRebuildScheduled, 0);
+            RebuildForExternalRotation(_pendingExternalRotation);
+        });
+#endif
+    }
+
+    /// <summary>
+    /// Subscribes to <c>CompositionTarget.Rendering</c> and calls
+    /// <see cref="RebuildForExternalRotation(Vector3)"/> on every frame, sampling the
+    /// current rotation from <paramref name="rotationSampler"/>. The sampler runs on the
+    /// UI thread; it should read the value the caller is feeding into the composition
+    /// expression (typically the same <c>Vector3</c> last pushed into a
+    /// <c>CompositionPropertySet</c>).
+    ///
+    /// <para>
+    /// Together with <see cref="SetExternalRotation(ExpressionAnimation)"/> this provides
+    /// the full "composition-thread rotation, periodic UI-thread cull/sort" loop without
+    /// requiring callers to wire <c>Rendering</c> themselves. Steady-state cost per tick
+    /// is one cull pass plus, on frames where the painter order actually changes, the
+    /// sibling reorder — see <c>docs/rendering-pipeline.md</c>.
+    /// </para>
+    /// </summary>
+    public void EnableAutoRefresh(Func<Vector3> rotationSampler)
+    {
+        if (rotationSampler is null) throw new ArgumentNullException(nameof(rotationSampler));
+        DisableAutoRefresh();
+        _autoRefreshSampler = rotationSampler;
+        _renderingHandler = OnRenderingTick;
+#if WINAPPSDK
+        Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
+#else
+        Windows.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
+#endif
+    }
+
+    /// <summary>Stops the auto-refresh loop installed by <see cref="EnableAutoRefresh"/>.</summary>
+    public void DisableAutoRefresh()
+    {
+        if (_renderingHandler != null)
+        {
+#if WINAPPSDK
+            Microsoft.UI.Xaml.Media.CompositionTarget.Rendering -= _renderingHandler;
+#else
+            Windows.UI.Xaml.Media.CompositionTarget.Rendering -= _renderingHandler;
+#endif
+            _renderingHandler = null;
+        }
+        _autoRefreshSampler = null;
+    }
+
+    private void OnRenderingTick(object? sender, object e)
+    {
+        var sampler = _autoRefreshSampler;
+        if (sampler == null) return;
+        try
+        {
+            RebuildForExternalRotation(sampler());
+        }
+        catch
+        {
+            // Sampler errors must not tear down the per-frame callback; the next tick
+            // re-tries. Silent by design — diagnostics belong in the caller's sampler.
+        }
+    }
+
     private void Rebuild() => Rebuild(GetRotationMatrix());
 
     private void Rebuild(Matrix4x4 rotation)
     {
         if (_compositor == null || _root == null) return;
 
-        // Tear down previous quads.
-        var existing = new List<Visual>(_root.Children.Count);
-        foreach (var child in _root.Children) existing.Add(child);
-        _root.Children.RemoveAll();
-        foreach (var v in existing) v.Dispose();
-
         var model = Model;
-        if (model == null || model.Quads.Count == 0) return;
+        if (model == null || model.Quads.Count == 0)
+        {
+            ClearSpritePool();
+            return;
+        }
 
         // Resolve cached geometry. ObjCache.ForModel is a ConditionalWeakTable lookup —
-        // O(1) amortized — so reusing the same ObjModel across many controls and across
+        // O(1) amortised — so reusing the same ObjModel across many controls and across
         // every rotation tick costs nothing beyond the first build.
         var geometry = _geometry;
         if (geometry == null || !ReferenceEquals(geometry.Model, model))
@@ -584,67 +706,148 @@ public sealed class Combobulate : Control
                 pack = StripTextures(pack);
         }
 
-        var resolved = MaterialResolver.Resolve(_compositor!, geometry, pack);
-
+        // (Re)materialise the per-instance sprite pool keyed off geometry + scale + host
+        // size + material pack. Anything in here is rotation-invariant; the rotation
+        // affects only IsVisible (cull) and sibling order (sort).
         var scale = (float)ModelScale;
+        var hostW = (float)(_host?.ActualWidth ?? 0);
+        var hostH = (float)(_host?.ActualHeight ?? 0);
 
-        var hostOriginX = (float)(_host?.ActualWidth ?? 0) / 2f;
-        var hostOriginY = (float)(_host?.ActualHeight ?? 0) / 2f;
-        var origin = new Vector3(hostOriginX, hostOriginY, 0);
+        var packKey = (object?)pack ?? NoPackSentinel;
+        bool geometryChanged = !ReferenceEquals(_spritePoolGeometry, geometry);
+        bool transformChanged = geometryChanged
+            || scale != _spritePoolScale
+            || hostW != _spritePoolHostW
+            || hostH != _spritePoolHostH;
+        bool packChanged = geometryChanged || !ReferenceEquals(_spritePoolPackKey, packKey);
 
-        // Composition has no z-buffer for SpriteVisuals — sibling order is paint order.
-        // Collect visible quads with their geometry so we can sort back-to-front
-        // using a topology-aware test (centroid sort alone fails for perpendicular
-        // adjacent faces with very different centroids — e.g. a book's page-top
-        // edge whose y=±0.7 centroid swings further in view-Z than a cover's
-        // z=±0.1 centroid under any non-trivial pitch).
+        if (geometryChanged)
+        {
+            ClearSpritePool();
+            _spritePoolGeometry = geometry;
+            _spritePool = new SpriteVisual?[geometry.Quads.Length];
+            _lastVisible = new bool[geometry.Quads.Length];
+            _lastOrder = Array.Empty<int>();
+        }
+
+        ResolvedQuadMaterials? resolved = packChanged
+            ? MaterialResolver.Resolve(_compositor, geometry, pack)
+            : _spritePoolBindings;
+        _spritePoolBindings = resolved;
+        _spritePoolPackKey = packKey;
+        _spritePoolScale = scale;
+        _spritePoolHostW = hostW;
+        _spritePoolHostH = hostH;
+
+        var origin = new Vector3(hostW / 2f, hostH / 2f, 0);
         var cachedQuads = geometry.Quads;
-        var visible = new List<VisibleQuad>(cachedQuads.Length);
+        var pool = _spritePool!;
+        var lastVisible = _lastVisible!;
+        if (_visibleScratch == null || _visibleScratch.Length < cachedQuads.Length)
+            _visibleScratch = new int[cachedQuads.Length];
+        if (_slotScratch == null || _slotScratch.Length < cachedQuads.Length)
+            _slotScratch = new int[cachedQuads.Length];
 
+        // Lazy-create / refresh sprites for each cached quad.
         for (int i = 0; i < cachedQuads.Length; i++)
         {
-            var cq = cachedQuads[i];
+            var sprite = pool[i];
+            bool isNew = sprite == null;
+            if (isNew)
+            {
+                sprite = _compositor.CreateSpriteVisual();
+                sprite.Size = new Vector2(1f, 1f);
+                sprite.IsVisible = false;
+                pool[i] = sprite;
+                // New sprites need transform + brush regardless of cached flags.
+                _root.Children.InsertAtTop(sprite);
+            }
 
-            // Back-face cull using the cached model-space normal — no per-render normal math.
-            var viewNormal = Vector3.TransformNormal(cq.Normal, rotation);
-            if (viewNormal.Z <= 0) continue;
+            if (isNew || transformChanged)
+            {
+                var cq = cachedQuads[i];
+                var v0 = cq.V0 * scale + origin;
+                var v1 = cq.V1 * scale + origin;
+                var v3 = cq.V3 * scale + origin;
+                var xAxis = v1 - v0;
+                var yAxis = v3 - v0;
+                var zAxis = Vector3.Normalize(Vector3.Cross(xAxis, yAxis));
+                sprite!.TransformMatrix = new Matrix4x4(
+                    xAxis.X, xAxis.Y, xAxis.Z, 0,
+                    yAxis.X, yAxis.Y, yAxis.Z, 0,
+                    zAxis.X, zAxis.Y, zAxis.Z, 0,
+                    v0.X,    v0.Y,    v0.Z,    1);
+            }
 
-            var v0 = cq.V0 * scale + origin;
-            var v1 = cq.V1 * scale + origin;
-            var v3 = cq.V3 * scale + origin;
-
-            var xAxis = v1 - v0;
-            var yAxis = v3 - v0;
-            var zAxis = Vector3.Normalize(Vector3.Cross(xAxis, yAxis));
-
-            // Maps unit-square local point (x, y, z, 1) → world via row-major basis.
-            var transform = new Matrix4x4(
-                xAxis.X, xAxis.Y, xAxis.Z, 0,
-                yAxis.X, yAxis.Y, yAxis.Z, 0,
-                zAxis.X, zAxis.Y, zAxis.Z, 0,
-                v0.X,    v0.Y,    v0.Z,    1);
-
-            var sprite = _compositor.CreateSpriteVisual();
-            sprite.Size = new Vector2(1f, 1f);
-            sprite.Brush = resolved.Bindings[i].Brush;
-            sprite.TransformMatrix = transform;
-
-            var viewCentroidZ = Vector3.Transform(cq.Centroid, rotation).Z;
-            visible.Add(new VisibleQuad(sprite, cq.V0, cq.V1, cq.V2, cq.V3, cq.Centroid, cq.Normal, viewCentroidZ));
+            if ((isNew || packChanged) && resolved != null)
+            {
+                sprite!.Brush = resolved.Bindings[i].Brush;
+            }
         }
 
-        // Topology-aware painter's sort. For each pair of visible quads (a, b),
-        // if every vertex of a lies on the back side of b's plane (negative
-        // signed distance with respect to b's outward normal), then a must be
-        // drawn before b. This holds regardless of rotation because each
-        // remaining quad already passed back-face culling, so its outward model
-        // normal points generally toward the viewer in view space — its plane's
-        // negative side is the far side from the camera.
-        var ordered = TopologicalPainterSort(visible);
-        foreach (var q in ordered)
+        // Cull: update IsVisible only for quads whose state actually flipped.
+        var visibleIndices = _visibleScratch!;
+        int visCount = 0;
+        for (int i = 0; i < cachedQuads.Length; i++)
         {
-            _root.Children.InsertAtTop(q.Sprite);
+            var viewNormal = Vector3.TransformNormal(cachedQuads[i].Normal, rotation);
+            bool visible = viewNormal.Z > 0;
+            if (lastVisible[i] != visible)
+            {
+                pool[i]!.IsVisible = visible;
+                lastVisible[i] = visible;
+            }
+            if (visible) visibleIndices[visCount++] = i;
         }
+
+        // Painter's sort over the cached predecessor lists, restricted to visible quads.
+        // Tiebreak by view-Z (back to front) so siblings without occlusion edges still get
+        // a deterministic order that swaps cleanly as the camera rotates.
+        var order = TopologicalPainterSort(visibleIndices, visCount, cachedQuads, geometry.Predecessors, rotation, _slotScratch!);
+
+        // Reorder children only if the painter order actually changed. Sprites already
+        // live under _root; InsertAtTop on an existing child is a sibling-reorder, not a
+        // new attach. Walking visible quads back-to-front and InsertAtTop'ing each one
+        // leaves the last-painted (frontmost) on top.
+        if (!OrderEquals(order, _lastOrder))
+        {
+            for (int i = 0; i < order.Length; i++)
+            {
+                _root.Children.InsertAtTop(pool[order[i]]!);
+            }
+            _lastOrder = order;
+        }
+    }
+
+    private static readonly object NoPackSentinel = new();
+
+    private void ClearSpritePool()
+    {
+        if (_spritePool != null)
+        {
+            if (_root != null) _root.Children.RemoveAll();
+            for (int i = 0; i < _spritePool.Length; i++)
+            {
+                _spritePool[i]?.Dispose();
+                _spritePool[i] = null;
+            }
+        }
+        _spritePool = null;
+        _lastVisible = null;
+        _lastOrder = Array.Empty<int>();
+        _spritePoolGeometry = null;
+        _spritePoolBindings = null;
+        _spritePoolPackKey = null;
+        _spritePoolScale = 0;
+        _spritePoolHostW = 0;
+        _spritePoolHostH = 0;
+    }
+
+    private static bool OrderEquals(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
     }
 
     private static ObjMaterialPack StripTextures(ObjMaterialPack pack)
@@ -677,6 +880,8 @@ public sealed class Combobulate : Control
 
     private readonly struct VisibleQuad
     {
+        // Reserved for diagnostics; the live painter sort works directly off cached quad
+        // indices to avoid per-frame allocations.
         public VisibleQuad(SpriteVisual sprite, Vector3 v0, Vector3 v1, Vector3 v2, Vector3 v3,
             Vector3 centroid, Vector3 normal, float viewCentroidZ)
         {
@@ -698,54 +903,50 @@ public sealed class Combobulate : Control
     }
 
     /// <summary>
-    /// Returns the visible quads in painter's order (back to front) using a
-    /// topology-aware partial order combined with a view-Z tiebreaker.
+    /// Returns the visible quads in painter's order (back to front) using the geometry's
+    /// precomputed (rotation-invariant) topological partial order, with view-Z as the
+    /// tiebreaker among nodes with no remaining predecessors.
     /// </summary>
-    private static List<VisibleQuad> TopologicalPainterSort(List<VisibleQuad> quads)
+    /// <param name="visible">Indices into <paramref name="cachedQuads"/> that survived culling.</param>
+    /// <param name="cachedQuads">All cached quads for the current geometry.</param>
+    /// <param name="predecessorsAll">For each cached quad index <c>b</c>, the quads that
+    /// must paint before <c>b</c>; precomputed by <see cref="ObjGeometry.Predecessors"/>.</param>
+    /// <param name="rotation">Current rotation matrix; used only for the view-Z tiebreaker.</param>
+    private static int[] TopologicalPainterSort(
+        int[] visible,
+        int visibleCount,
+        CachedQuad[] cachedQuads,
+        int[][] predecessorsAll,
+        Matrix4x4 rotation,
+        int[] slotScratch)
     {
-        int n = quads.Count;
-        if (n <= 1) return quads;
+        int n = visibleCount;
+        if (n == 0) return Array.Empty<int>();
+        if (n == 1) return new[] { visible[0] };
 
-        // edge[a,b] == true means a must be drawn before b.
-        var edge = new bool[n, n];
+        // Map cached-quad index → slot in the visible subset (or -1).
+        // For small N this is the cheapest representation; for very large models a
+        // dictionary would scale better, but the steady-state hot path here is small.
+        int total = cachedQuads.Length;
+        for (int i = 0; i < total; i++) slotScratch[i] = -1;
+        for (int i = 0; i < n; i++) slotScratch[visible[i]] = i;
+
         var inDegree = new int[n];
-        const float eps = 1e-4f;
-
-        for (int b = 0; b < n; b++)
+        var viewZ = new float[n];
+        for (int i = 0; i < n; i++)
         {
-            var qb = quads[b];
-            for (int a = 0; a < n; a++)
+            var q = cachedQuads[visible[i]];
+            viewZ[i] = Vector3.Transform(q.Centroid, rotation).Z;
+            var preds = predecessorsAll[visible[i]];
+            int deg = 0;
+            for (int p = 0; p < preds.Length; p++)
             {
-                if (a == b) continue;
-                var qa = quads[a];
-
-                // a is "behind" b iff every vertex of a lies on or behind b's
-                // plane (signed distance <= +eps) AND at least one vertex is
-                // strictly behind (< -eps). The "<=" tolerance is essential
-                // for adjacent perpendicular faces that share an edge — those
-                // shared vertices have signed distance ≈ 0, which would fail a
-                // strict "< -eps" test and leave the pair unordered, causing
-                // the centroid-Z fallback to mis-order them (e.g. a book's
-                // page-bottom edge vs its spine).
-                var d0 = Vector3.Dot(qa.V0 - qb.Centroid, qb.Normal);
-                var d1 = Vector3.Dot(qa.V1 - qb.Centroid, qb.Normal);
-                var d2 = Vector3.Dot(qa.V2 - qb.Centroid, qb.Normal);
-                var d3 = Vector3.Dot(qa.V3 - qb.Centroid, qb.Normal);
-                if (d0 <= eps && d1 <= eps && d2 <= eps && d3 <= eps &&
-                    (d0 < -eps || d1 < -eps || d2 < -eps || d3 < -eps))
-                {
-                    if (!edge[a, b])
-                    {
-                        edge[a, b] = true;
-                        inDegree[b]++;
-                    }
-                }
+                if (slotScratch[preds[p]] >= 0) deg++;
             }
+            inDegree[i] = deg;
         }
 
-        // Kahn's algorithm with a "farthest first" tiebreaker among nodes with
-        // no remaining predecessors.
-        var result = new List<VisibleQuad>(n);
+        var result = new int[n];
         var emitted = new bool[n];
         for (int step = 0; step < n; step++)
         {
@@ -754,36 +955,41 @@ public sealed class Combobulate : Control
             for (int i = 0; i < n; i++)
             {
                 if (emitted[i] || inDegree[i] != 0) continue;
-                if (quads[i].ViewCentroidZ < pickZ)
+                if (viewZ[i] < pickZ)
                 {
-                    pickZ = quads[i].ViewCentroidZ;
+                    pickZ = viewZ[i];
                     pick = i;
                 }
             }
 
             if (pick < 0)
             {
-                // Cycle (e.g. interpenetrating geometry). Fall back to view-Z
-                // ordering for whatever remains.
+                // Cycle (e.g. interpenetrating geometry). Fall back to view-Z ordering
+                // for whatever remains.
                 for (int i = 0; i < n; i++)
                 {
-                    if (!emitted[i])
+                    if (!emitted[i] && viewZ[i] < pickZ)
                     {
-                        if (quads[i].ViewCentroidZ < pickZ)
-                        {
-                            pickZ = quads[i].ViewCentroidZ;
-                            pick = i;
-                        }
+                        pickZ = viewZ[i];
+                        pick = i;
                     }
                 }
                 if (pick < 0) break;
             }
 
             emitted[pick] = true;
-            result.Add(quads[pick]);
+            result[step] = visible[pick];
+            // Decrement in-degree of every visible successor of `pick`.
+            // Successors of `pick` are quads `b` whose predecessor list contains `visible[pick]`.
+            int picked = visible[pick];
             for (int j = 0; j < n; j++)
             {
-                if (edge[pick, j]) inDegree[j]--;
+                if (emitted[j]) continue;
+                var preds = predecessorsAll[visible[j]];
+                for (int k = 0; k < preds.Length; k++)
+                {
+                    if (preds[k] == picked) { inDegree[j]--; break; }
+                }
             }
         }
 

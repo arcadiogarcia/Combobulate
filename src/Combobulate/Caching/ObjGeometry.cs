@@ -36,6 +36,71 @@ public sealed class ObjGeometry
     /// <summary>Per-quad render data. May be shorter than <c>Model.Quads</c> if some quads referenced invalid indices.</summary>
     public CachedQuad[] Quads { get; }
 
+    private int[][]? _predecessors;
+    private static readonly object PredecessorsLock = new();
+
+    /// <summary>
+    /// Topological "must paint before" relation, computed once per geometry and reused by
+    /// every renderer instance and every rotation. <c>Predecessors[b]</c> is the array of
+    /// quad indices <c>a</c> such that every vertex of <c>a</c> lies on the back side of
+    /// <c>b</c>'s plane (in model space). Because the test uses only model-space centroids
+    /// and normals, the partial order is rotation-invariant.
+    /// </summary>
+    public int[][] Predecessors
+    {
+        get
+        {
+            // Double-checked locking; lazy + thread-safe.
+            var p = _predecessors;
+            if (p != null) return p;
+            lock (PredecessorsLock)
+            {
+                p = _predecessors;
+                if (p != null) return p;
+                p = ComputePredecessors(Quads);
+                _predecessors = p;
+                return p;
+            }
+        }
+    }
+
+    private static int[][] ComputePredecessors(CachedQuad[] quads)
+    {
+        int n = quads.Length;
+        var result = new int[n][];
+        if (n <= 1)
+        {
+            for (int i = 0; i < n; i++) result[i] = Array.Empty<int>();
+            return result;
+        }
+
+        const float eps = 1e-4f;
+        var lists = new System.Collections.Generic.List<int>[n];
+        for (int i = 0; i < n; i++) lists[i] = new System.Collections.Generic.List<int>();
+
+        for (int b = 0; b < n; b++)
+        {
+            var qb = quads[b];
+            for (int a = 0; a < n; a++)
+            {
+                if (a == b) continue;
+                var qa = quads[a];
+                var d0 = Vector3.Dot(qa.V0 - qb.Centroid, qb.Normal);
+                var d1 = Vector3.Dot(qa.V1 - qb.Centroid, qb.Normal);
+                var d2 = Vector3.Dot(qa.V2 - qb.Centroid, qb.Normal);
+                var d3 = Vector3.Dot(qa.V3 - qb.Centroid, qb.Normal);
+                if (d0 <= eps && d1 <= eps && d2 <= eps && d3 <= eps &&
+                    (d0 < -eps || d1 < -eps || d2 < -eps || d3 < -eps))
+                {
+                    lists[b].Add(a);
+                }
+            }
+        }
+
+        for (int i = 0; i < n; i++) result[i] = lists[i].ToArray();
+        return result;
+    }
+
     private ObjGeometry(ObjModel model, Vector3 center, CachedQuad[] quads)
     {
         Model = model;

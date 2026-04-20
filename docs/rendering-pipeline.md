@@ -164,12 +164,28 @@ selection, where N is the number of front-facing quads. For the small models
 this control is designed for (cubes, books, simple prisms — typically <100
 quads after culling) this is negligible.
 
+> **The edge build runs once per geometry, not once per rebuild.** Because the
+> "behind" test uses model-space centroids and normals only, the partial order
+> is rotation-invariant and is cached on `ObjGeometry.Predecessors` (lazily,
+> thread-safe). Per-frame work in the hot path is just the Kahn loop restricted
+> to the visible subset.
+
 ### 4.3 Painting
 
-The ordered list is appended via `_root.Children.InsertAtTop(sprite)` in
-sequence. Because each `InsertAtTop` puts the new visual on top of all
-existing siblings, iterating from farthest to nearest is the correct painter's
-order.
+The painter-order list is realised by walking it back-to-front and calling
+`_root.Children.InsertAtTop(sprite)` on each. Because the per-quad
+`SpriteVisual`s are **pooled per control instance** (created once when the
+geometry is first attached and reused across every rebuild), `InsertAtTop` on
+an already-attached child is a sibling reorder rather than a new attach, and
+the previous frame's order is compared against the new one — when they
+match, the reorder is skipped entirely. Back-face cull only flips
+`IsVisible` on the sprites whose state actually changed.
+
+Steady-state per `Rebuild` is therefore:
+
+- One transform-only pass for cull (no IPC unless visibility flipped).
+- One restricted Kahn over the cached predecessor lists.
+- A sibling reorder only on frames where the painter order actually changed.
 
 ## 5. Root-level perspective transform
 
