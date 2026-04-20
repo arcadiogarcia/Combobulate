@@ -370,7 +370,7 @@ public sealed class CombobulateSceneVisual : Control
     /// </summary>
     public void SetExternalRotation(ExpressionAnimation rotationDegrees)
     {
-        ArgumentNullException.ThrowIfNull(rotationDegrees);
+        if (rotationDegrees is null) throw new ArgumentNullException(nameof(rotationDegrees));
         _externalRotationExpression = rotationDegrees;
         TryStartExternalRotationAnimation();
     }
