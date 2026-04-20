@@ -17,6 +17,7 @@ bottom or jump to the section you need.
   - [Live-updating pixels](#live-updating-pixels)
   - [`MaterialMode`](#materialmode)
 - [Control properties](#control-properties)
+- [Composition-driven rotation](#composition-driven-rotation)
 - [Supported `.obj` subset](#supported-obj-subset)
 - [Supported `.mtl` subset](#supported-mtl-subset)
 - [The cache, in one minute](#the-cache-in-one-minute)
@@ -232,6 +233,85 @@ Controls how the active pack interacts with OBJ material data:
 | `RotationX` / `RotationY` / `RotationZ` | `double` | `0` | Euler angles in degrees. |
 
 The control rebuilds its visual tree whenever any of these change.
+
+## Composition-driven rotation
+
+The `RotationX/Y/Z` dependency properties drive the same path internally, but
+each set forces a re-marshal back to the UI thread and a full visual
+rebuild. For animations that need to run independently of the UI thread —
+keyframe spins, expression-driven hover effects, scroll-linked tumbles — the
+controls also expose a composition-native API:
+
+```csharp
+public void SetExternalRotation(ExpressionAnimation rotationDegrees);
+public void ClearExternalRotation();
+public void RebuildForExternalRotation(Vector3 rotationDegrees);
+```
+
+`rotationDegrees` is any `ExpressionAnimation` whose result is a `Vector3`
+where `X = pitch`, `Y = yaw`, `Z = roll` in degrees. The control wires it
+into a composition expression bound to its root `TransformMatrix`; subsequent
+changes to anything that expression references (property sets, other visuals,
+time, …) flow entirely on the composition thread.
+
+### Driving from a property set
+
+The simplest pattern — push values from any thread without re-marshalling
+to the UI thread:
+
+```csharp
+var compositor = ElementCompositionPreview.GetElementVisual(this).Compositor;
+var props = compositor.CreatePropertySet();
+props.InsertVector3("R", Vector3.Zero);
+
+var rot = compositor.CreateExpressionAnimation("p.R");
+rot.SetReferenceParameter("p", props);
+
+combobulate.SetExternalRotation(rot);
+
+// Later, on any thread:
+props.InsertVector3("R", new Vector3(pitch, yaw, roll));
+```
+
+### Driving from another visual / time / scroll
+
+```csharp
+// Spin yaw at 60°/sec, no UI thread ever again:
+var spin = compositor.CreateExpressionAnimation(
+    "Vector3(0, this.Target.GetGlobalTime() * 60, 0)");
+combobulate.SetExternalRotation(spin);
+
+// Or rotate based on a ScrollViewer's offset:
+var scrollProps = ElementCompositionPreview
+    .GetScrollViewerManipulationPropertySet(scrollViewer);
+var rot = compositor.CreateExpressionAnimation(
+    "Vector3(scroll.Translation.Y * 0.5, scroll.Translation.X * 0.5, 0)");
+rot.SetReferenceParameter("scroll", scrollProps);
+combobulate.SetExternalRotation(rot);
+```
+
+### Refreshing painter sort / mesh
+
+While `SetExternalRotation` is active, the visible 3D rotation is correct on
+every composition frame, but back-face culling (`Combobulate`) and mesh
+baking (`CombobulateSceneVisual`) are *frozen* at whatever the last
+UI-thread `Rebuild` produced. For models where that matters, snapshot the
+animated value on the UI thread and call `RebuildForExternalRotation`:
+
+```csharp
+// E.g. on a periodic timer, or when the animation reaches a known keyframe:
+var current = ReadCurrentRotationOnUiThread();   // app-supplied
+combobulate.RebuildForExternalRotation(current);
+```
+
+The control cannot read the animated value itself — it lives on the
+composition thread — so the caller must supply it. This is the manual
+mitigation referenced in the [composition-thread animations
+section](rendering-pipeline.md#composition-thread-animations) of the
+rendering pipeline doc.
+
+`ClearExternalRotation` detaches the expression and reverts to the
+DP-driven path.
 
 ## Supported `.obj` subset
 

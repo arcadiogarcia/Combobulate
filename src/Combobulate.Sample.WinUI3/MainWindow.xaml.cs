@@ -55,51 +55,68 @@ public sealed partial class MainWindow : Window
 
     private void ExternalRotationToggle_Toggled(object sender, RoutedEventArgs e) => ApplyRotation();
 
+    private void RefreshQuads_Click(object sender, RoutedEventArgs e)
+    {
+        var rot = new Vector3((float)PitchSlider.Value, (float)YawSlider.Value, (float)RollSlider.Value);
+        combobulate.RebuildForExternalRotation(rot);
+        combobulateSceneVisual.RebuildForExternalRotation(rot);
+    }
+
     /// <summary>
     /// Routes the slider values either through the controls' rotation
     /// dependency properties (which trigger a paint-order rebuild) or via a
-    /// composition <see cref="Visual.TransformMatrix"/> on each control's outer
-    /// Visual (which does NOT — exposing back-face / paint-order artefacts as
-    /// the model spins).
+    /// shared <see cref="CompositionPropertySet"/> wired to each control's
+    /// composition root via <c>SetExternalRotationSource</c>. In external
+    /// mode the property update propagates through the composition graph
+    /// without any further UI-thread involvement \u2014 subsequent updates
+    /// (including those issued from a non-UI thread or driven by another
+    /// composition animation) re-evaluate the bound expression directly on
+    /// the composition thread.
     /// </summary>
+    // Backing storage for the external-rotation expression. The property
+    // set holds the live Vector3 value; the expression `p.Rotation` is what
+    // the renderers reference. Subsequent slider changes call InsertVector3
+    // and the new value flows entirely through composition with no UI-thread
+    // matrix work.
+    private CompositionPropertySet? _externalRotationProps;
+    private ExpressionAnimation? _externalRotationExpr;
+
+    private (CompositionPropertySet props, ExpressionAnimation expr) GetOrCreateExternalRotation()
+    {
+        if (_externalRotationProps != null && _externalRotationExpr != null)
+            return (_externalRotationProps, _externalRotationExpr);
+        var compositor = ElementCompositionPreview.GetElementVisual(this.Content).Compositor;
+        _externalRotationProps = compositor.CreatePropertySet();
+        _externalRotationProps.InsertVector3("Rotation", Vector3.Zero);
+        _externalRotationExpr = compositor.CreateExpressionAnimation("p.Rotation");
+        _externalRotationExpr.SetReferenceParameter("p", _externalRotationProps);
+        return (_externalRotationProps, _externalRotationExpr);
+    }
+
     private void ApplyRotation()
     {
         if (combobulate == null) return;
-        var x = PitchSlider.Value;
-        var y = YawSlider.Value;
-        var z = RollSlider.Value;
+        var x = (float)PitchSlider.Value;
+        var y = (float)YawSlider.Value;
+        var z = (float)RollSlider.Value;
         bool external = ExternalRotationToggle?.IsOn == true;
 
         if (external)
         {
-            // Force the controls' own painting to identity so the only
-            // rotation in effect is the external composition transform.
-            combobulate.RotationX = combobulate.RotationY = combobulate.RotationZ = 0;
-            ApplyExternalRotation(combobulate, x, y, z);
-            ApplyExternalRotation(combobulateSceneVisual, x, y, z);
+            var (props, expr) = GetOrCreateExternalRotation();
+            props.InsertVector3("Rotation", new Vector3(x, y, z));
+            combobulate.SetExternalRotation(expr);
+            combobulateSceneVisual.SetExternalRotation(expr);
         }
         else
         {
-            ApplyExternalRotation(combobulate, 0, 0, 0);
-            ApplyExternalRotation(combobulateSceneVisual, 0, 0, 0);
+            combobulate.ClearExternalRotation();
+            combobulateSceneVisual.ClearExternalRotation();
             combobulate.RotationX = x;
             combobulate.RotationY = y;
             combobulate.RotationZ = z;
             // combobulateSceneVisual mirrors combobulate's rotation via x:Bind.
         }
-    }
-
-    private static void ApplyExternalRotation(FrameworkElement element, double xDeg, double yDeg, double zDeg)
-    {
-        var visual = ElementCompositionPreview.GetElementVisual(element);
-        var w = (float)element.ActualWidth;
-        var h = (float)element.ActualHeight;
-        visual.CenterPoint = new Vector3(w / 2f, h / 2f, 0f);
-        const float deg2rad = MathF.PI / 180f;
-        visual.TransformMatrix = Matrix4x4.CreateFromYawPitchRoll(
-            (float)yDeg * deg2rad,
-            (float)xDeg * deg2rad,
-            (float)zDeg * deg2rad);
     }
 
     private async void LoadObjButton_Click(object sender, RoutedEventArgs e)

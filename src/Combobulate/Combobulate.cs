@@ -244,6 +244,152 @@ public sealed class Combobulate : Control
         Rebuild();
     }
 
+    private ExpressionAnimation? _externalRotationExpression;
+    private ExpressionAnimation? _externalRotationAnimation;
+    private CompositionPropertySet? _externalRotationBuffer;
+
+    /// <summary>
+    /// Drives the 3D rotation of the rendered model directly off a caller-
+    /// supplied <see cref="ExpressionAnimation"/> whose result is a
+    /// <c>Vector3</c> of degrees \u2014 (X = pitch, Y = yaw, Z = roll).
+    ///
+    /// <para>
+    /// The supplied expression is referenced as <c>src</c> inside this
+    /// control's own matrix expression, which is bound to the composition
+    /// root's <c>TransformMatrix</c>. Subsequent updates to anything the
+    /// caller's expression references (property sets, other animatable
+    /// composition objects, time, etc.) propagate automatically through the
+    /// composition graph without ever touching the UI thread.
+    /// </para>
+    ///
+    /// <para>
+    /// Examples:
+    /// <code>
+    /// // Constant value updated off the UI thread:
+    /// var p = compositor.CreatePropertySet();
+    /// p.InsertVector3("R", Vector3.Zero);
+    /// var rot = compositor.CreateExpressionAnimation("p.R");
+    /// rot.SetReferenceParameter("p", p);
+    /// combobulate.SetExternalRotation(rot);
+    /// // later, on any thread:
+    /// p.InsertVector3("R", new Vector3(pitch, yaw, roll));
+    ///
+    /// // Time-driven, never touches the UI thread again:
+    /// var spin = compositor.CreateExpressionAnimation(
+    ///     "Vector3(0, this.Target.GetGlobalTime() * 60, 0)");
+    /// combobulate.SetExternalRotation(spin);
+    /// </code>
+    /// </para>
+    ///
+    /// <para>
+    /// While this mode is active the painter sort and back-face cull state of
+    /// the existing per-quad <c>SpriteVisual</c> children remain frozen at
+    /// whatever the last internal rotation produced \u2014 the whole point of
+    /// driving rotation from outside is to expose what happens when the
+    /// renderer does not get a chance to refresh paint order.
+    /// </para>
+    ///
+    /// <para>Setting <see cref="RotationX"/>/<see cref="RotationY"/>/<see cref="RotationZ"/>
+    /// (or calling <see cref="ClearExternalRotation"/>) returns the control
+    /// to internally-driven rotation.</para>
+    /// </summary>
+    public void SetExternalRotation(ExpressionAnimation rotationDegrees)
+    {
+        ArgumentNullException.ThrowIfNull(rotationDegrees);
+        _externalRotationExpression = rotationDegrees;
+        TryStartExternalRotationAnimation();
+    }
+
+    /// <summary>
+    /// Detaches any previously-installed external rotation expression, stops
+    /// the composition expression animation bound to the root, and reverts
+    /// to the value computed from <see cref="RotationX"/>/<see cref="RotationY"/>/<see cref="RotationZ"/>.
+    /// Triggers a rebuild so paint order and back-face culling re-sync.
+    /// </summary>
+    public void ClearExternalRotation()
+    {
+        if (_externalRotationExpression == null) return;
+        _root?.StopAnimation("TransformMatrix");
+        _externalRotationBuffer?.StopAnimation("R");
+        _externalRotationAnimation?.Dispose();
+        _externalRotationAnimation = null;
+        _externalRotationExpression = null;
+        UpdateRootTransform();
+        Rebuild();
+    }
+
+    private void TryStartExternalRotationAnimation()
+    {
+        if (_root == null || _compositor == null || _host == null) return;
+        if (_externalRotationExpression == null) return;
+
+        var w = (float)_host.ActualWidth;
+        var h = (float)_host.ActualHeight;
+        // Even with a degenerate size we still install the animation \u2014 the
+        // expression references this.Target.Size, so it will re-evaluate
+        // once the host gets a real layout pass and we update _root.Size.
+        if (w > 0 && h > 0) _root.Size = new Vector2(w, h);
+
+        // Run the caller's Vector3 expression against an internal property
+        // set we own, then have OUR matrix expression reference that buffer.
+        // This avoids the SetExpressionReferenceParameter pitfall where
+        // the caller's reference parameters (e.g. "p" in "p.Rotation") are
+        // not visible to the substituted-into outer expression. With
+        // StartAnimation, the caller's parameters travel with the animation.
+        if (_externalRotationBuffer == null)
+        {
+            _externalRotationBuffer = _compositor.CreatePropertySet();
+            _externalRotationBuffer.InsertVector3("R", Vector3.Zero);
+        }
+        _externalRotationBuffer.StopAnimation("R");
+        _externalRotationBuffer.StartAnimation("R", _externalRotationExpression);
+
+        const string D2R = "0.01745329251994";
+        // Use the same composition order as Matrix4x4.CreateFromYawPitchRoll,
+        // which is what Rebuild/RebuildForExternalRotation use for back-face
+        // cull and painter sort. CreateFromYawPitchRoll(yaw,pitch,roll)
+        // produces a quaternion q = qY * qX * qZ; for row-vector
+        // multiplication that maps to a matrix M = RotZ * RotX * RotY,
+        // which means "roll first, then pitch, then yaw".
+        string rotationExpr =
+            $"Matrix4x4.CreateFromAxisAngle(Vector3(0,0,1), buf.R.Z * {D2R}) * " +
+            $"Matrix4x4.CreateFromAxisAngle(Vector3(1,0,0), buf.R.X * {D2R}) * " +
+            $"Matrix4x4.CreateFromAxisAngle(Vector3(0,1,0), buf.R.Y * {D2R})";
+
+        string toOriginExpr = "Matrix4x4.CreateTranslation(Vector3(-this.Target.Size.X / 2, -this.Target.Size.Y / 2, 0))";
+        string fromOriginExpr = "Matrix4x4.CreateTranslation(Vector3(this.Target.Size.X / 2, this.Target.Size.Y / 2, 0))";
+
+        string fullExpr;
+        if (EnablePerspective)
+        {
+            fullExpr = $"{toOriginExpr} * {rotationExpr} * persp * {fromOriginExpr}";
+        }
+        else
+        {
+            fullExpr = $"{toOriginExpr} * {rotationExpr} * {fromOriginExpr}";
+        }
+
+        _externalRotationAnimation?.Dispose();
+        _externalRotationAnimation = _compositor.CreateExpressionAnimation(fullExpr);
+        _externalRotationAnimation.SetReferenceParameter("buf", _externalRotationBuffer);
+        if (EnablePerspective)
+        {
+            // perspective uses host width as the focal distance, matching
+            // UpdateRootTransform's convention. Width can change on resize;
+            // the animation gets re-installed by UpdateRootTransform when
+            // that happens, so capturing w here is fine.
+            float d = w > 0 ? w : 1f;
+            var perspective = new Matrix4x4(
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, -1f / d,
+                0, 0, 0, 1);
+            _externalRotationAnimation.SetMatrix4x4Parameter("persp", perspective);
+        }
+
+        _root.StartAnimation("TransformMatrix", _externalRotationAnimation);
+    }
+
     private void UpdateRootTransform()
     {
         if (_root == null || _host == null) return;
@@ -251,6 +397,18 @@ public sealed class Combobulate : Control
         var w = (float)_host.ActualWidth;
         var h = (float)_host.ActualHeight;
         if (w <= 0 || h <= 0) return;
+
+        _root.Size = new Vector2(w, h);
+
+        // When an external rotation expression is installed, _root.TransformMatrix
+        // is driven by an ExpressionAnimation off the composition thread.
+        // Re-install it so the perspective constant (which depends on width)
+        // and EnablePerspective branch stay in sync with the current size.
+        if (_externalRotationExpression != null)
+        {
+            TryStartExternalRotationAnimation();
+            return;
+        }
 
         var rotation = GetRotationMatrix();
 
@@ -274,7 +432,6 @@ public sealed class Combobulate : Control
         }
 
         _root.TransformMatrix = transform;
-        _root.Size = new Vector2(w, h);
     }
 
     private Matrix4x4 GetRotationMatrix()
@@ -288,6 +445,9 @@ public sealed class Combobulate : Control
 
     private void OnRotationChanged()
     {
+        // Setting an internal rotation DP returns the control to internal mode
+        // so the new value actually takes effect.
+        if (_externalRotationExpression != null) ClearExternalRotation();
         UpdateRootTransform();
         // Visibility (back-face culling) depends on rotation.
         Rebuild();
@@ -358,7 +518,35 @@ public sealed class Combobulate : Control
     private string? _sourceKey;
     private string? _sourceDirectory;
 
-    private void Rebuild()
+    /// <summary>
+    /// Refreshes the per-quad <c>SpriteVisual</c> children (back-face cull
+    /// and painter-sort) for the supplied rotation, in degrees. Intended for
+    /// callers that drive <see cref="SetExternalRotation(ExpressionAnimation)"/>
+    /// from the composition thread and need the visible mesh to re-sync to
+    /// the current animated value.
+    ///
+    /// <para>
+    /// The control cannot read the animated value itself \u2014 it lives on
+    /// the composition thread \u2014 so the caller must supply it. This method
+    /// must be called on the UI thread; it does not affect the
+    /// <c>TransformMatrix</c> animation that
+    /// <see cref="SetExternalRotation(ExpressionAnimation)"/> installed.
+    /// </para>
+    /// </summary>
+    /// <param name="rotationDegrees">Current rotation as (X = pitch, Y = yaw, Z = roll), in degrees.</param>
+    public void RebuildForExternalRotation(Vector3 rotationDegrees)
+    {
+        const float deg2rad = MathF.PI / 180f;
+        var rotation = Matrix4x4.CreateFromYawPitchRoll(
+            rotationDegrees.Y * deg2rad,
+            rotationDegrees.X * deg2rad,
+            rotationDegrees.Z * deg2rad);
+        Rebuild(rotation);
+    }
+
+    private void Rebuild() => Rebuild(GetRotationMatrix());
+
+    private void Rebuild(Matrix4x4 rotation)
     {
         if (_compositor == null || _root == null) return;
 
@@ -403,11 +591,6 @@ public sealed class Combobulate : Control
         var hostOriginX = (float)(_host?.ActualWidth ?? 0) / 2f;
         var hostOriginY = (float)(_host?.ActualHeight ?? 0) / 2f;
         var origin = new Vector3(hostOriginX, hostOriginY, 0);
-
-        // For back-face culling: a face is front-facing if its model-space normal,
-        // after the current rotation, points toward the viewer. Our perspective
-        // (M34 = -1/d) places the viewer at +Z, so front-facing means viewN.Z > 0.
-        var rotation = GetRotationMatrix();
 
         // Composition has no z-buffer for SpriteVisuals — sibling order is paint order.
         // Collect visible quads with their geometry so we can sort back-to-front

@@ -325,6 +325,7 @@ public sealed class CombobulateSceneVisual : Control
 
         UpdateRootLayout();
         RebuildMesh();
+        TryStartExternalRotationAnimation();
     }
 
     private void UpdateRootLayout()
@@ -342,6 +343,97 @@ public sealed class CombobulateSceneVisual : Control
         // Vertex centres are baked relative to the host size, so a size change
         // requires rebuilding the mesh.
         if (sizeChanged) RebuildMesh();
+        ApplyExternalRotationTransform();
+    }
+
+    private ExpressionAnimation? _externalRotationExpression;
+    private ExpressionAnimation? _externalRotationAnimation;
+    private CompositionPropertySet? _externalRotationBuffer;
+
+    /// <summary>
+    /// Drives the rotation of the captured SceneVisual surface off a caller-
+    /// supplied <see cref="ExpressionAnimation"/> whose result is a
+    /// <c>Vector3</c> of degrees \u2014 (X = pitch, Y = yaw, Z = roll). See
+    /// <see cref="Combobulate.SetExternalRotation"/> for usage examples.
+    ///
+    /// <para>
+    /// <b>Limitation.</b> Because the SceneVisual's mesh has rotation baked
+    /// into its vertices, rotation under an external source is applied as a
+    /// 2D affine transform on the already-rasterised surface (the captured
+    /// snapshot of the mesh at whatever orientation the last internal
+    /// rotation produced). For full 3D rotation, drive the
+    /// <see cref="RotationX"/>/<see cref="RotationY"/>/<see cref="RotationZ"/>
+    /// dependency properties instead, or use the sibling
+    /// <c>Combobulate</c> sprite renderer whose external rotation applies a
+    /// true 3D composition transform.
+    /// </para>
+    /// </summary>
+    public void SetExternalRotation(ExpressionAnimation rotationDegrees)
+    {
+        ArgumentNullException.ThrowIfNull(rotationDegrees);
+        _externalRotationExpression = rotationDegrees;
+        TryStartExternalRotationAnimation();
+    }
+
+    /// <summary>
+    /// Detaches any previously-installed external rotation expression and
+    /// stops the composition expression animation, returning the surface
+    /// sprite to its identity transform.
+    /// </summary>
+    public void ClearExternalRotation()
+    {
+        if (_externalRotationExpression == null) return;
+        _surfaceSprite?.StopAnimation("TransformMatrix");
+        _externalRotationBuffer?.StopAnimation("R");
+        _externalRotationAnimation?.Dispose();
+        _externalRotationAnimation = null;
+        _externalRotationExpression = null;
+        if (_surfaceSprite != null) _surfaceSprite.TransformMatrix = Matrix4x4.Identity;
+    }
+
+    private void TryStartExternalRotationAnimation()
+    {
+        if (_surfaceSprite == null || _compositor == null) return;
+        if (_externalRotationExpression == null) return;
+
+        // See Combobulate.TryStartExternalRotationAnimation for the rationale
+        // behind the internal property-set buffer: it lets the caller's
+        // expression carry its own reference parameters via StartAnimation
+        // instead of via the brittle SetExpressionReferenceParameter path.
+        if (_externalRotationBuffer == null)
+        {
+            _externalRotationBuffer = _compositor.CreatePropertySet();
+            _externalRotationBuffer.InsertVector3("R", Vector3.Zero);
+        }
+        _externalRotationBuffer.StopAnimation("R");
+        _externalRotationBuffer.StartAnimation("R", _externalRotationExpression);
+
+        const string D2R = "0.01745329251994";
+        string toOrigin = "Matrix4x4.CreateTranslation(Vector3(-this.Target.Size.X / 2, -this.Target.Size.Y / 2, 0))";
+        string fromOrigin = "Matrix4x4.CreateTranslation(Vector3(this.Target.Size.X / 2, this.Target.Size.Y / 2, 0))";
+        // Match CreateFromYawPitchRoll's effective order (RotZ * RotX * RotY
+        // for row vectors) so the visible rotation aligns with what the
+        // mesh-bake path produces internally.
+        string rotation =
+            $"Matrix4x4.CreateFromAxisAngle(Vector3(0,0,1), buf.R.Z * {D2R}) * " +
+            $"Matrix4x4.CreateFromAxisAngle(Vector3(1,0,0), buf.R.X * {D2R}) * " +
+            $"Matrix4x4.CreateFromAxisAngle(Vector3(0,1,0), buf.R.Y * {D2R})";
+
+        string fullExpr = $"{toOrigin} * {rotation} * {fromOrigin}";
+
+        _externalRotationAnimation?.Dispose();
+        _externalRotationAnimation = _compositor.CreateExpressionAnimation(fullExpr);
+        _externalRotationAnimation.SetReferenceParameter("buf", _externalRotationBuffer);
+        _surfaceSprite.StartAnimation("TransformMatrix", _externalRotationAnimation);
+    }
+
+    private (double X, double Y, double Z) GetActiveRotation()
+        => (RotationX, RotationY, RotationZ);
+
+    private void ApplyExternalRotationTransform()
+    {
+        // Re-installing the expression on layout updates is unnecessary --
+        // the expression references this.Target.Size which auto-updates.
     }
 
     private void OnModelChanged()
@@ -392,13 +484,33 @@ public sealed class CombobulateSceneVisual : Control
         }
     }
 
-    private void RebuildMesh()
+    /// <summary>
+    /// Rebakes the mesh using the supplied rotation, in degrees. Intended
+    /// for callers that drive <see cref="SetExternalRotation(ExpressionAnimation)"/>
+    /// from the composition thread and need the static SceneVisual mesh to
+    /// re-sync to the current animated value.
+    ///
+    /// <para>
+    /// The control cannot read the animated value itself \u2014 it lives on
+    /// the composition thread \u2014 so the caller must supply it. Must be
+    /// called on the UI thread.
+    /// </para>
+    /// </summary>
+    /// <param name="rotationDegrees">Current rotation as (X = pitch, Y = yaw, Z = roll), in degrees.</param>
+    public void RebuildForExternalRotation(Vector3 rotationDegrees)
+    {
+        RebuildMesh(rotationDegrees);
+    }
+
+    private void RebuildMesh() => RebuildMesh(rotationOverride: null);
+
+    private void RebuildMesh(Vector3? rotationOverride)
     {
         if (_compositor == null || _sceneVisual == null) return;
 
         try
         {
-            RebuildMeshCore();
+            RebuildMeshCore(rotationOverride);
         }
         catch (Exception ex)
         {
@@ -420,7 +532,7 @@ public sealed class CombobulateSceneVisual : Control
         }
     }
 
-    private void RebuildMeshCore()
+    private void RebuildMeshCore(Vector3? rotationOverride)
     {        DisposeSceneTree();
 
         var model = Model;
@@ -449,10 +561,19 @@ public sealed class CombobulateSceneVisual : Control
         var center = new Vector3(w * 0.5f, h * 0.5f, 0f);
 
         const float deg2rad = MathF.PI / 180f;
+        double rotX, rotY, rotZ;
+        if (rotationOverride is { } ov)
+        {
+            rotX = ov.X; rotY = ov.Y; rotZ = ov.Z;
+        }
+        else
+        {
+            (rotX, rotY, rotZ) = GetActiveRotation();
+        }
         var rotation = Quaternion.CreateFromYawPitchRoll(
-            (float)RotationY * deg2rad,
-            (float)RotationX * deg2rad,
-            (float)RotationZ * deg2rad);
+            (float)rotY * deg2rad,
+            (float)rotX * deg2rad,
+            (float)rotZ * deg2rad);
 
         // Single SceneNode acting as the root.
         _modelNode = SceneNode.Create(_compositor);

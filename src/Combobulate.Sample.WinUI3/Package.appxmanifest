@@ -9,7 +9,7 @@
   <Identity
     Name="Combobulate.Sample.WinUI3"
     Publisher="CN=Dev"
-    Version="1.0.0.0" />
+    Version="1.0.7.0" />
 
   <mp:PhoneIdentity PhoneProductId="b0b0b0b0-b0b0-b0b0-b0b0-b0b0b0b0b001" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 

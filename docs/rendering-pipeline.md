@@ -229,7 +229,36 @@ changed, `Rebuild()` is never re-invoked, and the displayed image will exhibit
 the same depth artefacts that the topological sort exists to prevent — visibly
 wrong occlusion for as long as the animation runs.
 
-Three mitigation strategies, in increasing order of effort:
+### The supported workaround: `SetExternalRotation`
+
+The control exposes a composition-native rotation API that addresses this
+directly:
+
+```csharp
+public void SetExternalRotation(ExpressionAnimation rotationDegrees);
+public void ClearExternalRotation();
+public void RebuildForExternalRotation(Vector3 rotationDegrees);
+```
+
+`SetExternalRotation` binds an `ExpressionAnimation` (whose result is a
+`Vector3` of degrees `(pitch, yaw, roll)`) to the composition root's
+`TransformMatrix` via the engine. The visible 3D rotation then updates on
+every composition frame without UI-thread involvement, exactly as the user
+expects.
+
+The painter sort and back-face cull *still* use the rotation snapshot from
+the last UI-thread `Rebuild`. When the animated value drifts far enough that
+the cached order is wrong, snapshot the current value on the UI thread and
+call `RebuildForExternalRotation(currentDegrees)` to re-cull and re-sort
+against it. The control deliberately does not read the animated value
+itself — it cannot cross the thread boundary.
+
+See [Composition-driven rotation](usage.md#composition-driven-rotation) for
+a fuller walkthrough including property-set and time-driven examples.
+
+### Other mitigation strategies
+
+If `SetExternalRotation` doesn't fit your scenario:
 
 ### A. Tick the rebuild from `CompositionTarget.Rendering`
 

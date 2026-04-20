@@ -36,6 +36,9 @@
                           OffContent="Internal (control DPs)"
                           Toggled="ExternalRotationToggle_Toggled"
                           ToolTipService.ToolTip="When ON, rotation sliders apply a Composition TransformMatrix to the controls' outer Visuals. The controls themselves stay at identity — so the SpriteVisual painter sort never re-runs."/>
+            <Button Content="Refresh quads"
+                    Click="RefreshQuads_Click"
+                    ToolTipService.ToolTip="External-mode helper. Re-runs back-face cull / painter sort (Combobulate) and re-bakes mesh (CombobulateSceneVisual) for the current slider rotation."/>
             <TextBlock x:Name="StatusText"
                        VerticalAlignment="Center"
                        Opacity="0.7"
