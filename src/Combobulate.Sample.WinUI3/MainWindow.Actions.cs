@@ -55,6 +55,19 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
     ""zoom"": { ""type"": ""number"", ""minimum"": 1, ""maximum"": 1000 }
   }
 }"),
+        new ActionDescriptor(
+            name: "SetMaterial",
+            description: "Adjusts SceneVisual (Combobulate3D) material/render parameters at runtime so they can be tuned without rebuilding. Any omitted property keeps its current value. emissiveBoost: HDR multiplier on EmissiveFactor (try 1-10). baseColorScale: multiplier on BaseColorFactor (0 = pure-emissive). metallic/roughness: PBR factors. flipZ: toggle Z-axis negation in the projection (changes which faces are front-facing).",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""properties"": {
+    ""emissiveBoost"": { ""type"": ""number"", ""minimum"": 0, ""maximum"": 50 },
+    ""baseColorScale"": { ""type"": ""number"", ""minimum"": 0, ""maximum"": 10 },
+    ""metallic"": { ""type"": ""number"", ""minimum"": 0, ""maximum"": 1 },
+    ""roughness"": { ""type"": ""number"", ""minimum"": 0, ""maximum"": 1 },
+    ""flipZ"": { ""type"": ""boolean"" }
+  }
+}"),
     };
 
     public IReadOnlyList<ActionDescriptor> GetAvailableActions() => _actions;
@@ -68,6 +81,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             case "ResetRotation": return RunOnUi(() => { combobulate.RotationX = 0; combobulate.RotationY = 0; combobulate.RotationZ = 0; });
             case "ResetCube": return RunOnUi(LoadCube);
             case "SetZoom": return DispatchSetZoomAsync(parametersJson);
+            case "SetMaterial": return DispatchSetMaterialAsync(parametersJson);
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -124,6 +138,26 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             return Task.FromResult(ActionResult.Fail("validation_error", "params.zoom is required."));
 
         return RunOnUi(() => combobulate.ModelScale = zoomToken.Value<double>());
+    }
+
+    private Task<ActionResult> DispatchSetMaterialAsync(string parametersJson)
+    {
+        JObject p;
+        try { p = JObject.Parse(parametersJson); }
+        catch { return Task.FromResult(ActionResult.Fail("validation_error", "params is not valid JSON.")); }
+
+        return RunOnUi(() =>
+        {
+            // Apply to both renderers' ModelScale-equivalent material on the
+            // 3D pane. The sprite renderer (combobulate) ignores these.
+            if (p["emissiveBoost"] != null) combobulate3D.EmissiveBoost = p["emissiveBoost"]!.Value<double>();
+            if (p["baseColorScale"] != null) combobulate3D.BaseColorScale = p["baseColorScale"]!.Value<double>();
+            if (p["metallic"] != null) combobulate3D.MetallicFactor = p["metallic"]!.Value<double>();
+            if (p["roughness"] != null) combobulate3D.RoughnessFactor = p["roughness"]!.Value<double>();
+            if (p["flipZ"] != null) combobulate3D.FlipZ = p["flipZ"]!.Value<bool>();
+            // Also push the same zoom to the 3D pane for convenience.
+            combobulate3D.ModelScale = combobulate.ModelScale;
+        });
     }
 
     private Task<ActionResult> RunOnUi(Action action)

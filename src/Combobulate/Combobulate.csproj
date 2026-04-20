@@ -126,6 +126,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Combobulate.cs" />
+    <Compile Include="Combobulate3D.cs" />
     <Compile Include="GlobalUsings.cs" />
     <Compile Include="Caching\ObjCache.cs" />
     <Compile Include="Caching\ObjGeometry.cs" />

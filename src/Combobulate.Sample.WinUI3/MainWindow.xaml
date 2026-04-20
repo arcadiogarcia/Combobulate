@@ -33,12 +33,43 @@
                        Text="Loaded: built-in cube"/>
         </StackPanel>
 
-        <c:Combobulate x:Name="combobulate"
-                       Grid.Row="2"
-                       ModelScale="120"
-                       Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
-                       BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
-                       BorderThickness="1"/>
+        <Grid Grid.Row="2" ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Column="0" Grid.Row="0"
+                       Text="SpriteVisual (painter sort)"
+                       Style="{ThemeResource CaptionTextBlockStyle}"
+                       Opacity="0.7" Margin="0,0,0,4"/>
+            <TextBlock Grid.Column="1" Grid.Row="0"
+                       Text="SceneVisual (z-buffer)"
+                       Style="{ThemeResource CaptionTextBlockStyle}"
+                       Opacity="0.7" Margin="0,0,0,4"/>
+
+            <c:Combobulate x:Name="combobulate"
+                           Grid.Column="0" Grid.Row="1"
+                           ModelScale="120"
+                           Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
+                           BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                           BorderThickness="1"/>
+
+            <c:Combobulate3D x:Name="combobulate3D"
+                             Grid.Column="1" Grid.Row="1"
+                             ModelScale="{x:Bind combobulate.ModelScale, Mode=OneWay}"
+                             RotationX="{x:Bind combobulate.RotationX, Mode=OneWay}"
+                             RotationY="{x:Bind combobulate.RotationY, Mode=OneWay}"
+                             RotationZ="{x:Bind combobulate.RotationZ, Mode=OneWay}"
+                             Model="{x:Bind combobulate.Model, Mode=OneWay}"
+                             Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
+                             BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                             BorderThickness="1"/>
+        </Grid>
 
         <!--
             Thumbnail strip. Each thumbnail is a separate Combobulate control bound
