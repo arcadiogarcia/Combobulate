@@ -77,6 +77,7 @@ public sealed class CombobulateSceneVisual : Control
     private SceneVisual? _sceneVisual;
     private SceneNode? _modelNode;
     private ObjGeometry? _geometry;
+    private string? _pendingSource;
 
     public CombobulateSceneVisual()
     {
@@ -261,7 +262,16 @@ public sealed class CombobulateSceneVisual : Control
         TryAttachVisuals();
     }
 
-    private void OnLoaded(object sender, RoutedEventArgs e) => TryAttachVisuals();
+    private void OnLoaded(object sender, RoutedEventArgs e)
+    {
+        TryAttachVisuals();
+        if (_pendingSource != null)
+        {
+            var key = _pendingSource;
+            _pendingSource = null;
+            OnSourceChanged(key);
+        }
+    }
 
     private void OnUnloaded(object sender, RoutedEventArgs e)
     {
@@ -453,10 +463,15 @@ public sealed class CombobulateSceneVisual : Control
         }
         catch (Exception)
         {
+            // See Combobulate.OnSourceChanged: defer retry until OnLoaded so XAML
+            // Source="key" applied during InitializeComponent still works when the
+            // app registers the keyed cache from code-behind right after.
             _geometry = null;
+            _pendingSource = newValue;
             Model = null;
             return;
         }
+        _pendingSource = null;
 
         _geometry = geometry;
         if (!ReferenceEquals(Model, geometry.Model))

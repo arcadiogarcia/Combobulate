@@ -216,7 +216,20 @@ public sealed class Combobulate : Control
         TryAttachVisuals();
     }
 
-    private void OnLoaded(object sender, RoutedEventArgs e) => TryAttachVisuals();
+    private void OnLoaded(object sender, RoutedEventArgs e)
+    {
+        TryAttachVisuals();
+        // If a Source set in XAML failed to resolve during construction (e.g. the
+        // app registered the keyed cache entry from code-behind AFTER InitializeComponent
+        // returned), retry now that we are loaded and any code-behind initialisation has
+        // had a chance to run.
+        if (_pendingSource != null)
+        {
+            var key = _pendingSource;
+            _pendingSource = null;
+            OnSourceChanged(key);
+        }
+    }
 
     private void OnUnloaded(object sender, RoutedEventArgs e)
     {
@@ -480,14 +493,18 @@ public sealed class Combobulate : Control
         }
         catch (Exception)
         {
-            // Surface failures by clearing the model. Callers can listen to Model changes
-            // or check ObjCache directly for richer diagnostics.
+            // Resolution can fail when XAML sets Source before code-behind has had a
+            // chance to register the keyed cache entry (Source="key" attribute is
+            // applied during InitializeComponent). Stash the value and retry from
+            // OnLoaded once user code has run.
             _sourceKey = null;
             _sourceDirectory = null;
             _geometry = null;
+            _pendingSource = newValue;
             Model = null;
             return;
         }
+        _pendingSource = null;
 
         _sourceKey = newValue;
         try
@@ -519,6 +536,7 @@ public sealed class Combobulate : Control
     private ObjGeometry? _geometry;
     private string? _sourceKey;
     private string? _sourceDirectory;
+    private string? _pendingSource;
 
     // --- Per-instance render-state cache, keyed off the active geometry. -----
     // Sprites are created once per quad and reused across rebuilds; rotation only
@@ -806,14 +824,17 @@ public sealed class Combobulate : Control
         var order = TopologicalPainterSort(visibleIndices, visCount, cachedQuads, geometry.Predecessors, rotation, _slotScratch!);
 
         // Reorder children only if the painter order actually changed. Sprites already
-        // live under _root; InsertAtTop on an existing child is a sibling-reorder, not a
-        // new attach. Walking visible quads back-to-front and InsertAtTop'ing each one
-        // leaves the last-painted (frontmost) on top.
+        // live under _root; VisualCollection.InsertAtTop throws E_INVALIDARG when the
+        // child still has a parent (even if it's the same parent), so we must Remove
+        // first. Walking visible quads back-to-front and re-attaching each one leaves
+        // the last-painted (frontmost) on top.
         if (!OrderEquals(order, _lastOrder))
         {
             for (int i = 0; i < order.Length; i++)
             {
-                _root.Children.InsertAtTop(pool[order[i]]!);
+                var sprite = pool[order[i]]!;
+                _root.Children.Remove(sprite);
+                _root.Children.InsertAtTop(sprite);
             }
             _lastOrder = order;
         }
