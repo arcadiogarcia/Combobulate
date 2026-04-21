@@ -53,7 +53,46 @@ public sealed partial class MainWindow : Window
 
     private void Rotation_ValueChanged(object sender, RangeBaseValueChangedEventArgs e) => ApplyRotation();
 
-    private void ExternalRotationToggle_Toggled(object sender, RoutedEventArgs e) => ApplyRotation();
+    private void ExternalRotationToggle_Toggled(object sender, RoutedEventArgs e)
+    {
+        ApplyRotation();
+        UpdateAutoRefresh();
+    }
+
+    private void AutoRefreshToggle_Toggled(object sender, RoutedEventArgs e) => UpdateAutoRefresh();
+
+    /// <summary>
+    /// Auto-refresh only makes sense in external-rotation mode (in internal mode each
+    /// rotation DP setter already triggers a Rebuild on the UI thread). When both
+    /// toggles are on, subscribe Combobulate to <c>CompositionTarget.Rendering</c> via
+    /// <c>EnableAutoRefresh</c> with a sampler that reads the live property set the
+    /// expression animation already drives. The sampler also pokes the SceneVisual
+    /// renderer's <c>RebuildForExternalRotation</c> so both side-by-side views stay
+    /// in sync as the value updates from any thread.
+    /// </summary>
+    private void UpdateAutoRefresh()
+    {
+        if (combobulate == null) return;
+        bool external = ExternalRotationToggle?.IsOn == true;
+        bool wantAuto = external && AutoRefreshToggle?.IsOn == true;
+
+        if (wantAuto)
+        {
+            var (props, _) = GetOrCreateExternalRotation();
+            combobulate.EnableAutoRefresh(() =>
+            {
+                props.TryGetVector3("Rotation", out var r);
+                // CombobulateSceneVisual doesn't have its own auto-refresh hook yet,
+                // so piggy-back the same per-frame tick to keep its mesh in sync.
+                combobulateSceneVisual.RebuildForExternalRotation(r);
+                return r;
+            });
+        }
+        else
+        {
+            combobulate.DisableAutoRefresh();
+        }
+    }
 
     private void RefreshQuads_Click(object sender, RoutedEventArgs e)
     {

@@ -48,6 +48,11 @@
             <Button Content="Refresh quads"
                     Click="RefreshQuads_Click"
                     ToolTipService.ToolTip="External-mode helper. Re-runs back-face cull / painter sort (Combobulate) and re-bakes mesh (CombobulateSceneVisual) for the current slider rotation."/>
+            <ToggleSwitch x:Name="AutoRefreshToggle"
+                          OnContent="Auto-refresh"
+                          OffContent="Manual refresh"
+                          Toggled="AutoRefreshToggle_Toggled"
+                          ToolTipService.ToolTip="Only meaningful in external rotation mode. When ON, subscribes to CompositionTarget.Rendering and feeds the live property-set value into RebuildForExternalRotation per UI tick — painter sort and back-face cull stay in sync as the model spins, no manual Refresh needed."/>
             <TextBlock x:Name="StatusText"
                        VerticalAlignment="Center"
                        Opacity="0.7"
