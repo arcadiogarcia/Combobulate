@@ -37,9 +37,6 @@
                 <ComboBoxItem Content="UseFallback"/>
                 <ComboBoxItem Content="UseDiffuse"/>
             </ComboBox>
-            <Button Content="Paint a face"
-                    Click="PaintFace_Click"
-                    ToolTipService.ToolTip="Registers an updateable texture on the 'cube' key and animates pixels into it — no Rebuild, no flicker."/>
             <ToggleSwitch x:Name="ExternalRotationToggle"
                           OnContent="External (composition)"
                           OffContent="Internal (control DPs)"
@@ -53,6 +50,11 @@
                           OffContent="Manual refresh"
                           Toggled="AutoRefreshToggle_Toggled"
                           ToolTipService.ToolTip="Only meaningful in external rotation mode. When ON, subscribes to CompositionTarget.Rendering and feeds the live property-set value into RebuildForExternalRotation per UI tick — painter sort and back-face cull stay in sync as the model spins, no manual Refresh needed."/>
+            <ToggleSwitch x:Name="SpinToggle"
+                          OnContent="Spin"
+                          OffContent="Static"
+                          Toggled="SpinToggle_Toggled"
+                          ToolTipService.ToolTip="Autonomous continuous Y-axis spin. Turns on External + Auto-refresh automatically and advances the shared rotation property set from the CompositionTarget.Rendering tick — one coherent yaw per frame, visible to both renderers' cull/sort via the same expression animation."/>
             <TextBlock x:Name="StatusText"
                        VerticalAlignment="Center"
                        Opacity="0.7"

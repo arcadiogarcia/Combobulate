@@ -1,7 +1,6 @@
 using System;
 using System.IO;
 using System.Numerics;
-using System.Runtime.InteropServices.WindowsRuntime;
 using Combobulate.Caching;
 using Combobulate.Parsing;
 using Microsoft.UI.Composition;
@@ -9,9 +8,7 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Hosting;
-using Windows.Graphics.Imaging;
 using Windows.Storage.Pickers;
-using Windows.UI;
 using WinRT.Interop;
 
 namespace Combobulate.Sample.WinUI3;
@@ -62,6 +59,37 @@ public sealed partial class MainWindow : Window
     private void AutoRefreshToggle_Toggled(object sender, RoutedEventArgs e) => UpdateAutoRefresh();
 
     /// <summary>
+    /// Autonomous continuous Y-axis spin. Implicitly enables External + Auto-refresh
+    /// (spin is meaningless without them: external routes rotation through composition,
+    /// auto-refresh keeps cull/sort in sync). The per-frame sampler below writes the
+    /// advanced yaw into the shared rotation <see cref="CompositionPropertySet"/>, so
+    /// both renderers (<c>SpriteVisual</c> and <c>SceneVisual</c>) see identical live
+    /// values each tick via their expression animation.
+    /// </summary>
+    private void SpinToggle_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (SpinToggle == null) return;
+        if (SpinToggle.IsOn)
+        {
+            if (ExternalRotationToggle != null && !ExternalRotationToggle.IsOn)
+                ExternalRotationToggle.IsOn = true;
+            if (AutoRefreshToggle != null && !AutoRefreshToggle.IsOn)
+                AutoRefreshToggle.IsOn = true;
+            _spinStart = DateTime.UtcNow;
+            _spinBaseYaw = (float)(YawSlider?.Value ?? 0);
+        }
+        else
+        {
+            _spinStart = null;
+        }
+        UpdateAutoRefresh();
+    }
+
+    private DateTime? _spinStart;
+    private float _spinBaseYaw;
+    private const float SpinSecondsPerTurn = 6f;
+
+    /// <summary>
     /// Auto-refresh only makes sense in external-rotation mode (in internal mode each
     /// rotation DP setter already triggers a Rebuild on the UI thread). When both
     /// toggles are on, subscribe Combobulate to <c>CompositionTarget.Rendering</c> via
@@ -81,6 +109,23 @@ public sealed partial class MainWindow : Window
             var (props, _) = GetOrCreateExternalRotation();
             combobulate.EnableAutoRefresh(() =>
             {
+                // If autonomous spin is engaged, advance the shared property set ourselves
+                // from wall-clock time. Driving the value through the same props the
+                // expression animation references means both renderers (and their cull/sort
+                // samplers) see a single coherent yaw per frame — no composer-snapshot lag.
+                if (_spinStart is DateTime t0)
+                {
+                    var secs = (float)(DateTime.UtcNow - t0).TotalSeconds;
+                    var yaw = _spinBaseYaw + (secs / SpinSecondsPerTurn) * 360f;
+                    // Wrap to keep the float well-conditioned over long runs.
+                    yaw -= MathF.Floor(yaw / 360f) * 360f;
+                    var pitch = (float)(PitchSlider?.Value ?? 0);
+                    var roll = (float)(RollSlider?.Value ?? 0);
+                    var live = new Vector3(pitch, yaw, roll);
+                    props.InsertVector3("Rotation", live);
+                    combobulateSceneVisual.RebuildForExternalRotation(live);
+                    return live;
+                }
                 props.TryGetVector3("Rotation", out var r);
                 // CombobulateSceneVisual doesn't have its own auto-refresh hook yet,
                 // so piggy-back the same per-frame tick to keep its mesh in sync.
@@ -228,81 +273,6 @@ public sealed partial class MainWindow : Window
             "UseDiffuse" => global::Combobulate.MaterialMode.UseDiffuse,
             _ => global::Combobulate.MaterialMode.Auto,
         };
-    }
-
-    private ObjTextureSource? _paintSource;
-    private DispatcherTimer? _paintTimer;
-    private int _paintTick;
-
-    /// <summary>
-    /// Demonstrates app-rendered textures via <see cref="ObjTextureSource.FromBitmap"/>:
-    /// register a programmatic <see cref="ObjMaterialPack"/> against the "cube" key, then
-    /// keep painting into the same source. Calls to <c>Update</c> repoint the cached
-    /// composition surface — no <c>Rebuild</c>, no flicker.
-    /// </summary>
-    private void PaintFace_Click(object sender, RoutedEventArgs e)
-    {
-        if (_paintSource == null)
-        {
-            var bitmap = MakePaintBitmap(0);
-            _paintSource = ObjTextureSource.FromBitmap(bitmap);
-
-            ObjCache.RegisterMaterials(CubeKey, new ObjMaterialPackBuilder()
-            {
-                Fallback = new ObjMaterial
-                {
-                    Name = "paint",
-                    DiffuseTexture = _paintSource,
-                    DiffuseColor = Color.FromArgb(255, 200, 200, 200),
-                },
-            }.Build());
-
-            // Re-source the control to pick up the freshly registered pack.
-            combobulate.Source = CubeKey;
-
-            _paintTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
-            _paintTimer.Tick += (_, _) =>
-            {
-                _paintTick++;
-                _paintSource!.Update(MakePaintBitmap(_paintTick));
-            };
-            _paintTimer.Start();
-
-            StatusText.Text = "Painting — same texture surface, live updates.";
-        }
-        else
-        {
-            _paintTimer?.Stop();
-            _paintTimer = null;
-            _paintSource = null;
-            ObjCache.InvalidateMaterials(CubeKey);
-            combobulate.Source = CubeKey;
-            StatusText.Text = "Paint stopped.";
-        }
-    }
-
-    private static SoftwareBitmap MakePaintBitmap(int tick)
-    {
-        const int size = 128;
-        var bmp = new SoftwareBitmap(BitmapPixelFormat.Bgra8, size, size, BitmapAlphaMode.Premultiplied);
-        var bytes = new byte[size * size * 4];
-        for (int y = 0; y < size; y++)
-        {
-            for (int x = 0; x < size; x++)
-            {
-                var i = (y * size + x) * 4;
-                var phase = (x + y + tick * 3) * 0.05f;
-                byte r = (byte)(127 + 127 * MathF.Sin(phase));
-                byte g = (byte)(127 + 127 * MathF.Sin(phase + 2.094f));
-                byte b = (byte)(127 + 127 * MathF.Sin(phase + 4.188f));
-                bytes[i + 0] = b;
-                bytes[i + 1] = g;
-                bytes[i + 2] = r;
-                bytes[i + 3] = 255;
-            }
-        }
-        bmp.CopyFromBuffer(bytes.AsBuffer());
-        return bmp;
     }
 
     private static string? ResolveSamplePath(string fileName)
