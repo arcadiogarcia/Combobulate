@@ -156,6 +156,9 @@ public sealed partial class MainWindow : Window
             combobulate.RotationZ = z;
             // combobulateSceneVisual mirrors combobulate's rotation via x:Bind.
         }
+#if DEBUG
+        LogCurrentRotation();
+#endif
     }
 
     private async void LoadObjButton_Click(object sender, RoutedEventArgs e)

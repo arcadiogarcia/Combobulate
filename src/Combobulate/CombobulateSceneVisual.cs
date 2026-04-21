@@ -381,6 +381,10 @@ public sealed class CombobulateSceneVisual : Control
     public void SetExternalRotation(ExpressionAnimation rotationDegrees)
     {
         if (rotationDegrees is null) throw new ArgumentNullException(nameof(rotationDegrees));
+        // See Combobulate.SetExternalRotation: re-installing the same expression
+        // every slider tick re-creates the composition animation chain and
+        // produces a one-frame transform lag. Idempotent install fixes that.
+        if (ReferenceEquals(_externalRotationExpression, rotationDegrees)) return;
         _externalRotationExpression = rotationDegrees;
         TryStartExternalRotationAnimation();
     }
@@ -515,6 +519,20 @@ public sealed class CombobulateSceneVisual : Control
     public void RebuildForExternalRotation(Vector3 rotationDegrees)
     {
         RebuildMesh(rotationDegrees);
+        // The mesh now has the full rotation baked into its vertices. If
+        // SetExternalRotation also installed a 2D affine TransformMatrix
+        // animation against the rasterised surface, that animation would
+        // double-apply on top of the baked rotation (visually: the right-
+        // hand SceneVisual gets rotated/skewed twice). Stop the surface
+        // animation and reset to identity so the baked mesh is the sole
+        // source of truth. The expression buffer ("R") is left running
+        // so callers can still drive the next rebake through the same
+        // property set without re-installing.
+        if (_surfaceSprite != null && _externalRotationExpression != null)
+        {
+            _surfaceSprite.StopAnimation("TransformMatrix");
+            _surfaceSprite.TransformMatrix = Matrix4x4.Identity;
+        }
     }
 
     private void RebuildMesh() => RebuildMesh(rotationOverride: null);

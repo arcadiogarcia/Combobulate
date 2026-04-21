@@ -42,6 +42,24 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             description: "Resets all three rotation axes to 0.",
             parameterSchema: @"{""type"":""object"",""properties"":{}}"),
         new ActionDescriptor(
+            name: "GetState",
+            description: "Returns the current viewer state (rotation X/Y/Z degrees, zoom, external-rotation toggle, auto-refresh toggle, current Source) PLUS a snapshot of the sprite renderer's per-frame cull/order caches (visible[], order[]), the live _root.Children stack, and the live SpriteVisual.IsVisible flags. Returned via the ActionResult.Consequences string list as 'key=value' lines so a caller can correlate a screenshot with the exact internal state that produced it.",
+            parameterSchema: @"{""type"":""object"",""properties"":{}}"),
+        new ActionDescriptor(
+            name: "ForceRebuild",
+            description: "Diagnostic: invalidates the sprite renderer's per-frame cull/order skip caches (_lastVisible, _lastOrder) and triggers a full rebuild against the current rotation. Use this when the view looks broken: if it heals after this call, the bug is in the skip caches; if not, the bug is elsewhere (rotation matrix, expression animation, painter algorithm).",
+            parameterSchema: @"{""type"":""object"",""properties"":{}}"),
+        new ActionDescriptor(
+            name: "SetToggles",
+            description: "Sets the ExternalRotation and AutoRefresh toggle switches. Either or both may be omitted to keep current. Use this to script the exact mode used to reproduce a rotation-update bug.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""properties"": {
+    ""externalRotation"": { ""type"": ""boolean"" },
+    ""autoRefresh"": { ""type"": ""boolean"" }
+  }
+}"),
+        new ActionDescriptor(
             name: "ResetCube",
             description: "Reloads the built-in cube model.",
             parameterSchema: @"{""type"":""object"",""properties"":{}}"),
@@ -79,6 +97,14 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             case "LoadObjFromPath": return DispatchLoadObjFromPathAsync(parametersJson);
             case "SetRotation": return DispatchSetRotationAsync(parametersJson);
             case "ResetRotation": return RunOnUi(() => { PitchSlider.Value = 0; YawSlider.Value = 0; RollSlider.Value = 0; });
+            case "GetState": return DispatchGetStateAsync();
+            case "ForceRebuild": return RunOnUi(() =>
+            {
+                combobulate.InvalidateRenderCaches();
+                var rot = new System.Numerics.Vector3((float)PitchSlider.Value, (float)YawSlider.Value, (float)RollSlider.Value);
+                combobulate.RebuildForExternalRotation(rot);
+            });
+            case "SetToggles": return DispatchSetTogglesAsync(parametersJson);
             case "ResetCube": return RunOnUi(LoadCube);
             case "SetZoom": return DispatchSetZoomAsync(parametersJson);
             case "SetMaterial": return DispatchSetMaterialAsync(parametersJson);
@@ -158,6 +184,74 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             // Also push the same zoom to the 3D pane for convenience.
             combobulateSceneVisual.ModelScale = combobulate.ModelScale;
         });
+    }
+
+    private Task<ActionResult> DispatchSetTogglesAsync(string parametersJson)
+    {
+        JObject p;
+        try { p = JObject.Parse(parametersJson); }
+        catch { return Task.FromResult(ActionResult.Fail("validation_error", "params is not valid JSON.")); }
+
+        return RunOnUi(() =>
+        {
+            if (p["externalRotation"] != null && ExternalRotationToggle != null)
+                ExternalRotationToggle.IsOn = p["externalRotation"]!.Value<bool>();
+            if (p["autoRefresh"] != null && AutoRefreshToggle != null)
+                AutoRefreshToggle.IsOn = p["autoRefresh"]!.Value<bool>();
+        });
+    }
+
+    private Task<ActionResult> DispatchGetStateAsync()
+    {
+        var tcs = new TaskCompletionSource<ActionResult>();
+        var dq = this.DispatcherQueue;
+        if (!dq.TryEnqueue(DispatcherQueuePriority.Normal, () =>
+        {
+            try
+            {
+                var (cacheVisible, cacheOrder) = combobulate.GetRenderCacheSnapshot();
+                var actualOrder = combobulate.GetActualChildrenOrder();
+                var liveVisible = combobulate.GetLiveSpriteVisibility();
+                var lines = new List<string>
+                {
+                    $"rotationX={PitchSlider.Value:F3}",
+                    $"rotationY={YawSlider.Value:F3}",
+                    $"rotationZ={RollSlider.Value:F3}",
+                    $"zoom={combobulate.ModelScale:F3}",
+                    $"externalRotation={(ExternalRotationToggle?.IsOn == true)}",
+                    $"autoRefresh={(AutoRefreshToggle?.IsOn == true)}",
+                    $"perspective={combobulate.EnablePerspective}",
+                    $"source={combobulate.Source ?? "(null)"}",
+                    $"cache.visible={string.Join(",", cacheVisible)}",
+                    $"cache.order={string.Join(",", cacheOrder)}",
+                    $"children.actual={string.Join(",", actualOrder)}",
+                    $"sprite.visible={string.Join(",", liveVisible)}",
+                };
+                tcs.SetResult(ActionResult.Ok(lines));
+            }
+            catch (Exception ex) { tcs.SetResult(ActionResult.Fail("execution_error", ex.Message)); }
+        }))
+        {
+            tcs.SetResult(ActionResult.Fail("execution_error", "Failed to enqueue UI work."));
+        }
+        return tcs.Task;
+    }
+
+    /// <summary>
+    /// Continuous diagnostic log: writes the current rotation triple to the rover
+    /// log every time ApplyRotation runs so a tail of the diagnostic log shows
+    /// the live angle history.
+    /// </summary>
+    internal void LogCurrentRotation()
+    {
+        try
+        {
+            zRover.WinUI.RoverMcp.Log(
+                "Combobulate",
+                $"rotation x={PitchSlider.Value:F2} y={YawSlider.Value:F2} z={RollSlider.Value:F2} " +
+                $"external={ExternalRotationToggle?.IsOn == true} auto={AutoRefreshToggle?.IsOn == true}");
+        }
+        catch { /* logger is best-effort */ }
     }
 
     private Task<ActionResult> RunOnUi(Action action)

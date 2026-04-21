@@ -311,6 +311,13 @@ public sealed class Combobulate : Control
     public void SetExternalRotation(ExpressionAnimation rotationDegrees)
     {
         if (rotationDegrees is null) throw new ArgumentNullException(nameof(rotationDegrees));
+        // Idempotent: re-installing the same expression every slider tick was
+        // tearing down and rebuilding the composition animation chain on the
+        // root, which causes a one-frame lag where _root.TransformMatrix is
+        // still showing the previous matrix while the cull/sort run on the
+        // freshly-pushed property-set value. The visible symptom is a quad
+        // jump that looks "wrong" until the next slider tick recovers.
+        if (ReferenceEquals(_externalRotationExpression, rotationDegrees)) return;
         _externalRotationExpression = rotationDegrees;
         TryStartExternalRotationAnimation();
     }
@@ -654,6 +661,75 @@ public sealed class Combobulate : Control
 #else
         Windows.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
 #endif
+    }
+
+    /// <summary>
+    /// Diagnostic helper: forces the next rebuild to re-emit IsVisible flags and
+    /// child-order updates for every quad, regardless of the per-frame skip
+    /// optimisations (<c>_lastVisible</c> / <c>_lastOrder</c>). If a known-broken
+    /// view heals after calling this, the bug lives in the skip caches.
+    /// </summary>
+    public void InvalidateRenderCaches()
+    {
+        if (_lastVisible != null)
+            for (int i = 0; i < _lastVisible.Length; i++) _lastVisible[i] = false;
+        _lastOrder = Array.Empty<int>();
+    }
+
+    /// <summary>
+    /// Diagnostic snapshot of the per-frame skip caches. Returns the visible
+    /// flag for every quad (in cached-quad index order) and the painter order
+    /// (sequence of cached-quad indices, back to front). UI thread only.
+    /// </summary>
+    public (bool[] visible, int[] order) GetRenderCacheSnapshot()
+    {
+        var v = _lastVisible == null ? Array.Empty<bool>() : (bool[])_lastVisible.Clone();
+        var o = (int[])_lastOrder.Clone();
+        return (v, o);
+    }
+
+    /// <summary>
+    /// Diagnostic: returns the actual <c>_root.Children</c> stack as cached-quad
+    /// indices, bottom to top. This is the ground truth of what compositor will
+    /// render and includes hidden sprites still parented in the collection.
+    /// Compare against <see cref="GetRenderCacheSnapshot"/>.order to confirm the
+    /// visible subset's relative ordering matches what the painter sort decided.
+    /// </summary>
+    public int[] GetActualChildrenOrder()
+    {
+        if (_root == null || _spritePool == null) return Array.Empty<int>();
+        var children = _root.Children;
+        var pool = _spritePool;
+        var result = new int[children.Count];
+        int k = 0;
+        foreach (var child in children)
+        {
+            int idx = -1;
+            for (int i = 0; i < pool.Length; i++)
+            {
+                if (ReferenceEquals(pool[i], child)) { idx = i; break; }
+            }
+            result[k++] = idx;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Diagnostic: returns the LIVE <c>SpriteVisual.IsVisible</c> for every pooled
+    /// sprite (in cached-quad index order). Compare against
+    /// <see cref="GetRenderCacheSnapshot"/>.visible to detect a divergence between
+    /// what the cull code thinks it pushed and what the sprite property actually holds.
+    /// </summary>
+    public bool[] GetLiveSpriteVisibility()
+    {
+        if (_spritePool == null) return Array.Empty<bool>();
+        var result = new bool[_spritePool.Length];
+        for (int i = 0; i < _spritePool.Length; i++)
+        {
+            var s = _spritePool[i];
+            result[i] = s != null && s.IsVisible;
+        }
+        return result;
     }
 
     /// <summary>Stops the auto-refresh loop installed by <see cref="EnableAutoRefresh"/>.</summary>
