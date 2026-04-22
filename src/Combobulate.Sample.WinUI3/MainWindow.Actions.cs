@@ -86,6 +86,16 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
     ""flipZ"": { ""type"": ""boolean"" }
   }
 }"),
+        new ActionDescriptor(
+            name: "SetSpin",
+            description: "Toggles the SpinToggle (autonomous Y-axis spin). Pass on=true to start, false to stop.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""required"": [""on""],
+  ""properties"": {
+    ""on"": { ""type"": ""boolean"" }
+  }
+}"),
     };
 
     public IReadOnlyList<ActionDescriptor> GetAvailableActions() => _actions;
@@ -108,6 +118,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             case "ResetCube": return RunOnUi(LoadCube);
             case "SetZoom": return DispatchSetZoomAsync(parametersJson);
             case "SetMaterial": return DispatchSetMaterialAsync(parametersJson);
+            case "SetSpin": return DispatchSetSpinAsync(parametersJson);
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -184,6 +195,17 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             // Also push the same zoom to the 3D pane for convenience.
             combobulateSceneVisual.ModelScale = combobulate.ModelScale;
         });
+    }
+
+    private Task<ActionResult> DispatchSetSpinAsync(string parametersJson)
+    {
+        JObject p;
+        try { p = JObject.Parse(parametersJson); }
+        catch { return Task.FromResult(ActionResult.Fail("validation_error", "params is not valid JSON.")); }
+        var onToken = p["on"];
+        if (onToken == null) return Task.FromResult(ActionResult.Fail("validation_error", "params.on is required."));
+        var on = onToken.Value<bool>();
+        return RunOnUi(() => { if (SpinToggle != null) SpinToggle.IsOn = on; });
     }
 
     private Task<ActionResult> DispatchSetTogglesAsync(string parametersJson)
