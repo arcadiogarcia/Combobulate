@@ -96,6 +96,15 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
     ""on"": { ""type"": ""boolean"" }
   }
 }"),
+        new ActionDescriptor(
+            name: "DumpSpinDiagnostics",
+            description: "Returns per-tick spin instrumentation: total ticks, total wall-clock elapsed, frame-time stats (min/max/avg/p99 deltaMs), GC collection counts since spin start, last-N tick rows. Use this after running spin for ~30-60s to diagnose CPU/GPU clock drift, frame jitter, or GC-induced stalls.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""properties"": {
+    ""lastN"": { ""type"": ""integer"", ""minimum"": 0, ""maximum"": 1024, ""description"": ""Number of most-recent ring-buffer rows to dump (default 0 = stats only)."" }
+  }
+}"),
     };
 
     public IReadOnlyList<ActionDescriptor> GetAvailableActions() => _actions;
@@ -119,6 +128,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             case "SetZoom": return DispatchSetZoomAsync(parametersJson);
             case "SetMaterial": return DispatchSetMaterialAsync(parametersJson);
             case "SetSpin": return DispatchSetSpinAsync(parametersJson);
+            case "DumpSpinDiagnostics": return DispatchDumpSpinDiagnosticsAsync(parametersJson);
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -206,6 +216,29 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
         if (onToken == null) return Task.FromResult(ActionResult.Fail("validation_error", "params.on is required."));
         var on = onToken.Value<bool>();
         return RunOnUi(() => { if (SpinToggle != null) SpinToggle.IsOn = on; });
+    }
+
+    private Task<ActionResult> DispatchDumpSpinDiagnosticsAsync(string parametersJson)
+    {
+        int lastN = 0;
+        try
+        {
+            var p = JObject.Parse(parametersJson);
+            if (p["lastN"] != null) lastN = Math.Clamp(p["lastN"]!.Value<int>(), 0, 1024);
+        }
+        catch { /* tolerate missing/empty params */ }
+
+        var tcs = new TaskCompletionSource<ActionResult>();
+        var dq = this.DispatcherQueue;
+        if (!dq.TryEnqueue(DispatcherQueuePriority.Normal, () =>
+        {
+            try { tcs.SetResult(ActionResult.Ok(DumpSpinDiagnosticsLines(lastN))); }
+            catch (Exception ex) { tcs.SetResult(ActionResult.Fail("execution_error", ex.Message)); }
+        }))
+        {
+            tcs.SetResult(ActionResult.Fail("execution_error", "Failed to enqueue UI work."));
+        }
+        return tcs.Task;
     }
 
     private Task<ActionResult> DispatchSetTogglesAsync(string parametersJson)

@@ -99,6 +99,27 @@ public sealed partial class MainWindow : Window
     private DateTime? _spinStart;
     private const float SpinSecondsPerTurn = 6f;
 
+    // ===== Spin instrumentation =====
+    // Ring buffer of per-sampler-tick records, used by DumpSpinDiagnostics to
+    // diagnose CPU/GPU drift, frame-time jitter, and GC pauses during long spins.
+    private readonly System.Diagnostics.Stopwatch _spinClock = new();
+    private struct SpinTick
+    {
+        public long ElapsedTicks;       // _spinClock.ElapsedTicks at sample
+        public float CpuYawWrapped;     // what the cull/sort received
+        public float CpuYawRaw;         // pre-wrap (to see precision drift)
+        public float DeltaMsSincePrev;  // wall-clock gap between this tick and the previous
+        public int Gc0, Gc1, Gc2;       // snapshot of GC.CollectionCount
+        public byte VisibleMask;        // bit i = sprite i was last set IsVisible=true
+        public byte VisibleCount;       // popcount of VisibleMask
+        public float GpuSpinYawCached;  // TryGetScalar("SpinYaw") at this tick (often stale=0 for animated, but log it)
+    }
+    private SpinTick[] _spinRing = new SpinTick[1024]; // ~17s at 60Hz
+    private int _spinRingHead;       // next slot to write
+    private long _spinTickCount;     // total sampler invocations since spin start
+    private long _prevTickElapsedTicks;
+    private int _gc0AtStart, _gc1AtStart, _gc2AtStart;
+
     /// <summary>
     /// Start the looping Composition KFA that drives <c>SpinYaw</c> on the GPU,
     /// and capture the wall-clock epoch the CPU sampler uses to compute the same
@@ -120,6 +141,17 @@ public sealed partial class MainWindow : Window
         // Set CPU epoch as close as possible to the StartAnimation call so the two
         // clocks line up. Any sub-frame skew is constant and visually invisible.
         _spinStart = DateTime.UtcNow;
+        // Reset instrumentation. Stopwatch is a stable monotonic clock (QPC) and
+        // is the same source the compositor uses internally, so we use it for
+        // delta-ms measurements (DateTime.UtcNow can jump on NTP correction).
+        _spinClock.Restart();
+        _spinRingHead = 0;
+        _spinTickCount = 0;
+        _prevTickElapsedTicks = 0;
+        Array.Clear(_spinRing, 0, _spinRing.Length);
+        _gc0AtStart = GC.CollectionCount(0);
+        _gc1AtStart = GC.CollectionCount(1);
+        _gc2AtStart = GC.CollectionCount(2);
     }
 
     private void StopGpuSpin()
@@ -129,6 +161,98 @@ public sealed partial class MainWindow : Window
         _externalRotationProps.StopAnimation("SpinYaw");
         _externalRotationProps.InsertScalar("SpinYaw", 0f);
         _externalRotationProps.InsertScalar("SpinActive", 0f);
+    }
+
+    /// <summary>
+    /// Snapshot of the per-tick spin instrumentation. Returns one summary
+    /// section followed by optionally <paramref name="lastN"/> raw rows.
+    /// Called from the rover <c>DumpSpinDiagnostics</c> action; no harm if
+    /// invoked outside spin (it just reports zeroed counters).
+    /// </summary>
+    internal System.Collections.Generic.List<string> DumpSpinDiagnosticsLines(int lastN)
+    {
+        var lines = new System.Collections.Generic.List<string>();
+        bool spinning = _spinStart is DateTime;
+        var elapsedMs = spinning ? (DateTime.UtcNow - _spinStart!.Value).TotalMilliseconds : 0;
+        long total = _spinTickCount;
+
+        // Compute frame-time stats by walking the ring buffer.
+        float minDt = float.PositiveInfinity, maxDt = 0, sumDt = 0;
+        int dtCount = 0;
+        var dtSamples = new System.Collections.Generic.List<float>(_spinRing.Length);
+        for (int i = 0; i < _spinRing.Length; i++)
+        {
+            var t = _spinRing[i];
+            if (t.ElapsedTicks == 0 && t.CpuYawWrapped == 0 && t.CpuYawRaw == 0) continue;
+            // Skip the very first tick after StartSpin (DeltaMsSincePrev == 0 by construction).
+            if (t.DeltaMsSincePrev <= 0f) continue;
+            dtSamples.Add(t.DeltaMsSincePrev);
+            if (t.DeltaMsSincePrev < minDt) minDt = t.DeltaMsSincePrev;
+            if (t.DeltaMsSincePrev > maxDt) maxDt = t.DeltaMsSincePrev;
+            sumDt += t.DeltaMsSincePrev;
+            dtCount++;
+        }
+        dtSamples.Sort();
+        float avg = dtCount > 0 ? sumDt / dtCount : 0;
+        float p50 = dtCount > 0 ? dtSamples[dtCount / 2] : 0;
+        float p99 = dtCount > 0 ? dtSamples[(int)(dtCount * 0.99)] : 0;
+
+        // Read GPU's last cached SpinYaw scalar. TryGetScalar returns the value
+        // the compositor last synchronized to user-mode; while it's animated
+        // this lags by 1 commit, but the relative drift between successive
+        // reads still tells us if the GPU's animation timeline is advancing as
+        // expected.
+        float gpuSpinYaw = float.NaN;
+        if (_externalRotationProps != null)
+        {
+            _externalRotationProps.TryGetScalar("SpinYaw", out gpuSpinYaw);
+        }
+
+        // Predict CPU yaw at this exact instant (mirroring the sampler's formula).
+        float cpuYawNow = float.NaN, cpuRawNow = float.NaN;
+        if (spinning)
+        {
+            var secs = (float)(elapsedMs / 1000.0);
+            cpuRawNow = (secs / SpinSecondsPerTurn) * 360f;
+            cpuYawNow = cpuRawNow - MathF.Floor(cpuRawNow / 360f) * 360f;
+        }
+
+        lines.Add($"spinning={spinning}");
+        lines.Add($"elapsedMs={elapsedMs:F1}");
+        lines.Add($"sampler.tickCount={total}");
+        lines.Add($"sampler.avgFps={(elapsedMs > 0 ? total * 1000.0 / elapsedMs : 0):F2}");
+        lines.Add($"frame.dt.count={dtCount}");
+        lines.Add($"frame.dt.minMs={(float.IsPositiveInfinity(minDt) ? 0 : minDt):F3}");
+        lines.Add($"frame.dt.avgMs={avg:F3}");
+        lines.Add($"frame.dt.p50Ms={p50:F3}");
+        lines.Add($"frame.dt.p99Ms={p99:F3}");
+        lines.Add($"frame.dt.maxMs={maxDt:F3}");
+        lines.Add($"gc.sinceSpinStart.gen0={GC.CollectionCount(0) - _gc0AtStart}");
+        lines.Add($"gc.sinceSpinStart.gen1={GC.CollectionCount(1) - _gc1AtStart}");
+        lines.Add($"gc.sinceSpinStart.gen2={GC.CollectionCount(2) - _gc2AtStart}");
+        lines.Add($"cpu.yaw.now={cpuYawNow:F3}");
+        lines.Add($"cpu.yaw.raw={cpuRawNow:F3}");
+        lines.Add($"gpu.spinYaw.cached={gpuSpinYaw:F3}");
+        lines.Add($"cpu_minus_gpu={(spinning && !float.IsNaN(gpuSpinYaw) ? cpuYawNow - gpuSpinYaw : 0):F3}");
+
+        if (lastN > 0)
+        {
+            // Walk backwards from head over the last N entries, dump in chronological order.
+            int len = _spinRing.Length;
+            int n = (int)Math.Min(lastN, total);
+            int start = ((_spinRingHead - n) % len + len) % len;
+            lines.Add($"--- last {n} ticks (chronological, ms.relative cpuYawWrap cpuYawRaw deltaMs visMask visCnt gpuYaw gc0 gc1 gc2) ---");
+            double tickMsPerCount = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            for (int i = 0; i < n; i++)
+            {
+                var idx = (start + i) % len;
+                var t = _spinRing[idx];
+                if (t.ElapsedTicks == 0 && t.CpuYawWrapped == 0 && t.CpuYawRaw == 0) continue;
+                var ms = t.ElapsedTicks * tickMsPerCount;
+                lines.Add($"t={ms:F2} yawW={t.CpuYawWrapped:F2} yawR={t.CpuYawRaw:F2} dt={t.DeltaMsSincePrev:F2} vis=0x{t.VisibleMask:X2}({t.VisibleCount}) gpuY={t.GpuSpinYawCached:F2} g0={t.Gc0} g1={t.Gc1} g2={t.Gc2}");
+            }
+        }
+        return lines;
     }
 
     /// <summary>
@@ -155,17 +279,57 @@ public sealed partial class MainWindow : Window
                 var pitch = (float)(PitchSlider?.Value ?? 0);
                 var yaw   = (float)(YawSlider?.Value ?? 0);
                 var roll  = (float)(RollSlider?.Value ?? 0);
+                float spinYawRaw = 0f, spinYawWrapped = 0f;
                 if (_spinStart is DateTime t0)
                 {
                     var secs = (float)(DateTime.UtcNow - t0).TotalSeconds;
-                    var spinYaw = (secs / SpinSecondsPerTurn) * 360f;
-                    spinYaw -= MathF.Floor(spinYaw / 360f) * 360f;
-                    yaw += spinYaw;
+                    spinYawRaw = (secs / SpinSecondsPerTurn) * 360f;
+                    spinYawWrapped = spinYawRaw - MathF.Floor(spinYawRaw / 360f) * 360f;
+                    yaw += spinYawWrapped;
                 }
                 var live = new Vector3(pitch, yaw, roll);
                 // CombobulateSceneVisual doesn't have its own auto-refresh hook yet,
                 // so piggy-back the same per-frame tick to keep its mesh in sync.
                 combobulateSceneVisual.RebuildForExternalRotation(live);
+                // Instrumentation: record one ring-buffer entry per sampler tick.
+                // Stopwatch is QPC-based so deltas reflect the compositor's clock, not
+                // wall-clock NTP corrections. Taking GC counts here lets us correlate
+                // any single-frame deltaMs spike with a GC at exactly that frame.
+                if (_spinStart != null)
+                {
+                    var nowTicks = _spinClock.ElapsedTicks;
+                    var dtTicks  = nowTicks - _prevTickElapsedTicks;
+                    var deltaMs  = (float)((dtTicks * 1000.0) / System.Diagnostics.Stopwatch.Frequency);
+                    // Read the cull state RIGHT AFTER the rebuild ran (the
+                    // sampler returned a Vector3 above, then Combobulate's
+                    // OnRenderingTick called RebuildForExternalRotation with
+                    // it). At the moment this code runs we're still inside the
+                    // sampler invocation BEFORE rebuild — so we read state from
+                    // the PREVIOUS frame's rebuild. That's fine for trend
+                    // analysis (drift is monotonic).
+                    var (cv, _) = combobulate.GetRenderCacheSnapshot();
+                    byte mask = 0; byte cnt = 0;
+                    int n = Math.Min(cv.Length, 8);
+                    for (int i = 0; i < n; i++) if (cv[i]) { mask |= (byte)(1 << i); cnt++; }
+                    float gpuYaw = 0f;
+                    _externalRotationProps?.TryGetScalar("SpinYaw", out gpuYaw);
+                    _spinRing[_spinRingHead] = new SpinTick
+                    {
+                        ElapsedTicks      = nowTicks,
+                        CpuYawWrapped     = spinYawWrapped,
+                        CpuYawRaw         = spinYawRaw,
+                        DeltaMsSincePrev  = _spinTickCount == 0 ? 0f : deltaMs,
+                        Gc0 = GC.CollectionCount(0),
+                        Gc1 = GC.CollectionCount(1),
+                        Gc2 = GC.CollectionCount(2),
+                        VisibleMask       = mask,
+                        VisibleCount      = cnt,
+                        GpuSpinYawCached  = gpuYaw,
+                    };
+                    _spinRingHead = (_spinRingHead + 1) % _spinRing.Length;
+                    _prevTickElapsedTicks = nowTicks;
+                    _spinTickCount++;
+                }
                 return live;
             });
         }
