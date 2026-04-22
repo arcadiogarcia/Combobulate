@@ -157,6 +157,167 @@ public class RotationSweepTests
         }
     }
 
+    /// <summary>
+    /// Same visible-set parity invariant as
+    /// <see cref="AllAlgorithms_AgreeOnVisibleSet_AcrossRotationGrid"/>, but
+    /// run with PERSPECTIVE camera distance set so all three sorters use
+    /// <see cref="GeometryPredicates.IsFrontFacingPerspective"/>. Catches drift
+    /// in any single sorter's perspective code path.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Geometries))]
+    public void AllAlgorithms_AgreeOnVisibleSet_AcrossRotationGrid_UnderPerspective(string name, Func<ObjGeometry> factory)
+    {
+        var geom = factory();
+        var sorters = MakeSorters(geom);
+        int qc = geom.Quads.Length;
+
+        // A few perspective distances spanning "very far" (≈ ortho) to "close" (camera near bbox).
+        foreach (var d in new[] { 10f, 4f, 2f, 1.5f })
+        {
+            ForEachRotation((yaw, pitch, rotation) =>
+            {
+                var masks = sorters
+                    .Select(s => BitMask(RunSorter(s, rotation, qc, d).visible))
+                    .ToArray();
+                var first = masks[0];
+                for (int i = 1; i < masks.Length; i++)
+                {
+                    Assert.True(masks[i] == first,
+                        $"Visible-set drift on {name} at yaw={yaw}° pitch={pitch}° d={d}: " +
+                        $"{sorters[0].GetType().Name}={Convert.ToString((long)first, 2)} vs " +
+                        $"{sorters[i].GetType().Name}={Convert.ToString((long)masks[i], 2)}");
+                }
+            });
+        }
+    }
+
+    /// <summary>
+    /// Roll-axis coverage. The yaw+pitch sweeps in the other tests can miss
+    /// roll-only singularities (cover face normal becomes perpendicular to view
+    /// when roll combined with non-zero pitch), so we additionally sweep roll
+    /// at a few non-trivial pitch values and confirm visible-set parity.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Geometries))]
+    public void AllAlgorithms_AgreeOnVisibleSet_AcrossRollSweep(string name, Func<ObjGeometry> factory)
+    {
+        var geom = factory();
+        var sorters = MakeSorters(geom);
+        int qc = geom.Quads.Length;
+
+        var rolls = new[] { 0f, 30f, 45f, 89.99f, 90f, 90.01f, 135f, 180f, 225f, 270f, 315f };
+        foreach (var pitch in new[] { -45f, 0f, 30f, 89.99f, 90f })
+        foreach (var yaw in new[] { 0f, 45f, 90f, 180f })
+        foreach (var roll in rolls)
+        {
+            var rot = Matrix4x4.CreateFromYawPitchRoll(
+                yaw   * MathF.PI / 180f,
+                pitch * MathF.PI / 180f,
+                roll  * MathF.PI / 180f);
+
+            // Both ortho and perspective.
+            foreach (var d in new[] { 0f, 4f })
+            {
+                var masks = sorters.Select(s => BitMask(RunSorter(s, rot, qc, d).visible)).ToArray();
+                for (int i = 1; i < masks.Length; i++)
+                {
+                    Assert.True(masks[i] == masks[0],
+                        $"Visible-set drift on {name} at yaw={yaw}° pitch={pitch}° roll={roll}° d={d}: " +
+                        $"{sorters[0].GetType().Name}={Convert.ToString((long)masks[0], 2)} vs " +
+                        $"{sorters[i].GetType().Name}={Convert.ToString((long)masks[i], 2)}");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Painter-order correctness for OVERLAPPING geometry across all three sorters
+    /// under perspective. Builds a stack of three coplanar-axis quads (no Newell-
+    /// triggering straddles) so the canonical back-to-front order is unambiguous.
+    /// Generalises the BSP-only regression
+    /// (<c>BspSorterTests.Walk_OverlappingParallelQuads_AreEmittedBackToFrontUnderPerspective</c>)
+    /// to ensure NewellSorter and TopologicalSorter don't have similar
+    /// camera-direction-vs-position bugs.
+    /// </summary>
+    /// <remarks>
+    /// Combinations are restricted to pitch ≤ 60° (or d ≥ 4 at higher pitch) so the
+    /// camera stays in front of every quad's plane. At pitch=80° + d=1.5, the top
+    /// quad's outward normal rotates far enough that its plane crosses the camera —
+    /// see <see cref="ExtremeTilt_CloseCamera_TopQuad_BecomesBackFacing"/> for the
+    /// asserted-correct behaviour at that singularity.
+    /// </remarks>
+    [Theory]
+    [InlineData(SortAlgorithm.Topological)]
+    [InlineData(SortAlgorithm.Newell)]
+    [InlineData(SortAlgorithm.Bsp)]
+    public void OverlappingStack_AllAlgorithms_PaintBackToFrontUnderPerspective(SortAlgorithm algo)
+    {
+        var geom = OverlappingStackGeometry();
+        var sorter = FaceSorterFactory.Create(algo, geom);
+        var order = new int[geom.Quads.Length];
+        var visible = new bool[geom.Quads.Length];
+
+        // Combinations where every quad's plane stays in front of the camera.
+        var cases = new (float pitch, float d)[]
+        {
+            (0f,   4f), (0f,   2f), (0f,   1.5f),
+            (30f,  4f), (30f,  2f), (30f,  1.5f),
+            (45f,  4f), (45f,  2f),
+            (60f,  4f),
+            (80f,  4f),  // close-edge case still safe at d=4
+        };
+        foreach (var (pitch, d) in cases)
+        {
+            var rot = MakeRotation(0, pitch);
+            int n = sorter.Sort(rot, order, visible, d);
+            Assert.True(n == 3, $"{algo}: expected 3 visible at pitch={pitch},d={d}, got {n}");
+            for (int i = 1; i < n; i++)
+            {
+                var prevZ = Vector3.Transform(geom.Quads[order[i - 1]].Centroid, rot).Z;
+                var thisZ = Vector3.Transform(geom.Quads[order[i]].Centroid, rot).Z;
+                Assert.True(prevZ <= thisZ + 1e-3f,
+                    $"{algo}: painter order wrong at pitch={pitch}, d={d}: q{order[i-1]} (Z={prevZ:F3}) drew before q{order[i]} (Z={thisZ:F3})");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Documented-correct behaviour at the "close camera + extreme tilt" singularity:
+    /// when the model tilts far enough relative to a close camera, a face's outward
+    /// normal can rotate into the half-space facing AWAY from the camera even though
+    /// the face is still on screen — geometrically the camera has crossed its plane,
+    /// so what you'd see is the face's back side. With single-sided geometry the
+    /// face is correctly culled. This test pins that behaviour as deliberate so a
+    /// future "fix" doesn't quietly re-let edge-on faces leak through.
+    /// </summary>
+    [Theory]
+    [InlineData(SortAlgorithm.Topological)]
+    [InlineData(SortAlgorithm.Newell)]
+    [InlineData(SortAlgorithm.Bsp)]
+    public void ExtremeTilt_CloseCamera_TopQuad_BecomesBackFacing(SortAlgorithm algo)
+    {
+        var geom = OverlappingStackGeometry();
+        var sorter = FaceSorterFactory.Create(algo, geom);
+        var order = new int[geom.Quads.Length];
+        var visible = new bool[geom.Quads.Length];
+
+        // pitch=80°, d=1.5 (model units): the top quad's outward normal +Z rotates to
+        // (0, -sin80°, cos80°) ≈ (0, -0.985, 0.174); its centroid moves to
+        // (0, -0.295, +0.052); the camera at (0, 0, 1.5) is then on the back side
+        // of that plane (dot(normal, camera-centroid) < 0).
+        var rot = MakeRotation(0, 80f);
+        int n = sorter.Sort(rot, order, visible, cameraDistance: 1.5f);
+        Assert.Equal(2, n);
+        Assert.False(visible[2], $"{algo}: top quad must be culled (camera crosses its plane)");
+        Assert.True(visible[0] && visible[1], $"{algo}: bottom and middle quads must remain visible");
+    }
+
+    private static ObjGeometry OverlappingStackGeometry() => TestGeometries.Build(
+        new[] { new Vector3(-0.5f,-0.5f,-0.3f), new Vector3(+0.5f,-0.5f,-0.3f), new Vector3(+0.5f,+0.5f,-0.3f), new Vector3(-0.5f,+0.5f,-0.3f) },
+        new[] { new Vector3(-0.5f,-0.5f, 0.0f), new Vector3(+0.5f,-0.5f, 0.0f), new Vector3(+0.5f,+0.5f, 0.0f), new Vector3(-0.5f,+0.5f, 0.0f) },
+        new[] { new Vector3(-0.5f,-0.5f,+0.3f), new Vector3(+0.5f,-0.5f,+0.3f), new Vector3(+0.5f,+0.5f,+0.3f), new Vector3(-0.5f,+0.5f,+0.3f) });
+
     // ---------- helpers ----------
 
     private static IFaceSorter[] MakeSorters(ObjGeometry geom) => new IFaceSorter[]
@@ -166,11 +327,11 @@ public class RotationSweepTests
         new TopologicalSorter(geom),
     };
 
-    private static (int[] order, bool[] visible) RunSorter(IFaceSorter sorter, Matrix4x4 rot, int qc)
+    private static (int[] order, bool[] visible) RunSorter(IFaceSorter sorter, Matrix4x4 rot, int qc, float cameraDistance = 0f)
     {
         var order = new int[qc];
         var vis = new bool[qc];
-        sorter.Sort(rot, order, vis);
+        sorter.Sort(rot, order, vis, cameraDistance);
         return (order, vis);
     }
 
