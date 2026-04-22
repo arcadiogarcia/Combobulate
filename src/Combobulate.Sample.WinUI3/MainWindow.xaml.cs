@@ -61,10 +61,22 @@ public sealed partial class MainWindow : Window
     /// <summary>
     /// Autonomous continuous Y-axis spin. Implicitly enables External + Auto-refresh
     /// (spin is meaningless without them: external routes rotation through composition,
-    /// auto-refresh keeps cull/sort in sync). The per-frame sampler below writes the
-    /// advanced yaw into the shared rotation <see cref="CompositionPropertySet"/>, so
-    /// both renderers (<c>SpriteVisual</c> and <c>SceneVisual</c>) see identical live
-    /// values each tick via their expression animation.
+    /// auto-refresh keeps cull/sort in sync).
+    ///
+    /// <para>Architecture: the visual rotation is GPU-driven by a Composition
+    /// <c>ScalarKeyFrameAnimation</c> looping forever on a <c>SpinYaw</c> scalar in
+    /// the shared property set. <c>p.SpinActive * p.SpinYaw</c> is added to the slider
+    /// yaw inside the expression animation that produces the final <c>Rotation</c>
+    /// vector — so both renderers' visuals keep spinning smoothly even if the UI
+    /// thread hitches; no per-frame <c>InsertVector3</c> writes are needed.</para>
+    ///
+    /// <para>The CPU sampler installed by <c>EnableAutoRefresh</c> still runs on
+    /// <c>CompositionTarget.Rendering</c> in parallel — its only job is to recompute
+    /// the same yaw from wall-clock and feed it to <c>RebuildForExternalRotation</c>
+    /// for back-face cull / painter-sort. CPU and GPU clocks share the same epoch +
+    /// formula (<c>secs / SpinSecondsPerTurn * 360</c>), so they agree to sub-ms in
+    /// steady state and the CPU naturally re-syncs on the next tick after any UI
+    /// stall.</para>
     /// </summary>
     private void SpinToggle_Toggled(object sender, RoutedEventArgs e)
     {
@@ -75,28 +87,60 @@ public sealed partial class MainWindow : Window
                 ExternalRotationToggle.IsOn = true;
             if (AutoRefreshToggle != null && !AutoRefreshToggle.IsOn)
                 AutoRefreshToggle.IsOn = true;
-            _spinStart = DateTime.UtcNow;
-            _spinBaseYaw = (float)(YawSlider?.Value ?? 0);
+            StartGpuSpin();
         }
         else
         {
-            _spinStart = null;
+            StopGpuSpin();
         }
         UpdateAutoRefresh();
     }
 
     private DateTime? _spinStart;
-    private float _spinBaseYaw;
     private const float SpinSecondsPerTurn = 6f;
+
+    /// <summary>
+    /// Start the looping Composition KFA that drives <c>SpinYaw</c> on the GPU,
+    /// and capture the wall-clock epoch the CPU sampler uses to compute the same
+    /// yaw for cull/sort. Both clocks share the same formula
+    /// (<c>secs / SpinSecondsPerTurn * 360</c>) so they stay in sub-ms agreement.
+    /// </summary>
+    private void StartGpuSpin()
+    {
+        var (props, _) = GetOrCreateExternalRotation();
+        var compositor = ElementCompositionPreview.GetElementVisual(this.Content).Compositor;
+        var kfa = compositor.CreateScalarKeyFrameAnimation();
+        kfa.InsertKeyFrame(0f, 0f, compositor.CreateLinearEasingFunction());
+        kfa.InsertKeyFrame(1f, 360f, compositor.CreateLinearEasingFunction());
+        kfa.Duration = TimeSpan.FromSeconds(SpinSecondsPerTurn);
+        kfa.IterationBehavior = AnimationIterationBehavior.Forever;
+        props.InsertScalar("SpinActive", 1f);
+        props.StopAnimation("SpinYaw");
+        props.StartAnimation("SpinYaw", kfa);
+        // Set CPU epoch as close as possible to the StartAnimation call so the two
+        // clocks line up. Any sub-frame skew is constant and visually invisible.
+        _spinStart = DateTime.UtcNow;
+    }
+
+    private void StopGpuSpin()
+    {
+        _spinStart = null;
+        if (_externalRotationProps == null) return;
+        _externalRotationProps.StopAnimation("SpinYaw");
+        _externalRotationProps.InsertScalar("SpinYaw", 0f);
+        _externalRotationProps.InsertScalar("SpinActive", 0f);
+    }
 
     /// <summary>
     /// Auto-refresh only makes sense in external-rotation mode (in internal mode each
     /// rotation DP setter already triggers a Rebuild on the UI thread). When both
     /// toggles are on, subscribe Combobulate to <c>CompositionTarget.Rendering</c> via
-    /// <c>EnableAutoRefresh</c> with a sampler that reads the live property set the
-    /// expression animation already drives. The sampler also pokes the SceneVisual
-    /// renderer's <c>RebuildForExternalRotation</c> so both side-by-side views stay
-    /// in sync as the value updates from any thread.
+    /// <c>EnableAutoRefresh</c> with a sampler that recomputes the rotation from the
+    /// same inputs the GPU expression uses (slider scalars + wall-clock spin).
+    /// During spin we never write back to the property set — the GPU KFA owns
+    /// <c>SpinYaw</c> and slider changes already update their respective scalars
+    /// directly. The sampler also pokes the SceneVisual renderer's
+    /// <c>RebuildForExternalRotation</c> so both side-by-side views stay in sync.
     /// </summary>
     private void UpdateAutoRefresh()
     {
@@ -106,31 +150,23 @@ public sealed partial class MainWindow : Window
 
         if (wantAuto)
         {
-            var (props, _) = GetOrCreateExternalRotation();
             combobulate.EnableAutoRefresh(() =>
             {
-                // If autonomous spin is engaged, advance the shared property set ourselves
-                // from wall-clock time. Driving the value through the same props the
-                // expression animation references means both renderers (and their cull/sort
-                // samplers) see a single coherent yaw per frame — no composer-snapshot lag.
+                var pitch = (float)(PitchSlider?.Value ?? 0);
+                var yaw   = (float)(YawSlider?.Value ?? 0);
+                var roll  = (float)(RollSlider?.Value ?? 0);
                 if (_spinStart is DateTime t0)
                 {
                     var secs = (float)(DateTime.UtcNow - t0).TotalSeconds;
-                    var yaw = _spinBaseYaw + (secs / SpinSecondsPerTurn) * 360f;
-                    // Wrap to keep the float well-conditioned over long runs.
-                    yaw -= MathF.Floor(yaw / 360f) * 360f;
-                    var pitch = (float)(PitchSlider?.Value ?? 0);
-                    var roll = (float)(RollSlider?.Value ?? 0);
-                    var live = new Vector3(pitch, yaw, roll);
-                    props.InsertVector3("Rotation", live);
-                    combobulateSceneVisual.RebuildForExternalRotation(live);
-                    return live;
+                    var spinYaw = (secs / SpinSecondsPerTurn) * 360f;
+                    spinYaw -= MathF.Floor(spinYaw / 360f) * 360f;
+                    yaw += spinYaw;
                 }
-                props.TryGetVector3("Rotation", out var r);
+                var live = new Vector3(pitch, yaw, roll);
                 // CombobulateSceneVisual doesn't have its own auto-refresh hook yet,
                 // so piggy-back the same per-frame tick to keep its mesh in sync.
-                combobulateSceneVisual.RebuildForExternalRotation(r);
-                return r;
+                combobulateSceneVisual.RebuildForExternalRotation(live);
+                return live;
             });
         }
         else
@@ -165,14 +201,30 @@ public sealed partial class MainWindow : Window
     private CompositionPropertySet? _externalRotationProps;
     private ExpressionAnimation? _externalRotationExpr;
 
+    /// <summary>
+    /// Lazily creates the shared property set + composed expression that produces the
+    /// final <c>Rotation</c> Vector3 used by both renderers.
+    ///
+    /// <para>Layout: scalars <c>PitchVal</c>/<c>YawVal</c>/<c>RollVal</c> mirror the
+    /// sliders; <c>SpinYaw</c> is animated by a Composition KFA when spin is on;
+    /// <c>SpinActive</c> is 0 or 1 to gate the spin contribution. The expression
+    /// is <c>Vector3(p.PitchVal, p.YawVal + p.SpinActive * p.SpinYaw, p.RollVal)</c>
+    /// — fully evaluated on the compositor every frame, with no UI-thread per-frame
+    /// writes.</para>
+    /// </summary>
     private (CompositionPropertySet props, ExpressionAnimation expr) GetOrCreateExternalRotation()
     {
         if (_externalRotationProps != null && _externalRotationExpr != null)
             return (_externalRotationProps, _externalRotationExpr);
         var compositor = ElementCompositionPreview.GetElementVisual(this.Content).Compositor;
         _externalRotationProps = compositor.CreatePropertySet();
-        _externalRotationProps.InsertVector3("Rotation", Vector3.Zero);
-        _externalRotationExpr = compositor.CreateExpressionAnimation("p.Rotation");
+        _externalRotationProps.InsertScalar("PitchVal",  0f);
+        _externalRotationProps.InsertScalar("YawVal",    0f);
+        _externalRotationProps.InsertScalar("RollVal",   0f);
+        _externalRotationProps.InsertScalar("SpinYaw",   0f);
+        _externalRotationProps.InsertScalar("SpinActive", 0f);
+        _externalRotationExpr = compositor.CreateExpressionAnimation(
+            "Vector3(p.PitchVal, p.YawVal + p.SpinActive * p.SpinYaw, p.RollVal)");
         _externalRotationExpr.SetReferenceParameter("p", _externalRotationProps);
         return (_externalRotationProps, _externalRotationExpr);
     }
@@ -188,7 +240,13 @@ public sealed partial class MainWindow : Window
         if (external)
         {
             var (props, expr) = GetOrCreateExternalRotation();
-            props.InsertVector3("Rotation", new Vector3(x, y, z));
+            // Per-axis scalar updates: the composed expression rebuilds the Vector3
+            // on the compositor without any UI-thread Vector3 write. During spin
+            // the YawVal here is the slider base; the GPU KFA on SpinYaw adds the
+            // per-frame delta automatically.
+            props.InsertScalar("PitchVal", x);
+            props.InsertScalar("YawVal",   y);
+            props.InsertScalar("RollVal",  z);
             combobulate.SetExternalRotation(expr);
             combobulateSceneVisual.SetExternalRotation(expr);
         }
