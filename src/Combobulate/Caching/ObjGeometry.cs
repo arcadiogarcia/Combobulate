@@ -74,7 +74,9 @@ public sealed class ObjGeometry
             return result;
         }
 
-        const float eps = 1e-4f;
+        // Scale: signed distance in object space — anchored to the central predicate
+        // constant so all distance-scale tolerances move together.
+        const float eps = global::Combobulate.Sorting.GeometryPredicates.DistanceEpsilon;
         var lists = new System.Collections.Generic.List<int>[n];
         for (int i = 0; i < n; i++) lists[i] = new System.Collections.Generic.List<int>();
 

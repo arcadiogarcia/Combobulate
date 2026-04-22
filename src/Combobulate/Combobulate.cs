@@ -134,6 +134,31 @@ public sealed class Combobulate : Control
             typeof(Combobulate),
             new PropertyMetadata(true, (d, _) => ((Combobulate)d).UpdateRootTransform()));
 
+    /// <summary>
+    /// Focal distance (in pixels) used by the perspective projection when
+    /// <see cref="EnablePerspective"/> is true. The matrix uses
+    /// <c>M34 = -1/d</c>, so larger values produce weaker perspective
+    /// (more orthographic), smaller values produce stronger perspective
+    /// (more visible side faces). Set to <c>0</c> (the default) to use
+    /// the host's actual width, which is the historical behavior — this
+    /// couples the perspective strength to the control size and to
+    /// <see cref="ModelScale"/>. Setting an explicit positive value
+    /// decouples them, so changing zoom no longer changes how much of a
+    /// rotated face is visible.
+    /// </summary>
+    public double PerspectiveDistance
+    {
+        get => (double)GetValue(PerspectiveDistanceProperty);
+        set => SetValue(PerspectiveDistanceProperty, value);
+    }
+
+    public static readonly DependencyProperty PerspectiveDistanceProperty =
+        DependencyProperty.Register(
+            nameof(PerspectiveDistance),
+            typeof(double),
+            typeof(Combobulate),
+            new PropertyMetadata(0.0, (d, _) => ((Combobulate)d).UpdateRootTransform()));
+
     /// <summary>Rotation around the X axis, in degrees.</summary>
     public double RotationX
     {
@@ -206,6 +231,30 @@ public sealed class Combobulate : Control
             typeof(MaterialMode),
             typeof(Combobulate),
             new PropertyMetadata(MaterialMode.Auto, (d, _) => ((Combobulate)d).Rebuild()));
+
+    /// <summary>
+    /// Selects which back-to-front polygon sorting algorithm to use. Default is
+    /// <see cref="global::Combobulate.Sorting.SortAlgorithm.Bsp"/>, which handles arbitrary
+    /// mutual-straddle configurations correctly. <see cref="global::Combobulate.Sorting.SortAlgorithm.Newell"/>
+    /// is also fully correct (uses runtime fragmentation only when needed).
+    /// <see cref="global::Combobulate.Sorting.SortAlgorithm.Topological"/> is the original
+    /// O(n²) Kahn-sort and may produce incorrect orderings when two polygons mutually
+    /// straddle each other's planes (e.g. a flat cover meeting a thin page-edge strip).
+    /// </summary>
+    public global::Combobulate.Sorting.SortAlgorithm SortAlgorithm
+    {
+        get => (global::Combobulate.Sorting.SortAlgorithm)GetValue(SortAlgorithmProperty);
+        set => SetValue(SortAlgorithmProperty, value);
+    }
+
+    public static readonly DependencyProperty SortAlgorithmProperty =
+        DependencyProperty.Register(
+            nameof(SortAlgorithm),
+            typeof(global::Combobulate.Sorting.SortAlgorithm),
+            typeof(Combobulate),
+            new PropertyMetadata(
+                global::Combobulate.Sorting.SortAlgorithm.Bsp,
+                (d, _) => { var c = (Combobulate)d; c._sorter = null; c.Rebuild(); }));
 
     #endregion
 
@@ -396,11 +445,12 @@ public sealed class Combobulate : Control
         _externalRotationAnimation.SetReferenceParameter("buf", _externalRotationBuffer);
         if (EnablePerspective)
         {
-            // perspective uses host width as the focal distance, matching
-            // UpdateRootTransform's convention. Width can change on resize;
-            // the animation gets re-installed by UpdateRootTransform when
-            // that happens, so capturing w here is fine.
-            float d = w > 0 ? w : 1f;
+            // Focal distance: use the user-specified PerspectiveDistance if positive,
+            // otherwise fall back to the historical "use host width" behavior. The
+            // animation gets re-installed by UpdateRootTransform on resize, so
+            // capturing w (and the current PerspectiveDistance) here is fine.
+            float pd = (float)PerspectiveDistance;
+            float d = pd > 0f ? pd : (w > 0 ? w : 1f);
             var perspective = new Matrix4x4(
                 1, 0, 0, 0,
                 0, 1, 0, 0,
@@ -440,7 +490,8 @@ public sealed class Combobulate : Control
         Matrix4x4 transform;
         if (EnablePerspective)
         {
-            var d = w;
+            float pd = (float)PerspectiveDistance;
+            var d = pd > 0f ? pd : w;
             var perspective = new Matrix4x4(
                 1, 0, 0, 0,
                 0, 1, 0, 0,
@@ -463,6 +514,24 @@ public sealed class Combobulate : Control
             (float)RotationY * deg2rad,
             (float)RotationX * deg2rad,
             (float)RotationZ * deg2rad);
+    }
+
+    /// <summary>
+    /// Convert <see cref="PerspectiveDistance"/> (in render-pixel units, matching the
+    /// renderer's <c>w' = 1 - z/d</c> formula) into the model-space units that
+    /// <see cref="Sorting.IFaceSorter.Sort"/> expects, so the perspective front-face
+    /// test rays line up with the actual rendered projection. Mirrors the focal-distance
+    /// fallback in <see cref="UpdateRootTransform"/>: the user value when positive,
+    /// otherwise host width. Returns 0 ("use orthographic cull") when perspective is
+    /// disabled or the scale is zero.
+    /// </summary>
+    private float ComputeSortCameraDistance(float scale)
+    {
+        if (!EnablePerspective || scale <= 0f) return 0f;
+        float pd = (float)PerspectiveDistance;
+        float w = (float)(_host?.ActualWidth ?? 0);
+        float d = pd > 0f ? pd : (w > 0f ? w : 1f);
+        return d / scale;
     }
 
     private void OnRotationChanged()
@@ -551,6 +620,10 @@ public sealed class Combobulate : Control
     private SpriteVisual?[]? _spritePool;
     private bool[]? _lastVisible;
     private int[] _lastOrder = Array.Empty<int>();
+    private int _lastOrderCount;
+    private global::Combobulate.Sorting.IFaceSorter? _sorter;
+    private bool[]? _visScratchBool;
+    private int[]? _orderScratch;
     private ObjGeometry? _spritePoolGeometry;
     private float _spritePoolScale;
     private float _spritePoolHostW;
@@ -674,6 +747,7 @@ public sealed class Combobulate : Control
         if (_lastVisible != null)
             for (int i = 0; i < _lastVisible.Length; i++) _lastVisible[i] = false;
         _lastOrder = Array.Empty<int>();
+        _lastOrderCount = 0;
     }
 
     /// <summary>
@@ -822,6 +896,8 @@ public sealed class Combobulate : Control
             _spritePool = new SpriteVisual?[geometry.Quads.Length];
             _lastVisible = new bool[geometry.Quads.Length];
             _lastOrder = Array.Empty<int>();
+            _lastOrderCount = 0;
+            _sorter = null;
         }
 
         ResolvedQuadMaterials? resolved = packChanged
@@ -879,40 +955,47 @@ public sealed class Combobulate : Control
             }
         }
 
-        // Cull: update IsVisible only for quads whose state actually flipped.
-        var visibleIndices = _visibleScratch!;
-        int visCount = 0;
+        // Cull + paint-order: delegate to the configured face sorter.
+        // The sorter writes a per-quad bool[] cull buffer and a back-to-front
+        // permutation of cached-quad indices ([0..n) valid).
+        if (_sorter == null || !ReferenceEquals(_spritePoolGeometry, geometry))
+        {
+            _sorter = global::Combobulate.Sorting.FaceSorterFactory.Create(SortAlgorithm, geometry);
+        }
+        if (_visScratchBool == null || _visScratchBool.Length < cachedQuads.Length)
+            _visScratchBool = new bool[cachedQuads.Length];
+        if (_orderScratch == null || _orderScratch.Length < cachedQuads.Length)
+            _orderScratch = new int[cachedQuads.Length];
+
+        int orderCount = _sorter.Sort(rotation, _orderScratch, _visScratchBool, ComputeSortCameraDistance(scale));
+
+        // Diff IsVisible flips against last frame.
         for (int i = 0; i < cachedQuads.Length; i++)
         {
-            var viewNormal = Vector3.TransformNormal(cachedQuads[i].Normal, rotation);
-            bool visible = viewNormal.Z > 0;
+            bool visible = _visScratchBool[i];
             if (lastVisible[i] != visible)
             {
                 pool[i]!.IsVisible = visible;
                 lastVisible[i] = visible;
             }
-            if (visible) visibleIndices[visCount++] = i;
         }
-
-        // Painter's sort over the cached predecessor lists, restricted to visible quads.
-        // Tiebreak by view-Z (back to front) so siblings without occlusion edges still get
-        // a deterministic order that swaps cleanly as the camera rotates.
-        var order = TopologicalPainterSort(visibleIndices, visCount, cachedQuads, geometry.Predecessors, rotation, _slotScratch!);
 
         // Reorder children only if the painter order actually changed. Sprites already
         // live under _root; VisualCollection.InsertAtTop throws E_INVALIDARG when the
         // child still has a parent (even if it's the same parent), so we must Remove
         // first. Walking visible quads back-to-front and re-attaching each one leaves
         // the last-painted (frontmost) on top.
-        if (!OrderEquals(order, _lastOrder))
+        if (!OrderEquals(_orderScratch, orderCount, _lastOrder, _lastOrderCount))
         {
-            for (int i = 0; i < order.Length; i++)
+            for (int i = 0; i < orderCount; i++)
             {
-                var sprite = pool[order[i]]!;
+                var sprite = pool[_orderScratch[i]]!;
                 _root.Children.Remove(sprite);
                 _root.Children.InsertAtTop(sprite);
             }
-            _lastOrder = order;
+            if (_lastOrder.Length < orderCount) _lastOrder = new int[cachedQuads.Length];
+            Array.Copy(_orderScratch, _lastOrder, orderCount);
+            _lastOrderCount = orderCount;
         }
     }
 
@@ -932,6 +1015,8 @@ public sealed class Combobulate : Control
         _spritePool = null;
         _lastVisible = null;
         _lastOrder = Array.Empty<int>();
+        _lastOrderCount = 0;
+        _sorter = null;
         _spritePoolGeometry = null;
         _spritePoolBindings = null;
         _spritePoolPackKey = null;
@@ -940,10 +1025,10 @@ public sealed class Combobulate : Control
         _spritePoolHostH = 0;
     }
 
-    private static bool OrderEquals(int[] a, int[] b)
+    private static bool OrderEquals(int[] a, int aCount, int[] b, int bCount)
     {
-        if (a.Length != b.Length) return false;
-        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        if (aCount != bCount) return false;
+        for (int i = 0; i < aCount; i++) if (a[i] != b[i]) return false;
         return true;
     }
 

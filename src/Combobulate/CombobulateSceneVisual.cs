@@ -146,6 +146,28 @@ public sealed class CombobulateSceneVisual : Control
             typeof(CombobulateSceneVisual),
             new PropertyMetadata(true));
 
+    /// <summary>
+    /// Focal distance (in pixels) used by the per-vertex perspective
+    /// divide in <c>TransformVertex</c>. Larger = weaker perspective
+    /// (more orthographic), smaller = stronger perspective. Set to
+    /// <c>0</c> (the default) to use the host's actual width, matching
+    /// the historical behavior. Mirror of <c>Combobulate.PerspectiveDistance</c>
+    /// so the two renderers stay visually identical when both are bound
+    /// to the same value.
+    /// </summary>
+    public double PerspectiveDistance
+    {
+        get => (double)GetValue(PerspectiveDistanceProperty);
+        set => SetValue(PerspectiveDistanceProperty, value);
+    }
+
+    public static readonly DependencyProperty PerspectiveDistanceProperty =
+        DependencyProperty.Register(
+            nameof(PerspectiveDistance),
+            typeof(double),
+            typeof(CombobulateSceneVisual),
+            new PropertyMetadata(0.0, (d, _) => ((CombobulateSceneVisual)d).RebuildMesh()));
+
     public double RotationX
     {
         get => (double)GetValue(RotationXProperty);
@@ -592,6 +614,10 @@ public sealed class CombobulateSceneVisual : Control
         float w = _host != null ? (float)_host.ActualWidth : 0f;
         float h = _host != null ? (float)_host.ActualHeight : 0f;
         var center = new Vector3(w * 0.5f, h * 0.5f, 0f);
+        // Focal distance: explicit PerspectiveDistance if positive, otherwise host width
+        // (the historical default that couples perspective to control size).
+        float pd = (float)PerspectiveDistance;
+        float persp = pd > 0f ? pd : (w > 0f ? w : 1f);
 
         const float deg2rad = MathF.PI / 180f;
         double rotX, rotY, rotZ;
@@ -638,10 +664,10 @@ public sealed class CombobulateSceneVisual : Control
             {
                 var cq = groupQuads[i];
                 int v = i * 4;
-                positions[v + 0] = TransformVertex(cq.V0, scale, rotation, center, w, FlipZ);
-                positions[v + 1] = TransformVertex(cq.V1, scale, rotation, center, w, FlipZ);
-                positions[v + 2] = TransformVertex(cq.V2, scale, rotation, center, w, FlipZ);
-                positions[v + 3] = TransformVertex(cq.V3, scale, rotation, center, w, FlipZ);
+                positions[v + 0] = TransformVertex(cq.V0, scale, rotation, center, persp, FlipZ);
+                positions[v + 1] = TransformVertex(cq.V1, scale, rotation, center, persp, FlipZ);
+                positions[v + 2] = TransformVertex(cq.V2, scale, rotation, center, persp, FlipZ);
+                positions[v + 3] = TransformVertex(cq.V3, scale, rotation, center, persp, FlipZ);
 
                 int idx = i * 6;
                 indices[idx + 0] = (ushort)(v + 0);

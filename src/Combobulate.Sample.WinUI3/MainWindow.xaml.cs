@@ -275,6 +275,18 @@ public sealed partial class MainWindow : Window
         };
     }
 
+    private void SortAlgorithmBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (combobulate == null) return;
+        var label = (SortAlgorithmBox.SelectedItem as ComboBoxItem)?.Content as string;
+        combobulate.SortAlgorithm = label switch
+        {
+            "Newell"      => global::Combobulate.Sorting.SortAlgorithm.Newell,
+            "Topological" => global::Combobulate.Sorting.SortAlgorithm.Topological,
+            _             => global::Combobulate.Sorting.SortAlgorithm.Bsp,
+        };
+    }
+
     private static string? ResolveSamplePath(string fileName)
     {
         // Walk up from the app base looking for a samples directory containing the file.

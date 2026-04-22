@@ -37,6 +37,13 @@
                 <ComboBoxItem Content="UseFallback"/>
                 <ComboBoxItem Content="UseDiffuse"/>
             </ComboBox>
+            <ComboBox x:Name="SortAlgorithmBox"
+                      SelectionChanged="SortAlgorithmBox_SelectionChanged"
+                      ToolTipService.ToolTip="Painter-sort algorithm. Bsp (default) is cycle-free for any view; Newell handles arbitrary geometry with on-demand splits; Topological is the original O(n²) plane test that falls back to centroid-Z on cycles.">
+                <ComboBoxItem Content="Bsp" IsSelected="True"/>
+                <ComboBoxItem Content="Newell"/>
+                <ComboBoxItem Content="Topological"/>
+            </ComboBox>
             <ToggleSwitch x:Name="ExternalRotationToggle"
                           OnContent="External (composition)"
                           OffContent="Internal (control DPs)"
@@ -93,6 +100,7 @@
                              RotationX="{x:Bind combobulate.RotationX, Mode=OneWay}"
                              RotationY="{x:Bind combobulate.RotationY, Mode=OneWay}"
                              RotationZ="{x:Bind combobulate.RotationZ, Mode=OneWay}"
+                             PerspectiveDistance="{x:Bind combobulate.PerspectiveDistance, Mode=OneWay}"
                              Model="{x:Bind combobulate.Model, Mode=OneWay}"
                              Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
                              BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
@@ -174,6 +182,8 @@
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock Grid.Column="0" Text="Zoom" VerticalAlignment="Center"/>
                 <Slider x:Name="ZoomSlider"
@@ -182,6 +192,15 @@
                         Value="{x:Bind combobulate.ModelScale, Mode=TwoWay}"
                         StepFrequency="1"
                         TickFrequency="50" TickPlacement="Outside"/>
+
+                <TextBlock Grid.Column="2" Text="Perspective" VerticalAlignment="Center"
+                           ToolTipService.ToolTip="Focal distance in pixels. Smaller = stronger perspective (more visible side faces); larger = more orthographic. 0 ties the focal distance to the host width (legacy behavior — perspective changes with zoom)."/>
+                <Slider x:Name="PerspectiveSlider"
+                        Grid.Column="3"
+                        Minimum="0" Maximum="2000"
+                        Value="{x:Bind combobulate.PerspectiveDistance, Mode=TwoWay}"
+                        StepFrequency="10"
+                        TickFrequency="200" TickPlacement="Outside"/>
             </Grid>
         </StackPanel>
     </Grid>
