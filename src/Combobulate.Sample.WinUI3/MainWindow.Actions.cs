@@ -123,6 +123,21 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
   }
 }"),
         new ActionDescriptor(
+            name: "RunZSortTest",
+            description: "Spike: validates whether the WinUI Composition compositor honours per-sprite Offset.Z when paint-order-resolving overlapping siblings, OR whether it always paints in VisualCollection order regardless of Z. Creates a full-window overlay with two 200x200 SpriteVisuals (red at child[0], blue at child[1], both centred and overlapping), under a parent ContainerVisual that has a PerspectiveTransform applied via TransformMatrix. Sets the requested Z offsets, then the caller takes a screenshot and inspects which colour is on top. Convention: +Z = toward viewer (out of screen). Baseline (redZ=0,blueZ=0): blue should always be on top (later in tree). Test (redZ=+200,blueZ=0): if compositor depth-sorts, red appears on top; if compositor uses tree order, blue stays on top. The overlay persists between calls so you can call repeatedly with different Z values without rebuilding the scene.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""required"": [""redZ"", ""blueZ""],
+  ""properties"": {
+    ""redZ"":  { ""type"": ""number"", ""minimum"": -500, ""maximum"": 500, ""description"": ""Offset.Z for the red sprite (child[0])."" },
+    ""blueZ"": { ""type"": ""number"", ""minimum"": -500, ""maximum"": 500, ""description"": ""Offset.Z for the blue sprite (child[1])."" }
+  }
+}"),
+        new ActionDescriptor(
+            name: "ClearZSortTest",
+            description: "Tears down the Z-sort spike overlay created by RunZSortTest, restoring the normal app UI.",
+            parameterSchema: @"{""type"":""object"",""properties"":{}}"),
+        new ActionDescriptor(
             name: "SetSpinSeconds",
             description: "Sets SpinSecondsPerTurn live (drives the UI slider's Value, which triggers the same OnSpinSpeedChanged path: resets the sampler epoch and restarts the GPU KFA if currently spinning). Range 0.5..30. Use to test whether flicker is angular-speed-dependent: if drift scales with 1/seconds the cause is a constant TIME offset (clock-skew hypothesis); if drift is roughly speed-independent in degrees the cause is geometric/numeric in the sort path.",
             parameterSchema: @"{
@@ -175,6 +190,8 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             case "DumpSortDiagnostics": return DispatchDumpSortDiagnosticsAsync(parametersJson);
             case "SetSpinPhaseOffset": return DispatchSetSpinPhaseOffsetAsync(parametersJson);
             case "SetSpinSeconds": return DispatchSetSpinSecondsAsync(parametersJson);
+            case "RunZSortTest": return DispatchRunZSortTestAsync(parametersJson);
+            case "ClearZSortTest": return RunOnUi(ClearZSortTest);
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -438,6 +455,112 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             tcs.SetResult(ActionResult.Fail("execution_error", "Failed to enqueue UI work."));
         }
         return tcs.Task;
+    }
+
+    // ---------- Z-sort validation spike ----------
+    // Goal: prove or disprove that Microsoft.UI.Composition's compositor
+    // depth-sorts overlapping siblings by Offset.Z. The visual tree is set
+    // up as: hostVisual -> container (with PerspectiveTransform) -> [red, blue].
+    // Red is child[0] (would paint FIRST in tree-order). Blue is child[1]
+    // (would paint LAST = on top in tree-order). If the compositor honours
+    // depth, raising red's Z above blue's should make red appear on top.
+
+    private Microsoft.UI.Composition.ContainerVisual? _zTestContainer;
+    private Microsoft.UI.Composition.SpriteVisual? _zTestRed;
+    private Microsoft.UI.Composition.SpriteVisual? _zTestBlue;
+
+    private Task<ActionResult> DispatchRunZSortTestAsync(string parametersJson)
+    {
+        JObject p;
+        try { p = JObject.Parse(parametersJson); }
+        catch { return Task.FromResult(ActionResult.Fail("validation_error", "params is not valid JSON.")); }
+        var rZ = p["redZ"];  if (rZ == null) return Task.FromResult(ActionResult.Fail("validation_error", "params.redZ is required."));
+        var bZ = p["blueZ"]; if (bZ == null) return Task.FromResult(ActionResult.Fail("validation_error", "params.blueZ is required."));
+        var redZ  = (float)rZ.Value<double>();
+        var blueZ = (float)bZ.Value<double>();
+        return RunOnUi(() => SetupOrUpdateZSortTest(redZ, blueZ));
+    }
+
+    private void SetupOrUpdateZSortTest(float redZ, float blueZ)
+    {
+        var hostVisual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(this.Content);
+        var compositor = hostVisual.Compositor;
+
+        // Use the framework element's actual size, NOT hostVisual.Size, which
+        // is (0,0) for the root because Composition sizes only get pushed up
+        // for visuals inside ElementCompositionPreview-hosted trees.
+        var rootFE = this.Content as Microsoft.UI.Xaml.FrameworkElement;
+        float width  = rootFE != null && rootFE.ActualWidth  > 0 ? (float)rootFE.ActualWidth  : 1200f;
+        float height = rootFE != null && rootFE.ActualHeight > 0 ? (float)rootFE.ActualHeight : 800f;
+
+        if (_zTestContainer == null)
+        {
+            _zTestContainer = compositor.CreateContainerVisual();
+            _zTestContainer.Size = new System.Numerics.Vector2(width, height);
+            _zTestContainer.Offset = new System.Numerics.Vector3(0, 0, 0);
+
+            // Perspective: looking down +Z. The classic "perspective dip"
+            // matrix used in WinUI Composition tutorials is:
+            //   M[3,2] = -1 / cameraDistance
+            // This makes Offset.Z affect projected size AND, if the
+            // compositor depth-sorts, paint order.
+            var perspective = System.Numerics.Matrix4x4.Identity;
+            perspective.M34 = -1.0f / 500.0f;
+            // Centre the perspective vanishing point at the middle of the window.
+            var centerOffset = System.Numerics.Matrix4x4.CreateTranslation(-width / 2, -height / 2, 0);
+            var centerBack   = System.Numerics.Matrix4x4.CreateTranslation( width / 2,  height / 2, 0);
+            _zTestContainer.TransformMatrix = centerOffset * perspective * centerBack;
+
+            // Red sprite at child[0] = paints first under tree-order.
+            // Place it slightly LEFT of centre so the overlap is obvious.
+            _zTestRed = compositor.CreateSpriteVisual();
+            _zTestRed.Size = new System.Numerics.Vector2(300, 300);
+            _zTestRed.Offset = new System.Numerics.Vector3(width / 2 - 200, height / 2 - 150, 0);
+            _zTestRed.Brush = compositor.CreateColorBrush(Windows.UI.Color.FromArgb(255, 220, 40, 40));
+            _zTestContainer.Children.InsertAtTop(_zTestRed);
+
+            // Blue sprite at child[1] = paints last under tree-order = on top in 2D.
+            // Place it slightly RIGHT so left/right halves of each sprite are visible.
+            _zTestBlue = compositor.CreateSpriteVisual();
+            _zTestBlue.Size = new System.Numerics.Vector2(300, 300);
+            _zTestBlue.Offset = new System.Numerics.Vector3(width / 2 - 100, height / 2 - 150, 0);
+            _zTestBlue.Brush = compositor.CreateColorBrush(Windows.UI.Color.FromArgb(255, 40, 80, 220));
+            _zTestContainer.Children.InsertAtTop(_zTestBlue);
+
+            // Attach overlay on top of the existing app UI.
+            Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.SetElementChildVisual(this.Content, _zTestContainer);
+        }
+        else
+        {
+            // Keep size in sync with current window size in case the user resized.
+            _zTestContainer.Size = new System.Numerics.Vector2(width, height);
+        }
+
+        // Update Z values (only Z; X/Y stay where we put them above so the
+        // overlap is fixed and only the depth changes).
+        if (_zTestRed != null)
+        {
+            var off = _zTestRed.Offset;  off.Z = redZ;  _zTestRed.Offset = off;
+        }
+        if (_zTestBlue != null)
+        {
+            var off = _zTestBlue.Offset; off.Z = blueZ; _zTestBlue.Offset = off;
+        }
+    }
+
+    private void ClearZSortTest()
+    {
+        if (_zTestContainer != null)
+        {
+            _zTestContainer.Children.RemoveAll();
+            _zTestContainer.Dispose();
+            _zTestContainer = null;
+            _zTestRed  = null;
+            _zTestBlue = null;
+            // Restore the original child visual (which is what SetElementChildVisual
+            // had replaced - usually null, the framework manages the host).
+            Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.SetElementChildVisual(this.Content, null);
+        }
     }
 }
 #endif
