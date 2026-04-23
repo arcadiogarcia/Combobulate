@@ -79,6 +79,25 @@ public sealed class CombobulateSceneVisual : Control
     private ObjGeometry? _geometry;
     private string? _pendingSource;
 
+    // Per color-group state preserved across rotation rebakes. The hot path
+    // (RebuildForExternalRotation, called every frame during a spin) only
+    // changes vertex positions; the index buffer, scene tree, materials and
+    // native MemoryBuffer for positions are all reused. Set _geometryDirty
+    // = true to force a full rebuild on the next call.
+    private sealed class GroupCache
+    {
+        public CachedQuad[] Quads = Array.Empty<CachedQuad>();
+        public Vector3[] PositionsScratch = Array.Empty<Vector3>();
+        public SceneMesh? Mesh;
+        public MemoryBuffer? PositionsBuffer;
+        public object? PositionsRef; // IMemoryBufferReference, kept alive
+        public IntPtr PositionsAccessPtr; // AddRef'd, released in Dispose
+        public IntPtr PositionsDest; // raw write target inside the MemoryBuffer
+        public int PositionsByteSize;
+    }
+    private List<GroupCache>? _groupCaches;
+    private bool _geometryDirty = true;
+
     public CombobulateSceneVisual()
     {
         this.DefaultStyleKey = typeof(CombobulateSceneVisual);
@@ -513,6 +532,24 @@ public sealed class CombobulateSceneVisual : Control
 
     private void DisposeSceneTree()
     {
+        if (_groupCaches != null)
+        {
+            foreach (var g in _groupCaches)
+            {
+                if (g.PositionsAccessPtr != IntPtr.Zero)
+                {
+                    Marshal.Release(g.PositionsAccessPtr);
+                    g.PositionsAccessPtr = IntPtr.Zero;
+                }
+                (g.PositionsRef as IDisposable)?.Dispose();
+                g.PositionsRef = null;
+                g.PositionsBuffer?.Dispose();
+                g.PositionsBuffer = null;
+                g.Mesh = null;
+                g.PositionsDest = IntPtr.Zero;
+            }
+            _groupCaches = null;
+        }
         if (_modelNode != null)
         {
             // Children/Components collections own their items; clearing drops references.
@@ -523,6 +560,7 @@ public sealed class CombobulateSceneVisual : Control
         {
             _sceneVisual.Root = null;
         }
+        _geometryDirty = true;
     }
 
     /// <summary>
@@ -565,6 +603,14 @@ public sealed class CombobulateSceneVisual : Control
 
         try
         {
+            // No-arg rebuilds are caused by structural property changes
+            // (model, scale, perspective, materials, FlipZ) or layout
+            // changes; force a full rebuild so the cache is rebuilt for
+            // the new structure. Rotation-only rebakes (override supplied)
+            // can reuse the cache as long as nothing else invalidated it.
+            if (rotationOverride is null)
+                _geometryDirty = true;
+
             RebuildMeshCore(rotationOverride);
         }
         catch (Exception ex)
@@ -588,29 +634,25 @@ public sealed class CombobulateSceneVisual : Control
     }
 
     private void RebuildMeshCore(Vector3? rotationOverride)
-    {        DisposeSceneTree();
-
+    {
         var model = Model;
-        if (model == null) return;
+        if (model == null)
+        {
+            DisposeSceneTree();
+            return;
+        }
 
         _geometry ??= ObjCache.ForModel(model);
         var quads = _geometry.Quads;
-        if (quads.Length == 0) return;
+        if (quads.Length == 0)
+        {
+            DisposeSceneTree();
+            return;
+        }
 
+        // Compute the rotation+projection inputs that are baked into
+        // every vertex.
         var scale = (float)ModelScale;
-
-        // Bake the rotation and centering directly into the vertex positions.
-        // Nested SceneNodes do not rasterise on this hosting path, and a
-        // single-node Translation+Orientation pair is applied as
-        // Translation-after-Orientation, which would rotate the cube around
-        // the surface origin and fling it off-screen.
-        //
-        // The sibling sprite renderer rotates in pixel space (Y axis points
-        // DOWN), but scene space puts Y UP, so naively reusing the same
-        // CreateFromYawPitchRoll quaternion here makes pitch and roll spin
-        // in the opposite direction. To match the sprite renderer exactly we
-        // do the entire transform in pixel-down space first and only flip Y
-        // once at the very end when handing the position to scene space.
         float w = _host != null ? (float)_host.ActualWidth : 0f;
         float h = _host != null ? (float)_host.ActualHeight : 0f;
         var center = new Vector3(w * 0.5f, h * 0.5f, 0f);
@@ -633,15 +675,27 @@ public sealed class CombobulateSceneVisual : Control
             (float)rotY * deg2rad,
             (float)rotX * deg2rad,
             (float)rotZ * deg2rad);
+        bool flipZ = FlipZ;
 
-        // Single SceneNode acting as the root.
-        _modelNode = SceneNode.Create(_compositor);
+        // Fast path: caches are valid and only the rotation/projection
+        // inputs may have changed. Refill the existing native MemoryBuffer
+        // for each group's positions in-place and re-call FillMeshAttribute
+        // so the SceneMesh re-uploads the new contents to the GPU. No new
+        // SceneMesh / Material / Renderer / SceneNode / Dictionary / List /
+        // Vector3[] / ushort[] / MemoryBuffer is allocated.
+        if (!_geometryDirty && _groupCaches != null && _modelNode != null)
+        {
+            RebakePositions(scale, rotation, center, persp, flipZ);
+            return;
+        }
 
-        // Group quads by colour so we can build one mesh+material+renderer
-        // per colour and host them on sibling child SceneNodes. The previous
-        // attempt nested renderers under a parent that itself owned a
-        // renderer; this version leaves the root pure-container so the
-        // children's renderers are the only ones in the tree.
+        // Slow path: full structural build. Group quads by colour, allocate
+        // per-group SceneMesh + Material + Renderer + SceneNode and the
+        // persistent native MemoryBuffer that subsequent fast-path rebakes
+        // will rewrite into.
+        DisposeSceneTree();
+        _modelNode = SceneNode.Create(_compositor!);
+
         var groups = new Dictionary<uint, List<CachedQuad>>();
         foreach (var q in quads)
         {
@@ -655,19 +709,23 @@ public sealed class CombobulateSceneVisual : Control
             list.Add(q);
         }
 
+        var caches = new List<GroupCache>(groups.Count);
         foreach (var kvp in groups)
         {
             var groupQuads = kvp.Value;
-            var positions = new Vector3[groupQuads.Count * 4];
-            var indices = new ushort[groupQuads.Count * 6];
-            for (int i = 0; i < groupQuads.Count; i++)
+            var quadArray = groupQuads.ToArray();
+            int vertCount = quadArray.Length * 4;
+            int idxCount = quadArray.Length * 6;
+            var positions = new Vector3[vertCount];
+            var indices = new ushort[idxCount];
+            for (int i = 0; i < quadArray.Length; i++)
             {
-                var cq = groupQuads[i];
+                var cq = quadArray[i];
                 int v = i * 4;
-                positions[v + 0] = TransformVertex(cq.V0, scale, rotation, center, persp, FlipZ);
-                positions[v + 1] = TransformVertex(cq.V1, scale, rotation, center, persp, FlipZ);
-                positions[v + 2] = TransformVertex(cq.V2, scale, rotation, center, persp, FlipZ);
-                positions[v + 3] = TransformVertex(cq.V3, scale, rotation, center, persp, FlipZ);
+                positions[v + 0] = TransformVertex(cq.V0, scale, rotation, center, persp, flipZ);
+                positions[v + 1] = TransformVertex(cq.V1, scale, rotation, center, persp, flipZ);
+                positions[v + 2] = TransformVertex(cq.V2, scale, rotation, center, persp, flipZ);
+                positions[v + 3] = TransformVertex(cq.V3, scale, rotation, center, persp, flipZ);
 
                 int idx = i * 6;
                 indices[idx + 0] = (ushort)(v + 0);
@@ -678,13 +736,29 @@ public sealed class CombobulateSceneVisual : Control
                 indices[idx + 5] = (ushort)(v + 3);
             }
 
-            var mesh = SceneMesh.Create(_compositor);
+            var mesh = SceneMesh.Create(_compositor!);
             mesh.PrimitiveTopology = DirectXPrimitiveTopology.TriangleList;
-            FillAttribute(mesh, SceneAttributeSemantic.Vertex, DirectXPixelFormat.R32G32B32Float, positions);
+
+            // Allocate the persistent positions buffer + acquire the COM
+            // byte-access pointer. The pointer is held for the lifetime of
+            // the GroupCache so subsequent fast-path rebakes write directly
+            // into the native memory without re-creating the buffer.
+            var cache = new GroupCache
+            {
+                Quads = quadArray,
+                PositionsScratch = positions,
+                Mesh = mesh,
+                PositionsByteSize = vertCount * sizeof(float) * 3,
+            };
+            CreatePersistentPositionsBuffer(cache);
+            WritePositionsAndUpload(mesh, cache);
+
+            // Indices never change after the structural build; fill once and
+            // dispose the temporary index buffer immediately.
             FillAttribute(mesh, SceneAttributeSemantic.Index, DirectXPixelFormat.R16UInt, indices);
 
-            var faceColor = ColorToVector4(groupQuads[0].Color);
-            var material = SceneMetallicRoughnessMaterial.Create(_compositor);
+            var faceColor = ColorToVector4(quadArray[0].Color);
+            var material = SceneMetallicRoughnessMaterial.Create(_compositor!);
             // SceneMetallicRoughnessMaterial always runs through the IBL,
             // which washes BaseColorFactor down to a pastel and clips
             // EmissiveFactor > 1.0 to white. The compromise that reads
@@ -706,16 +780,98 @@ public sealed class CombobulateSceneVisual : Control
             material.EmissiveFactor = new Vector3(faceColor.X, faceColor.Y, faceColor.Z) * (float)EmissiveBoost;
             material.IsDoubleSided = true;
 
-            var renderer = SceneMeshRendererComponent.Create(_compositor);
+            var renderer = SceneMeshRendererComponent.Create(_compositor!);
             renderer.Mesh = mesh;
             renderer.Material = material;
 
-            var child = SceneNode.Create(_compositor);
+            var child = SceneNode.Create(_compositor!);
             child.Components.Add(renderer);
             _modelNode.Children.Add(child);
+
+            caches.Add(cache);
         }
 
-        _sceneVisual.Root = _modelNode;
+        _groupCaches = caches;
+        _sceneVisual!.Root = _modelNode;
+        _geometryDirty = false;
+    }
+
+    /// <summary>
+    /// Fast-path rebake invoked when only the rotation/projection inputs
+    /// have changed. Recomputes vertex positions for every cached group
+    /// and re-uploads them into the persistent native MemoryBuffer that
+    /// was allocated in the structural build.
+    /// </summary>
+    private void RebakePositions(float scale, Quaternion rotation, Vector3 center, float persp, bool flipZ)
+    {
+        var caches = _groupCaches!;
+        for (int g = 0; g < caches.Count; g++)
+        {
+            var cache = caches[g];
+            var quadArray = cache.Quads;
+            var positions = cache.PositionsScratch;
+            for (int i = 0; i < quadArray.Length; i++)
+            {
+                var cq = quadArray[i];
+                int v = i * 4;
+                positions[v + 0] = TransformVertex(cq.V0, scale, rotation, center, persp, flipZ);
+                positions[v + 1] = TransformVertex(cq.V1, scale, rotation, center, persp, flipZ);
+                positions[v + 2] = TransformVertex(cq.V2, scale, rotation, center, persp, flipZ);
+                positions[v + 3] = TransformVertex(cq.V3, scale, rotation, center, persp, flipZ);
+            }
+            WritePositionsAndUpload(cache.Mesh!, cache);
+        }
+    }
+
+    /// <summary>
+    /// Allocates a single MemoryBuffer sized for this group's vertex
+    /// positions and acquires the IMemoryBufferByteAccess byte pointer.
+    /// The buffer + COM ref + dest pointer are stored on the cache and
+    /// kept alive until <see cref="DisposeSceneTree"/> releases them.
+    /// </summary>
+    private static unsafe void CreatePersistentPositionsBuffer(GroupCache cache)
+    {
+        var buffer = new MemoryBuffer((uint)cache.PositionsByteSize);
+        var reference = buffer.CreateReference();
+        IntPtr unk = GetIUnknown(reference);
+        IntPtr accessPtr;
+        try
+        {
+            Guid iid = new Guid("5B0D3235-4DBA-4D44-865E-8F1D0E4FD04D");
+            int hr = Marshal.QueryInterface(unk, ref iid, out accessPtr);
+            if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+        }
+        finally { Marshal.Release(unk); }
+
+        var vtbl = *(IntPtr**)accessPtr;
+        var getBuffer = (delegate* unmanaged[Stdcall]<IntPtr, byte**, uint*, int>)vtbl[3];
+        byte* dest;
+        uint capacity;
+        int hr2 = getBuffer(accessPtr, &dest, &capacity);
+        if (hr2 < 0)
+        {
+            Marshal.Release(accessPtr);
+            Marshal.ThrowExceptionForHR(hr2);
+        }
+
+        cache.PositionsBuffer = buffer;
+        cache.PositionsRef = reference;
+        cache.PositionsAccessPtr = accessPtr;
+        cache.PositionsDest = (IntPtr)dest;
+    }
+
+    /// <summary>
+    /// Copies the cached <see cref="GroupCache.PositionsScratch"/> array
+    /// into the persistent native buffer and re-calls FillMeshAttribute so
+    /// the SceneMesh re-uploads to the GPU.
+    /// </summary>
+    private static unsafe void WritePositionsAndUpload(SceneMesh mesh, GroupCache cache)
+    {
+        fixed (Vector3* src = cache.PositionsScratch)
+        {
+            Buffer.MemoryCopy(src, (void*)cache.PositionsDest, cache.PositionsByteSize, cache.PositionsByteSize);
+        }
+        mesh.FillMeshAttribute(SceneAttributeSemantic.Vertex, DirectXPixelFormat.R32G32B32Float, cache.PositionsBuffer);
     }
 
     private void UpdateOrientation()

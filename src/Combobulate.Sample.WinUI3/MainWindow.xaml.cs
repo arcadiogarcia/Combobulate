@@ -300,17 +300,14 @@ public sealed partial class MainWindow : Window
                     var nowTicks = _spinClock.ElapsedTicks;
                     var dtTicks  = nowTicks - _prevTickElapsedTicks;
                     var deltaMs  = (float)((dtTicks * 1000.0) / System.Diagnostics.Stopwatch.Frequency);
-                    // Read the cull state RIGHT AFTER the rebuild ran (the
-                    // sampler returned a Vector3 above, then Combobulate's
-                    // OnRenderingTick called RebuildForExternalRotation with
-                    // it). At the moment this code runs we're still inside the
-                    // sampler invocation BEFORE rebuild — so we read state from
-                    // the PREVIOUS frame's rebuild. That's fine for trend
-                    // analysis (drift is monotonic).
-                    var (cv, _) = combobulate.GetRenderCacheSnapshot();
-                    byte mask = 0; byte cnt = 0;
-                    int n = Math.Min(cv.Length, 8);
-                    for (int i = 0; i < n; i++) if (cv[i]) { mask |= (byte)(1 << i); cnt++; }
+                    // Allocation-free read of the cull state from the
+                    // PREVIOUS frame's rebuild — the sampler returned a
+                    // Vector3 above, then Combobulate's OnRenderingTick
+                    // calls RebuildForExternalRotation with it. Reading
+                    // here records the state we just consumed; trend
+                    // analysis (drift is monotonic) is unaffected by the
+                    // one-frame skew.
+                    combobulate.CopyVisibleMaskByte(8, out byte mask, out byte cnt, out _);
                     float gpuYaw = 0f;
                     _externalRotationProps?.TryGetScalar("SpinYaw", out gpuYaw);
                     _spinRing[_spinRingHead] = new SpinTick

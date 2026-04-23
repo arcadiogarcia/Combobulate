@@ -763,6 +763,31 @@ public sealed class Combobulate : Control
     }
 
     /// <summary>
+    /// Allocation-free variant of <see cref="GetRenderCacheSnapshot"/> for
+    /// per-frame instrumentation. Packs the first <paramref name="maxBits"/>
+    /// entries of <c>_lastVisible</c> into <paramref name="mask"/> (LSB =
+    /// quad 0) and reports the popcount and total cached quad count. Safe
+    /// to call on the UI thread; performs no allocations.
+    /// </summary>
+    public void CopyVisibleMaskByte(int maxBits, out byte mask, out byte count, out int totalQuads)
+    {
+        mask = 0;
+        count = 0;
+        var lv = _lastVisible;
+        totalQuads = lv?.Length ?? 0;
+        if (lv == null || maxBits <= 0) return;
+        int n = Math.Min(Math.Min(maxBits, 8), lv.Length);
+        for (int i = 0; i < n; i++)
+        {
+            if (lv[i])
+            {
+                mask |= (byte)(1 << i);
+                count++;
+            }
+        }
+    }
+
+    /// <summary>
     /// Diagnostic: returns the actual <c>_root.Children</c> stack as cached-quad
     /// indices, bottom to top. This is the ground truth of what compositor will
     /// render and includes hidden sprites still parented in the collection.
