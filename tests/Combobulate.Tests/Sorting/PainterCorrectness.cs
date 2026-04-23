@@ -97,48 +97,63 @@ internal static class PainterCorrectness
     /// For the book mesh n ≤ 12, so 66 pair checks per yaw — trivially fast.
     /// </remarks>
     public static Violation? FindWorstViolation(ObjGeometry geometry, int[] order, int count, Matrix4x4 rotation)
+        => FindWorstViolation(geometry, order, count, rotation, cameraZ: 0f);
+
+    /// <summary>
+    /// Perspective-aware overload. <paramref name="cameraZ"/> in view-space
+    /// units places the camera at <c>(0, 0, cameraZ)</c> looking toward the
+    /// origin (matching <see cref="Combobulate.Sorting.GeometryPredicates.IsFrontFacingPerspective"/>).
+    /// Pass <c>0</c> for orthographic projection (XY drop).
+    ///
+    /// <para>
+    /// Perspective math: each view-space point <c>(x, y, z)</c> projects to
+    /// screen coordinates <c>(x · f, y · f)</c> where <c>f = cameraZ / (cameraZ − z)</c>.
+    /// The Sutherland–Hodgman overlap is computed in screen space, but
+    /// depth is recovered by intersecting the camera ray through each
+    /// overlap point with the face's view-space plane — which gives the
+    /// depth at exactly the pixel that would be drawn, not at an
+    /// orthographic projection of it.
+    /// </para>
+    /// </summary>
+    public static Violation? FindWorstViolation(ObjGeometry geometry, int[] order, int count, Matrix4x4 rotation, float cameraZ)
     {
         var quads = geometry.Quads;
         // Pre-rotate the visible quads' four corners into view space.
-        var v = new Vector3[count, 4];
+        var view = new Vector3[count, 4];
+        var screen = new Vector2[count, 4];
+        bool persp = cameraZ > 0f;
         for (int i = 0; i < count; i++)
         {
             var q = quads[order[i]];
-            v[i, 0] = Vector3.Transform(q.V0, rotation);
-            v[i, 1] = Vector3.Transform(q.V1, rotation);
-            v[i, 2] = Vector3.Transform(q.V2, rotation);
-            v[i, 3] = Vector3.Transform(q.V3, rotation);
+            view[i, 0] = Vector3.Transform(q.V0, rotation);
+            view[i, 1] = Vector3.Transform(q.V1, rotation);
+            view[i, 2] = Vector3.Transform(q.V2, rotation);
+            view[i, 3] = Vector3.Transform(q.V3, rotation);
+            for (int k = 0; k < 4; k++) screen[i, k] = ToScreen(view[i, k], cameraZ, persp);
         }
 
         Violation? worst = null;
         for (int i = 0; i < count; i++)
         {
-            // Subject polygon (drawn first).
+            // Subject polygon (drawn first) in screen space.
             var subject = new List<Vector2>(4)
             {
-                new(v[i, 0].X, v[i, 0].Y),
-                new(v[i, 1].X, v[i, 1].Y),
-                new(v[i, 2].X, v[i, 2].Y),
-                new(v[i, 3].X, v[i, 3].Y),
+                screen[i, 0], screen[i, 1], screen[i, 2], screen[i, 3],
             };
             // Make subject CCW for SH; if it's CW (back-facing in 2D), reverse.
             if (PolygonSignedArea(subject) < 0) subject.Reverse();
-            var planeI = PlaneFromTriangle(v[i, 0], v[i, 1], v[i, 2]);
+            var planeI = PlaneFromTriangle(view[i, 0], view[i, 1], view[i, 2]);
             // If the plane is degenerate (rare — would need a sliver quad) skip.
             if (planeI.IsDegenerate) continue;
 
             for (int j = i + 1; j < count; j++)
             {
-                // Clip polygon (drawn second).
                 var clip = new List<Vector2>(4)
                 {
-                    new(v[j, 0].X, v[j, 0].Y),
-                    new(v[j, 1].X, v[j, 1].Y),
-                    new(v[j, 2].X, v[j, 2].Y),
-                    new(v[j, 3].X, v[j, 3].Y),
+                    screen[j, 0], screen[j, 1], screen[j, 2], screen[j, 3],
                 };
                 if (PolygonSignedArea(clip) < 0) clip.Reverse();
-                var planeJ = PlaneFromTriangle(v[j, 0], v[j, 1], v[j, 2]);
+                var planeJ = PlaneFromTriangle(view[j, 0], view[j, 1], view[j, 2]);
                 if (planeJ.IsDegenerate) continue;
 
                 var overlap = SutherlandHodgman(subject, clip);
@@ -146,9 +161,6 @@ internal static class PainterCorrectness
                 if (overlap.Count < 3) continue;
                 if (PolygonSignedArea(overlap) <= 1e-8f) continue;
 
-                // Sample depth at overlap vertices + centroid (centroid catches
-                // mid-region violations when all vertices happen to lie on the
-                // shared seam edge of two coplanar-along-edge faces).
                 Vector2 cx = default;
                 for (int k = 0; k < overlap.Count; k++) cx += overlap[k];
                 cx /= overlap.Count;
@@ -158,9 +170,14 @@ internal static class PainterCorrectness
                 for (int k = 0; k <= overlap.Count; k++)
                 {
                     var p = k < overlap.Count ? overlap[k] : cx;
-                    if (!planeI.TryDepthAt(p, out float zi)) continue;
-                    if (!planeJ.TryDepthAt(p, out float zj)) continue;
-                    var delta = zi - zj; // > 0 means I is in front of J at p, painter order is wrong
+                    if (!TryDepthOnRay(p, planeI, cameraZ, persp, out float zi)) continue;
+                    if (!TryDepthOnRay(p, planeJ, cameraZ, persp, out float zj)) continue;
+                    // Painter convention: face drawn first should be FARTHER from camera.
+                    // Under our view convention "+Z is toward the camera under ortho"
+                    // and "z < cameraZ but z increasing = closer" under perspective.
+                    // In both cases the inequality "zi > zj" means face i is closer to
+                    // the camera than face j at the overlap point.
+                    var delta = zi - zj;
                     if (delta > maxFront)
                     {
                         maxFront = delta;
@@ -178,6 +195,43 @@ internal static class PainterCorrectness
         }
 
         return worst;
+    }
+
+    private static Vector2 ToScreen(Vector3 viewPoint, float cameraZ, bool persp)
+    {
+        if (!persp) return new Vector2(viewPoint.X, viewPoint.Y);
+        // Camera at (0,0,cameraZ) looking toward origin (-Z direction).
+        // Pinhole projection: screen.x = x * cameraZ / (cameraZ - z), same for y.
+        var denom = cameraZ - viewPoint.Z;
+        if (System.MathF.Abs(denom) < 1e-6f) denom = 1e-6f * System.MathF.Sign(denom == 0 ? 1 : denom);
+        var f = cameraZ / denom;
+        return new Vector2(viewPoint.X * f, viewPoint.Y * f);
+    }
+
+    /// <summary>
+    /// Recover the view-space depth (Z) at which the camera ray through
+    /// screen point <paramref name="p"/> intersects the given plane.
+    /// Returns <c>false</c> when the ray is parallel to the plane.
+    /// </summary>
+    private static bool TryDepthOnRay(Vector2 p, Plane plane, float cameraZ, bool persp, out float z)
+    {
+        if (!persp)
+        {
+            // Orthographic: ray is (p.X, p.Y, anything) — solve plane equation for z.
+            return plane.TryDepthAt(p, out z);
+        }
+        // Perspective: ray from camera (0,0,cameraZ) through screen point
+        // (p.X, p.Y, 0) (the projection plane is z=0). Parameterise as
+        //   r(t) = (1-t)*(0,0,cameraZ) + t*(p.X, p.Y, 0)
+        //        = (t·p.X, t·p.Y, cameraZ - t·cameraZ).
+        // Plug into plane: n.X · t·p.X + n.Y · t·p.Y + n.Z · (cameraZ - t·cameraZ) = D
+        //   t · (n.X·p.X + n.Y·p.Y - n.Z·cameraZ) = D - n.Z·cameraZ
+        var n = plane.Normal;
+        var denom = n.X * p.X + n.Y * p.Y - n.Z * cameraZ;
+        if (System.MathF.Abs(denom) < 1e-6f) { z = 0f; return false; }
+        var t = (plane.D - n.Z * cameraZ) / denom;
+        z = cameraZ - t * cameraZ;
+        return true;
     }
 
     // ---------- 2D polygon helpers ----------
