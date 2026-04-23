@@ -62,6 +62,17 @@
                           OffContent="Static"
                           Toggled="SpinToggle_Toggled"
                           ToolTipService.ToolTip="Autonomous continuous Y-axis spin. Turns on External + Auto-refresh automatically and advances the shared rotation property set from the CompositionTarget.Rendering tick — one coherent yaw per frame, visible to both renderers' cull/sort via the same expression animation."/>
+            <TextBlock Text="s/turn:" VerticalAlignment="Center" Margin="8,0,0,0"
+                       ToolTipService.ToolTip="Spin period in seconds. Smaller = faster. Use to test whether the residual flicker scales with angular speed (clock-offset hypothesis predicts WORSE flicker as speed increases, since the same time offset becomes a bigger yaw delta)."/>
+            <Slider x:Name="SpinSpeedSlider"
+                    Minimum="0.5" Maximum="30" Value="6"
+                    Width="200"
+                    StepFrequency="0.1"
+                    TickFrequency="5"
+                    TickPlacement="Outside"
+                    VerticalAlignment="Center"
+                    ValueChanged="OnSpinSpeedChanged"/>
+            <TextBlock x:Name="SpinSpeedValueText" Text="6.0" VerticalAlignment="Center" Width="40"/>
             <TextBlock x:Name="StatusText"
                        VerticalAlignment="Center"
                        Opacity="0.7"

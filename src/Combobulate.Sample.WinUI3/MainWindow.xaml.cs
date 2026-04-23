@@ -97,7 +97,9 @@ public sealed partial class MainWindow : Window
     }
 
     private DateTime? _spinStart;
-    private const float SpinSecondsPerTurn = 6f;
+    // Mutable so the SpinSpeedSlider can change it live. Used by both the
+    // GPU KFA (set in StartGpuSpin) and the CPU sampler's modulo-period math.
+    private float SpinSecondsPerTurn = 6f;
 
     // Compensates for the latency between the UI thread queuing
     // props.StartAnimation("SpinYaw", kfa) and the FIRST CompositionTarget.Rendering
@@ -205,6 +207,30 @@ public sealed partial class MainWindow : Window
         _externalRotationProps.StopAnimation("SpinYaw");
         _externalRotationProps.InsertScalar("SpinYaw", 0f);
         _externalRotationProps.InsertScalar("SpinActive", 0f);
+    }
+
+    /// <summary>
+    /// Live-tunable spin period. If the spin is currently running, restart
+    /// the GPU KFA with the new duration so the change takes effect mid-spin
+    /// without the user toggling spin off/on. The CPU sampler reads
+    /// SpinSecondsPerTurn each frame so its math picks up the new value
+    /// automatically. Resets the spin epoch so wrapping stays aligned with
+    /// the new period.
+    /// </summary>
+    private void OnSpinSpeedChanged(object sender, RangeBaseValueChangedEventArgs e)
+    {
+        SpinSecondsPerTurn = (float)e.NewValue;
+        if (SpinSpeedValueText != null)
+            SpinSpeedValueText.Text = SpinSecondsPerTurn.ToString("F1");
+        if (_spinStart != null)
+        {
+            // Mid-spin change: restart with new period. Reset the epoch so
+            // the CPU sampler's modulo math re-latches against the new
+            // GPU KFA's start instant.
+            _spinStartCompositorMs  = 0f;
+            _spinStartCompositorMsD = 0.0;
+            StartGpuSpin();
+        }
     }
 
     /// <summary>
