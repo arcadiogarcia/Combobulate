@@ -105,7 +105,14 @@ public sealed class BspSorter : IFaceSorter
 
         var seen = new bool[qc];
         int written = 0;
-        Walk(_root, cameraDir, cameraPosObj, persp, visibleBuffer, seen, orderBuffer, ref written);
+        // Same margin used to widen the cull cone is also used to widen the
+        // BSP's on-plane snap zone, so the traversal's hemisphere bit is stable
+        // across any sub-frame CPU/GPU yaw mismatch the animation can produce.
+        // Without this, the cull stays correct (margin absorbs face flips) but
+        // the BSP can still flip its front-/back-subtree order at the precise
+        // yaw where the camera crosses a partitioning plane, producing visible
+        // sort glitches even when the visible set is unchanged.
+        Walk(_root, cameraDir, cameraPosObj, persp, cullMarginCos, visibleBuffer, seen, orderBuffer, ref written);
         return written;
     }
 
@@ -118,7 +125,7 @@ public sealed class BspSorter : IFaceSorter
     /// <see cref="Sort"/> for why mixing them produces order glitches at
     /// extreme tilts.
     /// </summary>
-    private static void Walk(Node? node, Vector3 cameraDir, Vector3 cameraPosObj, bool isPerspective, bool[] visible, bool[] seen, int[] order, ref int written)
+    private static void Walk(Node? node, Vector3 cameraDir, Vector3 cameraPosObj, bool isPerspective, float sortMargin, bool[] visible, bool[] seen, int[] order, ref int written)
     {
         if (node == null) return;
 
@@ -126,30 +133,30 @@ public sealed class BspSorter : IFaceSorter
         if (isPerspective)
         {
             // Distance-scale: which side of an infinite plane the camera point sits on.
-            // SignedDistanceSide is symmetric and snaps |sd| < DistanceEpsilon to 0
-            // (camera lies essentially on the plane → the splitter is a thin sliver and
+            // SignedDistanceSide is symmetric and snaps |sd| < DistanceEpsilon + sortMargin
+            // to 0 (camera lies essentially on the plane → the splitter is a thin sliver and
             // either traversal order is equally correct; deterministic fallback below).
-            hemi = GeometryPredicates.SignedDistanceSide(node.Plane.SignedDistance(cameraPosObj));
+            hemi = GeometryPredicates.SignedDistanceSide(node.Plane.SignedDistance(cameraPosObj), sortMargin);
         }
         else
         {
             // Cosine-scale: camera is at infinity along +cameraDir relative to the model.
-            // Snaps |dot| < CosineEpsilon to 0 for the same grazing-plane reason.
-            hemi = GeometryPredicates.CameraHemisphere(Vector3.Dot(node.Plane.Normal, cameraDir));
+            // Snaps |dot| < CosineEpsilon + sortMargin to 0 for the same grazing-plane reason.
+            hemi = GeometryPredicates.CameraHemisphere(Vector3.Dot(node.Plane.Normal, cameraDir), sortMargin);
         }
 
         if (hemi >= 0)
         {
             // Camera on/above front side → render back subtree, then node, then front.
-            Walk(node.Back, cameraDir, cameraPosObj, isPerspective, visible, seen, order, ref written);
+            Walk(node.Back, cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written);
             EmitBundle(node, visible, seen, order, ref written);
-            Walk(node.Front, cameraDir, cameraPosObj, isPerspective, visible, seen, order, ref written);
+            Walk(node.Front, cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written);
         }
         else
         {
-            Walk(node.Front, cameraDir, cameraPosObj, isPerspective, visible, seen, order, ref written);
+            Walk(node.Front, cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written);
             EmitBundle(node, visible, seen, order, ref written);
-            Walk(node.Back,  cameraDir, cameraPosObj, isPerspective, visible, seen, order, ref written);
+            Walk(node.Back,  cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written);
         }
     }
 

@@ -136,6 +136,24 @@ public static class GeometryPredicates
         return 0;
     }
 
+    /// <summary>
+    /// Margin overload of <see cref="CameraHemisphere(float)"/>. The grazing-plane
+    /// snap zone is widened from <see cref="CosineEpsilon"/> to
+    /// <c>CosineEpsilon + sortMarginCos</c>. Used by the BSP traversal during
+    /// animations to absorb sub-frame CPU/GPU yaw mismatches: when the camera
+    /// direction is within the widened cone of a partitioning plane the
+    /// hemisphere bit returns 0 and traversal falls back to a deterministic
+    /// (yaw-stable) order, eliminating sort flips at plane-crossing yaw values.
+    /// </summary>
+    /// <remarks>Scale: <b>cosine</b>.</remarks>
+    public static int CameraHemisphere(float planeNormalDotCameraDir, float sortMarginCos)
+    {
+        var t = CosineEpsilon + sortMarginCos;
+        if (planeNormalDotCameraDir >  t) return +1;
+        if (planeNormalDotCameraDir < -t) return -1;
+        return 0;
+    }
+
     // ---------- Distance-scale tolerances (object-space, unit-cube assumption) ----------
 
     /// <summary>
@@ -155,6 +173,24 @@ public static class GeometryPredicates
     {
         if (signedDistance >  DistanceEpsilon) return +1;
         if (signedDistance < -DistanceEpsilon) return -1;
+        return 0;
+    }
+
+    /// <summary>
+    /// Margin overload of <see cref="SignedDistanceSide(float)"/>. The on-plane
+    /// snap zone is widened from <see cref="DistanceEpsilon"/> to
+    /// <c>DistanceEpsilon + sortMarginDistance</c>. Counterpart of
+    /// <see cref="CameraHemisphere(float, float)"/> for the perspective branch
+    /// of BSP traversal: when the camera point is within the widened slab around
+    /// a partitioning plane, returns 0 so traversal can pick a deterministic
+    /// order that is stable across the animation's sub-frame yaw uncertainty.
+    /// </summary>
+    /// <remarks>Scale: <b>signed distance</b> in object space.</remarks>
+    public static int SignedDistanceSide(float signedDistance, float sortMarginDistance)
+    {
+        var t = DistanceEpsilon + sortMarginDistance;
+        if (signedDistance >  t) return +1;
+        if (signedDistance < -t) return -1;
         return 0;
     }
 
