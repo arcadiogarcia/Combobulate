@@ -177,15 +177,15 @@ public sealed partial class MainWindow : Window
         props.InsertScalar("SpinActive", 1f);
         props.StopAnimation("SpinYaw");
         props.StartAnimation("SpinYaw", kfa);
-        // Widened from 6° to 18°. At 360°/6s the per-frame yaw delta is ~1°,
-        // so 18° = ~18 frames = ~300ms of clock-offset headroom — enough to
-        // cover any compositor-side queueing/latency between the time the
-        // KFA is evaluated and the time RenderingTime is stamped, even under
-        // moderate load. The BSP sort margin (also widened by
-        // CullMarginDegrees) keeps draw order deterministic across the full
-        // uncertainty window so CPU and GPU never disagree on ORDER, even
-        // when their numeric yaws disagree by a few degrees.
-        if (combobulate != null) combobulate.CullMarginDegrees = 18.0;
+        // Narrow window (3°): the widened margin (18°) eliminated CPU chatter
+        // but at the cost of forcing the deterministic-fallback traversal
+        // across a ±18° window, during which the GPU may be firmly in one
+        // hemisphere where the OTHER order is correct — visible as a stable-
+        // but-wrong sort order for several frames at each plane crossing.
+        // With 3° the fallback covers only the measured CPU/GPU clock
+        // uncertainty (~1-2° at 60°/s); the CPU picks the correct hemisphere
+        // for the GPU-rendered yaw on nearly every frame.
+        if (combobulate != null) combobulate.CullMarginDegrees = 3.0;
         _spinStart = DateTime.UtcNow;
         _spinClock.Restart();
         _spinRingHead = 0;
