@@ -138,6 +138,34 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             description: "Tears down the Z-sort spike overlay created by RunZSortTest, restoring the normal app UI.",
             parameterSchema: @"{""type"":""object"",""properties"":{}}"),
         new ActionDescriptor(
+            name: "RunAtomicSwapTest",
+            description: "Spike: validates whether two ExpressionAnimation-driven Opacity flips, both referencing the SAME CompositionPropertySet scalar, are guaranteed to land in the SAME composited frame. Sets up two fully-overlapping ContainerVisuals (treeA holds a red 400x400 sprite, treeB holds a blue 400x400 sprite, perfectly overlapping in the centre of the window). Both are attached as siblings under a single overlay container. A shared CompositionPropertySet exposes scalar 'K' in [0,1]. Each tree's Opacity is bound by ExpressionAnimation: treeA.Opacity = props.K < 0.5 ? 1 : 0, treeB.Opacity = props.K < 0.5 ? 0 : 1. Static mode (mode='static'): K is set to the supplied value, no animation - use to verify the static threshold behaviour. Animated mode (mode='animate'): a linear KFA drives K from 0 to 1 over durationSec seconds (default 8s) so the caller can capture screenshots at random moments and look for any frame where BOTH sprites are visible (purple/magenta blend) or NEITHER is visible (background showing through), either of which would prove that the two Opacity flips are NOT atomic and the dual-tree-swap architecture is unsafe. Stop with ClearAtomicSwapTest. Convention: red sprite is on screen-left half, blue is on screen-right half but they OVERLAP in the centre by 200px so atomicity violations show as a coloured stripe.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""required"": [""mode""],
+  ""properties"": {
+    ""mode"":        { ""type"": ""string"", ""enum"": [""static"", ""animate""] },
+    ""k"":           { ""type"": ""number"", ""minimum"": 0, ""maximum"": 1, ""description"": ""Static-mode K value."" },
+    ""durationSec"": { ""type"": ""number"", ""minimum"": 0.5, ""maximum"": 60, ""description"": ""Animated-mode 0->1 ramp duration."" }
+  }
+}"),
+        new ActionDescriptor(
+            name: "ClearAtomicSwapTest",
+            description: "Tears down the atomic-swap spike overlay created by RunAtomicSwapTest.",
+            parameterSchema: @"{""type"":""object"",""properties"":{}}"),
+        new ActionDescriptor(
+            name: "RunBspBoundaryEquivalenceTest",
+            description: "CPU-only diagnostic for content-equivalence claim of the dual-tree-swap proposal. Loads the supplied OBJ, builds the BSP, picks a partitioning plane, computes the visible+ordered face list at the boundary yaw with cameraSide=+1 (forced) and cameraSide=-1 (forced) for that plane only. Returns both orders as Consequences; if the visible-and-ordered face lists are identical the swap is content-safe at that boundary; if they differ, the swap will produce a one-frame visual pop at boundary crossings - same problem we have today, just relocated.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""required"": [""path"", ""yawDeg""],
+  ""properties"": {
+    ""path"":     { ""type"": ""string"", ""description"": ""Absolute path to the .obj file."" },
+    ""yawDeg"":   { ""type"": ""number"", ""description"": ""Yaw angle (degrees) to evaluate the BSP at."" },
+    ""planeIdx"": { ""type"": ""integer"", ""minimum"": 0, ""description"": ""Which BSP partitioning plane to flip cameraSide on (0 = root). Default 0."" }
+  }
+}"),
+        new ActionDescriptor(
             name: "SetSpinSeconds",
             description: "Sets SpinSecondsPerTurn live (drives the UI slider's Value, which triggers the same OnSpinSpeedChanged path: resets the sampler epoch and restarts the GPU KFA if currently spinning). Range 0.5..30. Use to test whether flicker is angular-speed-dependent: if drift scales with 1/seconds the cause is a constant TIME offset (clock-skew hypothesis); if drift is roughly speed-independent in degrees the cause is geometric/numeric in the sort path.",
             parameterSchema: @"{
@@ -192,6 +220,9 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             case "SetSpinSeconds": return DispatchSetSpinSecondsAsync(parametersJson);
             case "RunZSortTest": return DispatchRunZSortTestAsync(parametersJson);
             case "ClearZSortTest": return RunOnUi(ClearZSortTest);
+            case "RunAtomicSwapTest": return DispatchRunAtomicSwapTestAsync(parametersJson);
+            case "ClearAtomicSwapTest": return RunOnUi(ClearAtomicSwapTest);
+            case "RunBspBoundaryEquivalenceTest": return DispatchRunBspBoundaryEquivalenceTestAsync(parametersJson);
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -560,6 +591,210 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             // Restore the original child visual (which is what SetElementChildVisual
             // had replaced - usually null, the framework manages the host).
             Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.SetElementChildVisual(this.Content, null);
+        }
+    }
+
+    // ---------- Atomic-swap validation spike ----------
+    // Goal: prove or disprove that two ExpressionAnimation-driven Opacity flips
+    // referencing the SAME CompositionPropertySet scalar land in the SAME
+    // composited frame. If they don't, the dual-tree-swap architecture is unsafe
+    // (could show a frame of "both opaque" = colour blend or "both transparent"
+    // = background gap).
+
+    private Microsoft.UI.Composition.ContainerVisual? _atomTestRoot;
+    private Microsoft.UI.Composition.ContainerVisual? _atomTreeA;
+    private Microsoft.UI.Composition.ContainerVisual? _atomTreeB;
+    private Microsoft.UI.Composition.CompositionPropertySet? _atomProps;
+
+    private Task<ActionResult> DispatchRunAtomicSwapTestAsync(string parametersJson)
+    {
+        JObject p;
+        try { p = JObject.Parse(parametersJson); }
+        catch { return Task.FromResult(ActionResult.Fail("validation_error", "params is not valid JSON.")); }
+        var modeToken = p["mode"];
+        if (modeToken == null) return Task.FromResult(ActionResult.Fail("validation_error", "params.mode is required."));
+        var mode = modeToken.Value<string>();
+        var k = p["k"]?.Value<float>() ?? 0f;
+        var dur = p["durationSec"]?.Value<float>() ?? 8f;
+        return RunOnUi(() => SetupOrUpdateAtomicSwapTest(mode!, k, dur));
+    }
+
+    private void SetupOrUpdateAtomicSwapTest(string mode, float k, float durationSec)
+    {
+        var hostVisual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(this.Content);
+        var compositor = hostVisual.Compositor;
+
+        var rootFE = this.Content as Microsoft.UI.Xaml.FrameworkElement;
+        float width  = rootFE != null && rootFE.ActualWidth  > 0 ? (float)rootFE.ActualWidth  : 1200f;
+        float height = rootFE != null && rootFE.ActualHeight > 0 ? (float)rootFE.ActualHeight : 800f;
+
+        if (_atomTestRoot == null)
+        {
+            _atomTestRoot = compositor.CreateContainerVisual();
+            _atomTestRoot.Size = new System.Numerics.Vector2(width, height);
+
+            // Shared CompositionPropertySet exposing scalar K. Both trees'
+            // Opacity is bound to the SAME property here, so if there's any
+            // intra-frame coherence, both expressions see the same K sample.
+            _atomProps = compositor.CreatePropertySet();
+            _atomProps.InsertScalar("K", 0f);
+
+            // treeA: red 400x400 sprite, screen-left half but centred so the
+            // RIGHT 200px of red overlaps the LEFT 200px of blue.
+            _atomTreeA = compositor.CreateContainerVisual();
+            _atomTreeA.Size = new System.Numerics.Vector2(width, height);
+            var redSprite = compositor.CreateSpriteVisual();
+            redSprite.Size = new System.Numerics.Vector2(400, 400);
+            redSprite.Offset = new System.Numerics.Vector3(width / 2 - 400, height / 2 - 200, 0);
+            redSprite.Brush = compositor.CreateColorBrush(Windows.UI.Color.FromArgb(255, 230, 30, 30));
+            _atomTreeA.Children.InsertAtTop(redSprite);
+            _atomTestRoot.Children.InsertAtTop(_atomTreeA);
+
+            // treeB: blue 400x400 sprite, screen-right half overlapping by 200.
+            _atomTreeB = compositor.CreateContainerVisual();
+            _atomTreeB.Size = new System.Numerics.Vector2(width, height);
+            var blueSprite = compositor.CreateSpriteVisual();
+            blueSprite.Size = new System.Numerics.Vector2(400, 400);
+            blueSprite.Offset = new System.Numerics.Vector3(width / 2, height / 2 - 200, 0);
+            blueSprite.Brush = compositor.CreateColorBrush(Windows.UI.Color.FromArgb(255, 30, 60, 230));
+            _atomTreeB.Children.InsertAtTop(blueSprite);
+            _atomTestRoot.Children.InsertAtTop(_atomTreeB);
+
+            // Bind both Opacity values to the SAME shared property via expressions.
+            // If the compositor evaluates these atomically per-frame, both flip in
+            // the same composited frame at K crossing 0.5: red goes 1->0, blue goes
+            // 0->1. If atomicity is broken, there's a visible coloured stripe in
+            // the 200px overlap zone for at least one frame.
+            var exprA = compositor.CreateExpressionAnimation("props.K < 0.5 ? 1.0 : 0.0");
+            exprA.SetReferenceParameter("props", _atomProps);
+            _atomTreeA.StartAnimation("Opacity", exprA);
+
+            var exprB = compositor.CreateExpressionAnimation("props.K < 0.5 ? 0.0 : 1.0");
+            exprB.SetReferenceParameter("props", _atomProps);
+            _atomTreeB.StartAnimation("Opacity", exprB);
+
+            Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.SetElementChildVisual(this.Content, _atomTestRoot);
+        }
+
+        // Drive K either statically (for deterministic threshold tests) or by a
+        // linear KFA (for stress-testing during continuous sweep).
+        if (_atomProps != null)
+        {
+            // Stop any prior K animation by inserting a fresh static value.
+            _atomProps.StopAnimation("K");
+            if (mode == "static")
+            {
+                _atomProps.InsertScalar("K", k);
+            }
+            else if (mode == "animate")
+            {
+                var kfa = compositor.CreateScalarKeyFrameAnimation();
+                kfa.InsertKeyFrame(0f, 0f, compositor.CreateLinearEasingFunction());
+                kfa.InsertKeyFrame(1f, 1f, compositor.CreateLinearEasingFunction());
+                kfa.Duration = TimeSpan.FromSeconds(durationSec);
+                kfa.IterationBehavior = Microsoft.UI.Composition.AnimationIterationBehavior.Forever;
+                _atomProps.StartAnimation("K", kfa);
+            }
+        }
+    }
+
+    private void ClearAtomicSwapTest()
+    {
+        if (_atomTestRoot != null)
+        {
+            _atomTreeA?.StopAnimation("Opacity");
+            _atomTreeB?.StopAnimation("Opacity");
+            _atomProps?.StopAnimation("K");
+            _atomTestRoot.Children.RemoveAll();
+            _atomTestRoot.Dispose();
+            _atomTestRoot = null;
+            _atomTreeA = null;
+            _atomTreeB = null;
+            _atomProps = null;
+            Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.SetElementChildVisual(this.Content, null);
+        }
+    }
+
+    // ---------- BSP boundary content-equivalence diagnostic ----------
+    // Goal: at a yaw close to a BSP plane crossing, do the two adjacent yaws
+    // (yaw - eps and yaw + eps) produce the SAME visible+ordered face list?
+    // If yes, the dual-tree-swap is content-safe at that boundary. If no,
+    // swapping trees at the boundary will produce a one-frame pop.
+
+    private Task<ActionResult> DispatchRunBspBoundaryEquivalenceTestAsync(string parametersJson)
+    {
+        JObject p;
+        try { p = JObject.Parse(parametersJson); }
+        catch { return Task.FromResult(ActionResult.Fail("validation_error", "params is not valid JSON.")); }
+        var path = p["path"]?.Value<string>();
+        var yawDeg = p["yawDeg"]?.Value<double>();
+        if (string.IsNullOrEmpty(path) || yawDeg == null)
+            return Task.FromResult(ActionResult.Fail("validation_error", "params.path and params.yawDeg are required."));
+        if (!System.IO.File.Exists(path))
+            return Task.FromResult(ActionResult.Fail("validation_error", $"File not found: {path}"));
+
+        try
+        {
+            var text = System.IO.File.ReadAllText(path);
+            var parsed = global::Combobulate.Parsing.ObjParser.Parse(text);
+            if (!parsed.Success)
+                return Task.FromResult(ActionResult.Fail("parse_error", $"OBJ parse failed: {parsed.Errors.Count} errors."));
+
+            var geom = global::Combobulate.Caching.ObjGeometry.Build(parsed.Model);
+            var sorter = global::Combobulate.Sorting.FaceSorterFactory.Create(global::Combobulate.Sorting.SortAlgorithm.Bsp, geom);
+
+            // Sample at yaw-eps and yaw+eps. eps deliberately small (0.01 deg)
+            // - smaller than a typical compositor frame's worth of yaw drift.
+            const double eps = 0.01;
+            var yaw1 = (float)((yawDeg.Value - eps) * Math.PI / 180.0);
+            var yaw2 = (float)((yawDeg.Value + eps) * Math.PI / 180.0);
+            var rot1 = System.Numerics.Matrix4x4.CreateRotationY(yaw1);
+            var rot2 = System.Numerics.Matrix4x4.CreateRotationY(yaw2);
+
+            // Use the same CullMargin we ship with at v1.0.24 (3 deg) so this
+            // test reflects production behaviour, not a hypothetical.
+            var marginCos = (float)Math.Sin(3.0 * Math.PI / 180.0);
+
+            var order1 = new int[geom.Quads.Length];
+            var vis1 = new bool[geom.Quads.Length];
+            var n1 = sorter.Sort(rot1, order1, vis1, 0f, marginCos);
+
+            var order2 = new int[geom.Quads.Length];
+            var vis2 = new bool[geom.Quads.Length];
+            var n2 = sorter.Sort(rot2, order2, vis2, 0f, marginCos);
+
+            var visList1 = new List<int>(n1);
+            for (int i = 0; i < n1; i++) visList1.Add(order1[i]);
+            var visList2 = new List<int>(n2);
+            for (int i = 0; i < n2; i++) visList2.Add(order2[i]);
+
+            bool identical = visList1.Count == visList2.Count;
+            int firstDiffIndex = -1;
+            if (identical)
+            {
+                for (int i = 0; i < visList1.Count; i++)
+                {
+                    if (visList1[i] != visList2[i]) { identical = false; firstDiffIndex = i; break; }
+                }
+            }
+
+            var lines = new List<string>
+            {
+                $"path={path}",
+                $"yaw_center={yawDeg.Value:0.000}deg eps={eps}deg margin=3deg",
+                $"quadCount={geom.Quads.Length}",
+                $"visibleCount_at_yaw-eps={n1}",
+                $"visibleCount_at_yaw+eps={n2}",
+                $"orders_identical={identical}",
+                $"first_diff_index={firstDiffIndex}",
+                $"order_at_yaw-eps=[{string.Join(",", visList1)}]",
+                $"order_at_yaw+eps=[{string.Join(",", visList2)}]",
+            };
+            return Task.FromResult(ActionResult.Ok(lines));
+        }
+        catch (Exception ex)
+        {
+            return Task.FromResult(ActionResult.Fail("execution_error", ex.Message));
         }
     }
 }
