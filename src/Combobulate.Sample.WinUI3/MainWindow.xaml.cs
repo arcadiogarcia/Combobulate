@@ -128,29 +128,38 @@ public sealed partial class MainWindow : Window
     private float _spinStartCompositorMs;
 
     /// <summary>
-    /// Start the looping Composition KFA that drives <c>SpinYaw</c> on the GPU,
-    /// and capture the wall-clock epoch the CPU sampler uses to compute the same
-    /// yaw for cull/sort. Both clocks share the same formula
-    /// (<c>secs / SpinSecondsPerTurn * 360</c>) so they stay in sub-ms agreement.
+    /// Begin the spin. <c>SpinYaw</c> is no longer driven by a Composition
+    /// KFA — instead the per-frame sampler computes the yaw on the UI thread
+    /// from the compositor's <c>RenderingTime</c> and writes it directly into
+    /// the <c>SpinYaw</c> scalar via <c>InsertScalar</c>. This makes the value
+    /// the GPU expression reads identical-by-construction to the value the
+    /// CPU cull/sort uses (both come from the exact same write each frame),
+    /// eliminating every possible source of clock divergence:
+    ///
+    ///   - wall-clock vs compositor-clock drift (was: ~22ms over 60s)
+    ///   - KFA epoch uncertainty (we can't read the compositor's commit time
+    ///     for an animated property, so a KFA-vs-CPU mirror would always be
+    ///     phase-shifted by an indeterminate fraction of a frame, producing
+    ///     a constant cull-vs-draw offset visible from frame 1)
+    ///
+    /// Trade-off: if the UI thread stalls, the spin pauses for that frame
+    /// instead of continuing GPU-side. That is acceptable here because the
+    /// sampler is what would have produced the cull rebuild on that same
+    /// stalled frame anyway — there is nothing for a "smooth GPU spin" to
+    /// be in sync with during a stall.
     /// </summary>
     private void StartGpuSpin()
     {
         var (props, _) = GetOrCreateExternalRotation();
-        var compositor = ElementCompositionPreview.GetElementVisual(this.Content).Compositor;
-        var kfa = compositor.CreateScalarKeyFrameAnimation();
-        kfa.InsertKeyFrame(0f, 0f, compositor.CreateLinearEasingFunction());
-        kfa.InsertKeyFrame(1f, 360f, compositor.CreateLinearEasingFunction());
-        kfa.Duration = TimeSpan.FromSeconds(SpinSecondsPerTurn);
-        kfa.IterationBehavior = AnimationIterationBehavior.Forever;
-        props.InsertScalar("SpinActive", 1f);
+        // Make sure no leftover KFA is still bound to SpinYaw — if there is
+        // one, our InsertScalar writes will be ignored while it is active.
         props.StopAnimation("SpinYaw");
-        props.StartAnimation("SpinYaw", kfa);
-        // Set CPU epoch as close as possible to the StartAnimation call so the two
-        // clocks line up. Any sub-frame skew is constant and visually invisible.
+        props.InsertScalar("SpinActive", 1f);
+        props.InsertScalar("SpinYaw", 0f);
+        // _spinStart serves as a "spin is on" sentinel; the actual epoch
+        // used for yaw computation is _spinStartCompositorMs which is
+        // captured on the first sampler tick.
         _spinStart = DateTime.UtcNow;
-        // Reset instrumentation. Stopwatch is a stable monotonic clock (QPC) and
-        // is the same source the compositor uses internally, so we use it for
-        // delta-ms measurements (DateTime.UtcNow can jump on NTP correction).
         _spinClock.Restart();
         _spinRingHead = 0;
         _spinTickCount = 0;
@@ -166,6 +175,8 @@ public sealed partial class MainWindow : Window
     {
         _spinStart = null;
         if (_externalRotationProps == null) return;
+        // No KFA to stop, but be defensive in case a previous build (which
+        // did use a KFA) left one running across an in-place package update.
         _externalRotationProps.StopAnimation("SpinYaw");
         _externalRotationProps.InsertScalar("SpinYaw", 0f);
         _externalRotationProps.InsertScalar("SpinActive", 0f);
@@ -315,14 +326,26 @@ public sealed partial class MainWindow : Window
                 float compMs = (float)renderingTime.TotalMilliseconds;
                 if (_spinStart != null)
                 {
-                    // Clock the spin off the compositor's own RenderingTime.
-                    // SpinYaw KFA started at SpinStartCompositorMs, so:
-                    //   secs = (RenderingTime - SpinStartCompositorMs) / 1000
+                    // Latch the compositor-time epoch the FIRST time the
+                    // sampler runs after StartGpuSpin. We must do this BEFORE
+                    // computing yaw, otherwise the first tick computes yaw
+                    // off a 0 epoch (which is the app's start-of-time, hours
+                    // ago) and would push a wildly wrong initial yaw.
+                    if (_spinStartCompositorMs == 0f && compMs > 0f)
+                    {
+                        _spinStartCompositorMs = compMs;
+                    }
                     var secs = (compMs - _spinStartCompositorMs) / 1000f;
-                    if (secs < 0) secs = 0; // first tick before epoch captured
+                    if (secs < 0) secs = 0;
                     spinYawRaw = (secs / SpinSecondsPerTurn) * 360f;
                     spinYawWrapped = spinYawRaw - MathF.Floor(spinYawRaw / 360f) * 360f;
                     yaw += spinYawWrapped;
+                    // Push the same value to the GPU so the sprite renderer's
+                    // ExpressionAnimation reads exactly the value we just used
+                    // for cull/sort. With InsertScalar this becomes the value
+                    // the compositor sees on the next commit (this same frame).
+                    // No KFA, no clock divergence, no phase offset.
+                    _externalRotationProps?.InsertScalar("SpinYaw", spinYawWrapped);
                 }
                 var live = new Vector3(pitch, yaw, roll);
                 // CombobulateSceneVisual doesn't have its own auto-refresh hook yet,
@@ -337,6 +360,9 @@ public sealed partial class MainWindow : Window
                     var wallMs   = (float)((nowTicks * 1000.0) / System.Diagnostics.Stopwatch.Frequency);
                     var driftMs  = compMs > 0f ? (wallMs - (compMs - _spinStartCompositorMs)) : 0f;
                     combobulate.CopyVisibleMaskByte(8, out byte mask, out byte cnt, out _);
+                    // GPU-cached SpinYaw should now exactly match spinYawWrapped
+                    // since we wrote it via InsertScalar above (no animation =
+                    // TryGetScalar returns the actual current value).
                     float gpuYaw = 0f;
                     _externalRotationProps?.TryGetScalar("SpinYaw", out gpuYaw);
                     _spinRing[_spinRingHead] = new SpinTick
@@ -358,16 +384,6 @@ public sealed partial class MainWindow : Window
                     _spinRingHead = (_spinRingHead + 1) % _spinRing.Length;
                     _prevTickElapsedTicks = nowTicks;
                     _spinTickCount++;
-                    // Lazily capture the compositor-time origin on the very
-                    // first tick after StartGpuSpin(). The KFA was started
-                    // on the previous UI-thread call but the compositor only
-                    // begins evaluating it at the next frame; whatever
-                    // RenderingTime we observe on the first tick is the
-                    // closest we can get to "KFA epoch in compositor units."
-                    if (_spinStartCompositorMs == 0f && compMs > 0f)
-                    {
-                        _spinStartCompositorMs = compMs;
-                    }
                 }
                 return live;
             });
