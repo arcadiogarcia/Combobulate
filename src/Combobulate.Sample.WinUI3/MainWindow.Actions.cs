@@ -105,6 +105,23 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
     ""lastN"": { ""type"": ""integer"", ""minimum"": 0, ""maximum"": 1024, ""description"": ""Number of most-recent ring-buffer rows to dump (default 0 = stats only)."" }
   }
 }"),
+        new ActionDescriptor(
+            name: "EnableSortDiagnostics",
+            description: "Turns on the renderer's sort/reorder ring buffer (Combobulate.Diagnostics.SpinDiagnostics). Each call to Combobulate.Rebuild thereafter records frameId, threadId, recovered yaw/pitch, visible-mask, order[], orderChanged, mutationsApplied, and per-phase microsecond timings. Use this BEFORE starting a spin to capture the first ~5 seconds of frames for sync-glitch diagnosis.",
+            parameterSchema: @"{""type"":""object"",""properties"":{}}"),
+        new ActionDescriptor(
+            name: "DisableSortDiagnostics",
+            description: "Turns off the sort/reorder ring buffer. Existing entries remain queryable via DumpSortDiagnostics until the next Enable call resets the cursor.",
+            parameterSchema: @"{""type"":""object"",""properties"":{}}"),
+        new ActionDescriptor(
+            name: "DumpSortDiagnostics",
+            description: "Returns the contents of the renderer's sort/reorder ring buffer. Two modes: 'summary' (default — counts, threads, mutation-per-frame stats, slowest reorder frame) or 'full' (every record as JSON). Use 'full' for offline analysis of sync glitches; 'summary' for at-a-glance triage.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""properties"": {
+    ""mode"": { ""type"": ""string"", ""enum"": [""summary"", ""full""], ""description"": ""Default 'summary'. 'full' returns the entire ring serialised as JSON (~256KB)."" }
+  }
+}"),
     };
 
     public IReadOnlyList<ActionDescriptor> GetAvailableActions() => _actions;
@@ -129,6 +146,13 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             case "SetMaterial": return DispatchSetMaterialAsync(parametersJson);
             case "SetSpin": return DispatchSetSpinAsync(parametersJson);
             case "DumpSpinDiagnostics": return DispatchDumpSpinDiagnosticsAsync(parametersJson);
+            case "EnableSortDiagnostics":
+                global::Combobulate.Diagnostics.SpinDiagnostics.Enable();
+                return Task.FromResult(ActionResult.Ok(new[] { "sortDiagnostics=enabled" }));
+            case "DisableSortDiagnostics":
+                global::Combobulate.Diagnostics.SpinDiagnostics.Disable();
+                return Task.FromResult(ActionResult.Ok(new[] { "sortDiagnostics=disabled" }));
+            case "DumpSortDiagnostics": return DispatchDumpSortDiagnosticsAsync(parametersJson);
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -239,6 +263,35 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             tcs.SetResult(ActionResult.Fail("execution_error", "Failed to enqueue UI work."));
         }
         return tcs.Task;
+    }
+
+    private Task<ActionResult> DispatchDumpSortDiagnosticsAsync(string parametersJson)
+    {
+        // No UI-thread marshalling required: SpinDiagnostics is lock-free and
+        // safe to read from any thread. Snapshot may briefly race with new
+        // writes from the rendering tick, which is fine — the report is for
+        // human triage, not transactional inspection.
+        string mode = "summary";
+        try
+        {
+            var p = JObject.Parse(parametersJson);
+            if (p["mode"] != null) mode = (p["mode"]!.Value<string>() ?? "summary").ToLowerInvariant();
+        }
+        catch { /* tolerate missing/empty params */ }
+
+        try
+        {
+            var payload = mode == "full"
+                ? global::Combobulate.Diagnostics.SpinDiagnostics.Snapshot()
+                : global::Combobulate.Diagnostics.SpinDiagnostics.SummaryReport();
+            // Wrap in a single Consequences line — the rover transport already
+            // splits long strings into multiple message parts at the client.
+            return Task.FromResult(ActionResult.Ok(new[] { payload }));
+        }
+        catch (Exception ex)
+        {
+            return Task.FromResult(ActionResult.Fail("execution_error", ex.Message));
+        }
     }
 
     private Task<ActionResult> DispatchSetTogglesAsync(string parametersJson)

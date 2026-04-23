@@ -1078,12 +1078,27 @@ public sealed class Combobulate : Control
         {
             cullMarginCos = MathF.Sin((float)(marginDeg * Math.PI / 180.0));
         }
+
+        // ---- diagnostics: time the sort and reorder phases separately ----
+        long t0 = global::Combobulate.Diagnostics.SpinDiagnostics.IsEnabled
+            ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+
         int orderCount = _sorter.Sort(rotation, _orderScratch, _visScratchBool, ComputeSortCameraDistance(scale), cullMarginCos);
 
+        long t1 = global::Combobulate.Diagnostics.SpinDiagnostics.IsEnabled
+            ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+
         // Diff IsVisible flips against last frame.
+        long visMask = 0L;
+        long prevVisMask = 0L;
         for (int i = 0; i < cachedQuads.Length; i++)
         {
             bool visible = _visScratchBool[i];
+            if (i < 64)
+            {
+                if (visible) visMask |= 1L << i;
+                if (lastVisible[i]) prevVisMask |= 1L << i;
+            }
             if (lastVisible[i] != visible)
             {
                 pool[i]!.IsVisible = visible;
@@ -1096,19 +1111,48 @@ public sealed class Combobulate : Control
         // child still has a parent (even if it's the same parent), so we must Remove
         // first. Walking visible quads back-to-front and re-attaching each one leaves
         // the last-painted (frontmost) on top.
-        if (!OrderEquals(_orderScratch, orderCount, _lastOrder, _lastOrderCount))
+        bool orderChanged = !OrderEquals(_orderScratch, orderCount, _lastOrder, _lastOrderCount);
+        int mutationsApplied = 0;
+        if (orderChanged)
         {
             for (int i = 0; i < orderCount; i++)
             {
                 var sprite = pool[_orderScratch[i]]!;
                 _root.Children.Remove(sprite);
                 _root.Children.InsertAtTop(sprite);
+                mutationsApplied++;
             }
             if (_lastOrder.Length < orderCount) _lastOrder = new int[cachedQuads.Length];
             Array.Copy(_orderScratch, _lastOrder, orderCount);
             _lastOrderCount = orderCount;
         }
+
+        // ---- diagnostics: emit one record per Rebuild call ----
+        if (global::Combobulate.Diagnostics.SpinDiagnostics.IsEnabled)
+        {
+            long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+            long ticksPerUs = System.Diagnostics.Stopwatch.Frequency / 1_000_000L;
+            if (ticksPerUs <= 0) ticksPerUs = 1;
+            var (yawDeg, pitchDeg) = global::Combobulate.Diagnostics.SpinDiagnostics.ExtractYawPitch(rotation);
+            global::Combobulate.Diagnostics.SpinDiagnostics.Record(new global::Combobulate.Diagnostics.SpinDiagnostics.FrameRecord(
+                frameId: _diagFrameCounter++,
+                timestampMicros: global::Combobulate.Diagnostics.SpinDiagnostics.ElapsedMicros(),
+                threadId: System.Environment.CurrentManagedThreadId,
+                yawDeg: yawDeg,
+                pitchDeg: pitchDeg,
+                orderCount: orderCount,
+                visibleMask: visMask,
+                previousVisibleMask: prevVisMask,
+                orderChanged: orderChanged,
+                mutationsApplied: mutationsApplied,
+                sortMicros: (t1 - t0) / ticksPerUs,
+                reorderMicros: (t2 - t1) / ticksPerUs,
+                order: global::Combobulate.Diagnostics.SpinDiagnostics.OrderSnapshot.From(_orderScratch, orderCount)));
+        }
     }
+
+    /// <summary>Per-control monotonic frame counter used by <see cref="Combobulate.Diagnostics.SpinDiagnostics"/>.</summary>
+    private long _diagFrameCounter;
 
     private static readonly object NoPackSentinel = new();
 
