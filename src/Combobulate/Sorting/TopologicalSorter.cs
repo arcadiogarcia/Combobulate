@@ -26,7 +26,7 @@ public sealed class TopologicalSorter : IFaceSorter
 
     public int QuadCount => _geometry.Quads.Length;
 
-    public int Sort(Matrix4x4 rotation, int[] orderBuffer, bool[] visibleBuffer, float cameraDistance = 0f)
+    public int Sort(Matrix4x4 rotation, int[] orderBuffer, bool[] visibleBuffer, float cameraDistance = 0f, float cullMarginCos = 0f)
     {
         var quads = _geometry.Quads;
         int n = quads.Length;
@@ -35,6 +35,8 @@ public sealed class TopologicalSorter : IFaceSorter
         // Cull: a quad is visible iff its rotated normal points toward the camera. Under
         // perspective (cameraDistance > 0) the test uses the per-face view ray from the
         // camera to the face centroid; under orthographic it reduces to viewNormal.Z > eps.
+        // cullMarginCos > 0 widens the front-facing cone by asin(cullMarginCos) to absorb
+        // small CPU-vs-GPU rotation mismatches during animations.
         Span<int> visIdx = n <= 64 ? stackalloc int[n] : new int[n];
         int visCount = 0;
         bool persp = cameraDistance > 0f;
@@ -48,11 +50,11 @@ public sealed class TopologicalSorter : IFaceSorter
             if (persp)
             {
                 var rc = Vector3.Transform(quads[i].Centroid, rotation);
-                vis = GeometryPredicates.IsFrontFacingPerspective(rn, rc, cameraDistance);
+                vis = GeometryPredicates.IsFrontFacingPerspective(rn, rc, cameraDistance, cullMarginCos);
             }
             else
             {
-                vis = GeometryPredicates.IsFrontFacing(rn.Z);
+                vis = GeometryPredicates.IsFrontFacing(rn.Z, cullMarginCos);
             }
             visibleBuffer[i] = vis;
             if (vis) visIdx[visCount++] = i;

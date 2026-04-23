@@ -63,7 +63,7 @@ public sealed class NewellSorter : IFaceSorter
     /// </summary>
     public IReadOnlyList<RenderTriangle> BaseTriangles => _baseTriangles;
 
-    public int Sort(Matrix4x4 rotation, int[] orderBuffer, bool[] visibleBuffer, float cameraDistance = 0f)
+    public int Sort(Matrix4x4 rotation, int[] orderBuffer, bool[] visibleBuffer, float cameraDistance = 0f, float cullMarginCos = 0f)
     {
         var quads = _geometry.Quads;
         int qc = quads.Length;
@@ -71,7 +71,8 @@ public sealed class NewellSorter : IFaceSorter
 
         // Per-quad cull (whole-quad granularity for output, but the per-triangle
         // sort respects every triangle's individual cull below). See BspSorter.Sort
-        // for the rationale on the perspective vs. orthographic branches.
+        // for the rationale on the perspective vs. orthographic branches. cullMarginCos > 0
+        // widens the front-facing cone to absorb small CPU-vs-GPU rotation mismatches.
         bool persp = cameraDistance > 0f;
         for (int i = 0; i < qc; i++)
         {
@@ -79,11 +80,11 @@ public sealed class NewellSorter : IFaceSorter
             if (persp)
             {
                 var rc = Vector3.Transform(quads[i].Centroid, rotation);
-                visibleBuffer[i] = GeometryPredicates.IsFrontFacingPerspective(rn, rc, cameraDistance);
+                visibleBuffer[i] = GeometryPredicates.IsFrontFacingPerspective(rn, rc, cameraDistance, cullMarginCos);
             }
             else
             {
-                visibleBuffer[i] = GeometryPredicates.IsFrontFacing(rn.Z);
+                visibleBuffer[i] = GeometryPredicates.IsFrontFacing(rn.Z, cullMarginCos);
             }
         }
 

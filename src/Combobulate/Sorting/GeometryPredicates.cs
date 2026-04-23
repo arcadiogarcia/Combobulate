@@ -54,6 +54,18 @@ public static class GeometryPredicates
     public static bool IsFrontFacing(float viewNormalZ) => viewNormalZ > CosineEpsilon;
 
     /// <summary>
+    /// Cull-margin overload of <see cref="IsFrontFacing(float)"/>. The face is
+    /// kept visible if its rotated normal Z exceeds <c>-cullMarginCos + CosineEpsilon</c>,
+    /// i.e. the front-facing cone is widened by <c>asin(cullMarginCos)</c> radians.
+    /// Use during animations where the CPU-computed rotation may lag the GPU draw
+    /// by a known maximum angle: setting <paramref name="cullMarginCos"/> to <c>sin(maxLagRadians)</c>
+    /// guarantees no face right at the back-cull boundary can flip visibility from a sync error.
+    /// Setting <paramref name="cullMarginCos"/> = 0 reproduces the exact behaviour of <see cref="IsFrontFacing(float)"/>.
+    /// </summary>
+    public static bool IsFrontFacing(float viewNormalZ, float cullMarginCos)
+        => viewNormalZ + cullMarginCos > CosineEpsilon;
+
+    /// <summary>
     /// Perspective-aware front-face test. Use when the renderer applies a
     /// perspective divide so view rays diverge from a finite camera point
     /// at <c>(0, 0, cameraZ)</c> in view space. A face is visible iff its
@@ -82,6 +94,28 @@ public static class GeometryPredicates
         var dot = Vector3.Dot(viewNormal, ray);
         if (dot <= 0f) return false;
         return dot * dot > (CosineEpsilon * CosineEpsilon) * lenSq;
+    }
+
+    /// <summary>
+    /// Cull-margin overload of <see cref="IsFrontFacingPerspective(Vector3, Vector3, float)"/>.
+    /// Widens the front-facing cone by <c>asin(cullMarginCos)</c> radians, i.e. the face
+    /// remains visible when <c>dot(viewNormal, ray)/|ray| &gt; -cullMarginCos + CosineEpsilon</c>.
+    /// Setting <paramref name="cullMarginCos"/> = 0 reproduces the exact behaviour of
+    /// <see cref="IsFrontFacingPerspective(Vector3, Vector3, float)"/>.
+    /// </summary>
+    public static bool IsFrontFacingPerspective(Vector3 viewNormal, Vector3 viewCentroid, float cameraZ, float cullMarginCos)
+    {
+        if (cullMarginCos <= 0f) return IsFrontFacingPerspective(viewNormal, viewCentroid, cameraZ);
+        if (cameraZ <= 0f) return IsFrontFacing(viewNormal.Z, cullMarginCos);
+        var ray = new Vector3(-viewCentroid.X, -viewCentroid.Y, cameraZ - viewCentroid.Z);
+        var lenSq = ray.LengthSquared();
+        if (lenSq < DivisorEpsilon) return IsFrontFacing(viewNormal.Z, cullMarginCos);
+        // Want: dot/|ray| > -cullMarginCos + CosineEpsilon
+        //   <=> dot + (cullMarginCos - CosineEpsilon)*|ray| > 0
+        // Using sqrt because the pre-margin path's signed-square trick relied on dot >= 0.
+        var dot = Vector3.Dot(viewNormal, ray);
+        var len = MathF.Sqrt(lenSq);
+        return dot + (cullMarginCos - CosineEpsilon) * len > 0f;
     }
 
     /// <summary>

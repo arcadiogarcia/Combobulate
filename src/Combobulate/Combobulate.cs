@@ -256,6 +256,34 @@ public sealed class Combobulate : Control
                 global::Combobulate.Sorting.SortAlgorithm.Bsp,
                 (d, _) => { var c = (Combobulate)d; c._sorter = null; c.Rebuild(); }));
 
+    /// <summary>
+    /// Widens the back-face cull boundary by this many degrees. Default 0
+    /// (strict cull). Set to a small positive value (e.g. 6 = one frame at
+    /// 60Hz with a 6-second-per-turn spin) when an external animation drives
+    /// the rotation on the GPU and the CPU-supplied rotation may lag the
+    /// GPU-drawn one by up to one frame. The widened cone keeps boundary
+    /// faces visible through any single-frame CPU/GPU sync error so the
+    /// painter sort never drops a face the GPU is actually drawing.
+    ///
+    /// <para>Cost: at any moment a few extra sprites near the back-face
+    /// boundary stay parented and visible; the painter sort still draws
+    /// them in the correct order, so the visual is identical to a strict
+    /// cull plus a thin sliver of the same colour the next face over would
+    /// have shown anyway.</para>
+    /// </summary>
+    public double CullMarginDegrees
+    {
+        get => (double)GetValue(CullMarginDegreesProperty);
+        set => SetValue(CullMarginDegreesProperty, value);
+    }
+
+    public static readonly DependencyProperty CullMarginDegreesProperty =
+        DependencyProperty.Register(
+            nameof(CullMarginDegrees),
+            typeof(double),
+            typeof(Combobulate),
+            new PropertyMetadata(0.0, (d, _) => ((Combobulate)d).Rebuild()));
+
     #endregion
 
     protected override void OnApplyTemplate()
@@ -1041,7 +1069,16 @@ public sealed class Combobulate : Control
         if (_orderScratch == null || _orderScratch.Length < cachedQuads.Length)
             _orderScratch = new int[cachedQuads.Length];
 
-        int orderCount = _sorter.Sort(rotation, _orderScratch, _visScratchBool, ComputeSortCameraDistance(scale));
+        // Convert the user-facing CullMarginDegrees DP into the cosine-scale
+        // value the sorter expects (sin(margin) is the amount of cosine "slack"
+        // we add to the front-facing test). 0 reproduces the strict cull.
+        float cullMarginCos = 0f;
+        var marginDeg = CullMarginDegrees;
+        if (marginDeg > 0)
+        {
+            cullMarginCos = MathF.Sin((float)(marginDeg * Math.PI / 180.0));
+        }
+        int orderCount = _sorter.Sort(rotation, _orderScratch, _visScratchBool, ComputeSortCameraDistance(scale), cullMarginCos);
 
         // Diff IsVisible flips against last frame.
         for (int i = 0; i < cachedQuads.Length; i++)

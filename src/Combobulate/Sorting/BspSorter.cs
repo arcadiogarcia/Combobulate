@@ -58,7 +58,7 @@ public sealed class BspSorter : IFaceSorter
 
     public int QuadCount => _geometry.Quads.Length;
 
-    public int Sort(Matrix4x4 rotation, int[] orderBuffer, bool[] visibleBuffer, float cameraDistance = 0f)
+    public int Sort(Matrix4x4 rotation, int[] orderBuffer, bool[] visibleBuffer, float cameraDistance = 0f, float cullMarginCos = 0f)
     {
         var quads = _geometry.Quads;
         int qc = quads.Length;
@@ -70,6 +70,8 @@ public sealed class BspSorter : IFaceSorter
         // viewNormal.Z > eps. The perspective branch is what keeps off-centre faces
         // visible when their normal becomes perpendicular to the global view axis
         // — e.g. the inside face of a double-sided book cover at pitch=±90°.
+        // cullMarginCos > 0 widens the front-facing cone to absorb small CPU-vs-GPU
+        // rotation mismatches during animations.
         bool persp = cameraDistance > 0f;
         for (int i = 0; i < qc; i++)
         {
@@ -77,11 +79,11 @@ public sealed class BspSorter : IFaceSorter
             if (persp)
             {
                 var rc = Vector3.Transform(quads[i].Centroid, rotation);
-                visibleBuffer[i] = GeometryPredicates.IsFrontFacingPerspective(rn, rc, cameraDistance);
+                visibleBuffer[i] = GeometryPredicates.IsFrontFacingPerspective(rn, rc, cameraDistance, cullMarginCos);
             }
             else
             {
-                visibleBuffer[i] = GeometryPredicates.IsFrontFacing(rn.Z);
+                visibleBuffer[i] = GeometryPredicates.IsFrontFacing(rn.Z, cullMarginCos);
             }
         }
 

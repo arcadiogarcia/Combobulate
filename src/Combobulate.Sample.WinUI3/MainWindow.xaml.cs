@@ -128,37 +128,36 @@ public sealed partial class MainWindow : Window
     private float _spinStartCompositorMs;
 
     /// <summary>
-    /// Begin the spin. <c>SpinYaw</c> is no longer driven by a Composition
-    /// KFA — instead the per-frame sampler computes the yaw on the UI thread
-    /// from the compositor's <c>RenderingTime</c> and writes it directly into
-    /// the <c>SpinYaw</c> scalar via <c>InsertScalar</c>. This makes the value
-    /// the GPU expression reads identical-by-construction to the value the
-    /// CPU cull/sort uses (both come from the exact same write each frame),
-    /// eliminating every possible source of clock divergence:
-    ///
-    ///   - wall-clock vs compositor-clock drift (was: ~22ms over 60s)
-    ///   - KFA epoch uncertainty (we can't read the compositor's commit time
-    ///     for an animated property, so a KFA-vs-CPU mirror would always be
-    ///     phase-shifted by an indeterminate fraction of a frame, producing
-    ///     a constant cull-vs-draw offset visible from frame 1)
-    ///
-    /// Trade-off: if the UI thread stalls, the spin pauses for that frame
-    /// instead of continuing GPU-side. That is acceptable here because the
-    /// sampler is what would have produced the cull rebuild on that same
-    /// stalled frame anyway — there is nothing for a "smooth GPU spin" to
-    /// be in sync with during a stall.
+    /// Begin the spin. <c>SpinYaw</c> is driven on the GPU by a Composition
+    /// <c>ScalarKeyFrameAnimation</c>, so the spin keeps animating smoothly
+    /// even when the UI thread stalls. The CPU sampler computes its own
+    /// best-effort approximation of <c>SpinYaw</c> from the compositor's
+    /// <c>RenderingTime</c> for cull/sort. The two values can disagree by up
+    /// to a fraction of a frame (the KFA's true epoch on the compositor is
+    /// not directly observable), so we widen the back-face cull cone via
+    /// <c>combobulate.CullMarginDegrees</c> by enough to absorb a single-
+    /// frame yaw delta. The sort still draws the boundary faces in the
+    /// correct order, so the visual is identical to a strict cull — minus
+    /// any glitch caused by cull/draw disagreement.
     /// </summary>
     private void StartGpuSpin()
     {
         var (props, _) = GetOrCreateExternalRotation();
-        // Make sure no leftover KFA is still bound to SpinYaw — if there is
-        // one, our InsertScalar writes will be ignored while it is active.
-        props.StopAnimation("SpinYaw");
+        var compositor = ElementCompositionPreview.GetElementVisual(this.Content).Compositor;
+        var kfa = compositor.CreateScalarKeyFrameAnimation();
+        kfa.InsertKeyFrame(0f, 0f, compositor.CreateLinearEasingFunction());
+        kfa.InsertKeyFrame(1f, 360f, compositor.CreateLinearEasingFunction());
+        kfa.Duration = TimeSpan.FromSeconds(SpinSecondsPerTurn);
+        kfa.IterationBehavior = AnimationIterationBehavior.Forever;
         props.InsertScalar("SpinActive", 1f);
-        props.InsertScalar("SpinYaw", 0f);
-        // _spinStart serves as a "spin is on" sentinel; the actual epoch
-        // used for yaw computation is _spinStartCompositorMs which is
-        // captured on the first sampler tick.
+        props.StopAnimation("SpinYaw");
+        props.StartAnimation("SpinYaw", kfa);
+        // Widen the back-face cull cone enough to absorb the indeterminate
+        // sub-frame phase offset between the GPU KFA and the CPU sampler's
+        // approximation of SpinYaw. At 360°/6s = 60°/sec the per-frame yaw
+        // delta is ~1° at 60Hz, so 6° gives a 6× safety factor that easily
+        // covers any single-frame stall recovery.
+        if (combobulate != null) combobulate.CullMarginDegrees = 6.0;
         _spinStart = DateTime.UtcNow;
         _spinClock.Restart();
         _spinRingHead = 0;
@@ -174,9 +173,8 @@ public sealed partial class MainWindow : Window
     private void StopGpuSpin()
     {
         _spinStart = null;
+        if (combobulate != null) combobulate.CullMarginDegrees = 0.0;
         if (_externalRotationProps == null) return;
-        // No KFA to stop, but be defensive in case a previous build (which
-        // did use a KFA) left one running across an in-place package update.
         _externalRotationProps.StopAnimation("SpinYaw");
         _externalRotationProps.InsertScalar("SpinYaw", 0f);
         _externalRotationProps.InsertScalar("SpinActive", 0f);
@@ -340,12 +338,12 @@ public sealed partial class MainWindow : Window
                     spinYawRaw = (secs / SpinSecondsPerTurn) * 360f;
                     spinYawWrapped = spinYawRaw - MathF.Floor(spinYawRaw / 360f) * 360f;
                     yaw += spinYawWrapped;
-                    // Push the same value to the GPU so the sprite renderer's
-                    // ExpressionAnimation reads exactly the value we just used
-                    // for cull/sort. With InsertScalar this becomes the value
-                    // the compositor sees on the next commit (this same frame).
-                    // No KFA, no clock divergence, no phase offset.
-                    _externalRotationProps?.InsertScalar("SpinYaw", spinYawWrapped);
+                    // SpinYaw is driven by the GPU KFA — do NOT InsertScalar it
+                    // here, that would freeze the GPU animation. The CPU value
+                    // we just computed is a best-effort approximation of what
+                    // the GPU is drawing this frame; the back-face cull cone is
+                    // widened (CullMarginDegrees) so any sub-frame yaw delta is
+                    // absorbed without flipping a face's visibility.
                 }
                 var live = new Vector3(pitch, yaw, roll);
                 // CombobulateSceneVisual doesn't have its own auto-refresh hook yet,

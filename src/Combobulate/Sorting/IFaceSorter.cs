@@ -61,8 +61,16 @@ public interface IFaceSorter
     /// off-centre faces whose normals are perpendicular to the global view axis can still
     /// be visible (e.g. the inside face of a book cover at pitch=±90°).
     /// </param>
+    /// <param name="cullMarginCos">
+    /// Optional widening of the front-facing cone in cosine units (= <c>sin(maxAngleError)</c>).
+    /// <c>0</c> (default) reproduces the strict back-face cull. Positive values keep faces
+    /// visible up to <c>asin(cullMarginCos)</c> past the back-cull boundary — useful when
+    /// the CPU-supplied <paramref name="rotation"/> may lag the GPU-drawn rotation by a
+    /// known maximum angle (e.g. one frame of an animation), so cull/draw cannot disagree
+    /// at boundary faces.
+    /// </param>
     /// <returns>Number of valid entries written into <paramref name="orderBuffer"/>.</returns>
-    int Sort(Matrix4x4 rotation, int[] orderBuffer, bool[] visibleBuffer, float cameraDistance = 0f);
+    int Sort(Matrix4x4 rotation, int[] orderBuffer, bool[] visibleBuffer, float cameraDistance = 0f, float cullMarginCos = 0f);
 }
 
 /// <summary>
