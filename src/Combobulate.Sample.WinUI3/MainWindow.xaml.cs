@@ -99,6 +99,18 @@ public sealed partial class MainWindow : Window
     private DateTime? _spinStart;
     private const float SpinSecondsPerTurn = 6f;
 
+    // Compensates for the latency between the UI thread queuing
+    // props.StartAnimation("SpinYaw", kfa) and the FIRST CompositionTarget.Rendering
+    // tick that latches _spinStartCompositorMs. The KFA's true epoch on the
+    // compositor is approximately one render frame BEFORE the first sampler tick
+    // we observe, so the latched epoch is too LATE by ~16.7ms — meaning the CPU
+    // computes a yaw that is ~1° BEHIND the GPU's actual displayed yaw at every
+    // frame. That bounded constant offset becomes a one-frame visible flicker at
+    // every sort-order boundary (every ~30°). Subtracting this many ms from the
+    // latched epoch shifts CPU yaw forward to match GPU. Tunable live via the
+    // SetSpinPhaseOffset rover action so we can sweep and validate.
+    internal float _spinPhaseOffsetMs = 16.667f;
+
     // ===== Spin instrumentation =====
     // Ring buffer of per-sampler-tick records, used by DumpSpinDiagnostics to
     // diagnose CPU/GPU drift, frame-time jitter, and GC pauses during long spins.
@@ -329,9 +341,14 @@ public sealed partial class MainWindow : Window
                     // computing yaw, otherwise the first tick computes yaw
                     // off a 0 epoch (which is the app's start-of-time, hours
                     // ago) and would push a wildly wrong initial yaw.
+                    //
+                    // Subtract _spinPhaseOffsetMs (default ~1 frame) to
+                    // compensate for the gap between StartAnimation queue and
+                    // first observed render tick. See the field comment for
+                    // why this is necessary.
                     if (_spinStartCompositorMs == 0f && compMs > 0f)
                     {
-                        _spinStartCompositorMs = compMs;
+                        _spinStartCompositorMs = compMs - _spinPhaseOffsetMs;
                     }
                     var secs = (compMs - _spinStartCompositorMs) / 1000f;
                     if (secs < 0) secs = 0;

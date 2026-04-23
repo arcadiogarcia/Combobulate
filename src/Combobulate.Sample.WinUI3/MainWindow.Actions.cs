@@ -122,6 +122,16 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
     ""mode"": { ""type"": ""string"", ""enum"": [""summary"", ""full""], ""description"": ""Default 'summary'. 'full' returns the entire ring serialised as JSON (~256KB)."" }
   }
 }"),
+        new ActionDescriptor(
+            name: "SetSpinPhaseOffset",
+            description: "Tunes the millisecond offset subtracted from the latched compositor-time epoch when the spin sampler latches its first tick. Compensates for the gap between props.StartAnimation(SpinYaw, kfa) and the first observed CompositionTarget.Rendering tick — the GPU KFA actually starts ~1 frame BEFORE the latch, so without this offset the CPU's computed yaw lags the GPU's drawn yaw by a constant ~1°, which appears as a one-frame stale-order flicker at every sort-order boundary (~every 30° of spin). Default 16.667ms (one 60Hz frame). Sweep via repeated calls + visual inspection while spinning to find the offset where flicker disappears. Takes effect on the NEXT StartGpuSpin (toggle SetSpin off then on).",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""required"": [""offsetMs""],
+  ""properties"": {
+    ""offsetMs"": { ""type"": ""number"", ""minimum"": -100, ""maximum"": 100, ""description"": ""Milliseconds to subtract from the latched compositor-time epoch. Negative values shift CPU yaw BEHIND GPU yaw; positive values shift it AHEAD."" }
+  }
+}"),
     };
 
     public IReadOnlyList<ActionDescriptor> GetAvailableActions() => _actions;
@@ -153,6 +163,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
                 global::Combobulate.Diagnostics.SpinDiagnostics.Disable();
                 return Task.FromResult(ActionResult.Ok(new[] { "sortDiagnostics=disabled" }));
             case "DumpSortDiagnostics": return DispatchDumpSortDiagnosticsAsync(parametersJson);
+            case "SetSpinPhaseOffset": return DispatchSetSpinPhaseOffsetAsync(parametersJson);
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -240,6 +251,31 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
         if (onToken == null) return Task.FromResult(ActionResult.Fail("validation_error", "params.on is required."));
         var on = onToken.Value<bool>();
         return RunOnUi(() => { if (SpinToggle != null) SpinToggle.IsOn = on; });
+    }
+
+    private Task<ActionResult> DispatchSetSpinPhaseOffsetAsync(string parametersJson)
+    {
+        JObject p;
+        try { p = JObject.Parse(parametersJson); }
+        catch { return Task.FromResult(ActionResult.Fail("validation_error", "params is not valid JSON.")); }
+        var token = p["offsetMs"];
+        if (token == null) return Task.FromResult(ActionResult.Fail("validation_error", "params.offsetMs is required."));
+        var offset = token.Value<float>();
+        if (offset < -100f || offset > 100f) return Task.FromResult(ActionResult.Fail("validation_error", "offsetMs must be in [-100, 100]."));
+        return RunOnUi(() =>
+        {
+            // Apply mid-spin: shift the latched compositor-time epoch by the
+            // delta between old and new offset so the change takes effect on
+            // the very next sampler tick. (offset is SUBTRACTED from compMs to
+            // produce the latched epoch, so increasing offset pushes the
+            // epoch BACKWARDS, which advances CPU yaw FORWARD.)
+            var delta = _spinPhaseOffsetMs - offset;  // old - new
+            _spinPhaseOffsetMs = offset;
+            if (_spinStartCompositorMs != 0f)
+            {
+                _spinStartCompositorMs += delta;
+            }
+        });
     }
 
     private Task<ActionResult> DispatchDumpSpinDiagnosticsAsync(string parametersJson)
