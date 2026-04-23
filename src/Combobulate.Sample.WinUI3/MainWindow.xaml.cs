@@ -144,38 +144,46 @@ public sealed partial class MainWindow : Window
     private double _spinStartCompositorMsD;
 
     /// <summary>
-    /// Begin the spin. <c>SpinYaw</c> is driven by the CPU sampler:
-    /// <c>UpdateAutoRefresh</c>'s <c>EnableAutoRefresh</c> callback computes
-    /// the wrapped yaw from <c>RenderingTime</c> and writes it via
-    /// <c>props.InsertScalar("SpinYaw", ...)</c> every frame. The GPU's
-    /// rotation expression then evaluates with the EXACT same float value
-    /// the CPU just used for cull/sort \u2014 so CPU and GPU are guaranteed
-    /// bit-identical, with no possibility of clock drift.
+    /// Begin the spin. <c>SpinYaw</c> is driven on the GPU by a Composition
+    /// <c>ScalarKeyFrameAnimation</c>, so the spin keeps animating smoothly
+    /// even when the UI thread stalls (the whole point of composition-driven
+    /// animation). The CPU sampler computes its own approximation of
+    /// <c>SpinYaw</c> from the compositor's <c>RenderingTime</c> for cull/sort.
     ///
-    /// <para>Trade-off: when the UI thread stalls, no <c>InsertScalar</c>
-    /// fires, so the GPU spin freezes for the duration of the stall (vs
-    /// continuing smoothly under a GPU-side <c>ScalarKeyFrameAnimation</c>).
-    /// We accept this because the alternative \u2014 GPU KFA + parallel CPU
-    /// clock \u2014 leaks two independent compositor-internal clocks, whose
-    /// phase relationship is not directly observable from the UI thread and
-    /// drifts over time, producing visible sort flicker that grows with
-    /// spin duration.</para>
+    /// <para>The two values can disagree by a bounded but non-trivial amount.
+    /// Both clocks ultimately derive from QPC, so the offset is bounded — but
+    /// the compositor evaluates the KFA at a vsync-aligned instant that is
+    /// not <c>RenderingTime</c>, and the gap between them includes display
+    /// latency, frame-prediction adjustments, and queued-frame depth. Under
+    /// load this can briefly reach ~10° (~166ms) at 60°/s.</para>
+    ///
+    /// <para><c>CullMarginDegrees</c> is set wide enough to absorb that
+    /// worst-case offset — plus the BSP sort margin (committed earlier) snaps
+    /// the hemisphere decision to a deterministic order across the entire
+    /// uncertainty window so CPU and GPU agree on draw order even when their
+    /// numeric yaws disagree.</para>
     /// </summary>
     private void StartGpuSpin()
     {
         var (props, _) = GetOrCreateExternalRotation();
-        // Stop any previously installed KFA so subsequent InsertScalar calls
-        // actually take effect (an animated property ignores InsertScalar
-        // until the animation is stopped).
-        props.StopAnimation("SpinYaw");
-        props.InsertScalar("SpinYaw", 0f);
+        var compositor = ElementCompositionPreview.GetElementVisual(this.Content).Compositor;
+        var kfa = compositor.CreateScalarKeyFrameAnimation();
+        kfa.InsertKeyFrame(0f, 0f, compositor.CreateLinearEasingFunction());
+        kfa.InsertKeyFrame(1f, 360f, compositor.CreateLinearEasingFunction());
+        kfa.Duration = TimeSpan.FromSeconds(SpinSecondsPerTurn);
+        kfa.IterationBehavior = AnimationIterationBehavior.Forever;
         props.InsertScalar("SpinActive", 1f);
-        // Cull margin still useful as defence-in-depth against any per-frame
-        // jitter introduced by the compositor evaluating the expression at a
-        // slightly different sub-frame instant than when the CPU wrote the
-        // scalar. With single-source-of-truth this should be ~0, but 6\u00b0 is
-        // cheap insurance.
-        if (combobulate != null) combobulate.CullMarginDegrees = 6.0;
+        props.StopAnimation("SpinYaw");
+        props.StartAnimation("SpinYaw", kfa);
+        // Widened from 6° to 18°. At 360°/6s the per-frame yaw delta is ~1°,
+        // so 18° = ~18 frames = ~300ms of clock-offset headroom — enough to
+        // cover any compositor-side queueing/latency between the time the
+        // KFA is evaluated and the time RenderingTime is stamped, even under
+        // moderate load. The BSP sort margin (also widened by
+        // CullMarginDegrees) keeps draw order deterministic across the full
+        // uncertainty window so CPU and GPU never disagree on ORDER, even
+        // when their numeric yaws disagree by a few degrees.
+        if (combobulate != null) combobulate.CullMarginDegrees = 18.0;
         _spinStart = DateTime.UtcNow;
         _spinClock.Restart();
         _spinRingHead = 0;
@@ -378,14 +386,15 @@ public sealed partial class MainWindow : Window
                     // spinYawRaw kept for the diagnostic ring buffer; NOT used for cull.
                     spinYawRaw        = (float)(elapsedMsD / periodMsD * 360.0);
                     yaw += spinYawWrapped;
-                    // SINGLE SOURCE OF TRUTH: write the wrapped yaw to the
-                    // shared property set NOW, so the GPU expression evaluates
-                    // this very same float for the sprite's TransformMatrix on
-                    // the same compositor commit. This is the bit-identical
-                    // value the CPU is about to use for cull/sort below, so
-                    // CPU and GPU are guaranteed in lockstep \u2014 no parallel
-                    // KFA clock, no precision drift, no growing flicker.
-                    _externalRotationProps?.InsertScalar("SpinYaw", spinYawWrapped);
+                    // SpinYaw is driven by the GPU KFA — do NOT InsertScalar it
+                    // here, that would freeze the GPU animation. The CPU value
+                    // we just computed is a best-effort approximation of what
+                    // the GPU is drawing this frame; the back-face cull cone
+                    // is widened (CullMarginDegrees=18 during spin) so any
+                    // bounded sub-frame yaw delta is absorbed without flipping
+                    // a face's visibility, and the BSP sort margin snaps draw
+                    // order to a deterministic choice across the entire
+                    // uncertainty window.
                 }
                 var live = new Vector3(pitch, yaw, roll);
                 // CombobulateSceneVisual doesn't have its own auto-refresh hook yet,
