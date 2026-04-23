@@ -123,6 +123,16 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
   }
 }"),
         new ActionDescriptor(
+            name: "SetSpinSeconds",
+            description: "Sets SpinSecondsPerTurn live (drives the UI slider's Value, which triggers the same OnSpinSpeedChanged path: resets the sampler epoch and restarts the GPU KFA if currently spinning). Range 0.5..30. Use to test whether flicker is angular-speed-dependent: if drift scales with 1/seconds the cause is a constant TIME offset (clock-skew hypothesis); if drift is roughly speed-independent in degrees the cause is geometric/numeric in the sort path.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""required"": [""seconds""],
+  ""properties"": {
+    ""seconds"": { ""type"": ""number"", ""minimum"": 0.5, ""maximum"": 30, ""description"": ""Seconds per full 360 deg revolution."" }
+  }
+}"),
+        new ActionDescriptor(
             name: "SetSpinPhaseOffset",
             description: "Tunes the millisecond offset subtracted from the latched compositor-time epoch when the spin sampler latches its first tick. Compensates for the gap between props.StartAnimation(SpinYaw, kfa) and the first observed CompositionTarget.Rendering tick — the GPU KFA actually starts ~1 frame BEFORE the latch, so without this offset the CPU's computed yaw lags the GPU's drawn yaw by a constant ~1°, which appears as a one-frame stale-order flicker at every sort-order boundary (~every 30° of spin). Default 16.667ms (one 60Hz frame). Sweep via repeated calls + visual inspection while spinning to find the offset where flicker disappears. Takes effect on the NEXT StartGpuSpin (toggle SetSpin off then on).",
             parameterSchema: @"{
@@ -164,6 +174,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
                 return Task.FromResult(ActionResult.Ok(new[] { "sortDiagnostics=disabled" }));
             case "DumpSortDiagnostics": return DispatchDumpSortDiagnosticsAsync(parametersJson);
             case "SetSpinPhaseOffset": return DispatchSetSpinPhaseOffsetAsync(parametersJson);
+            case "SetSpinSeconds": return DispatchSetSpinSecondsAsync(parametersJson);
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -251,6 +262,21 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
         if (onToken == null) return Task.FromResult(ActionResult.Fail("validation_error", "params.on is required."));
         var on = onToken.Value<bool>();
         return RunOnUi(() => { if (SpinToggle != null) SpinToggle.IsOn = on; });
+    }
+
+    private Task<ActionResult> DispatchSetSpinSecondsAsync(string parametersJson)
+    {
+        JObject p;
+        try { p = JObject.Parse(parametersJson); }
+        catch { return Task.FromResult(ActionResult.Fail("validation_error", "params is not valid JSON.")); }
+        var token = p["seconds"];
+        if (token == null) return Task.FromResult(ActionResult.Fail("validation_error", "params.seconds is required."));
+        var secs = token.Value<double>();
+        if (secs < 0.5 || secs > 30) return Task.FromResult(ActionResult.Fail("validation_error", "seconds must be in [0.5, 30]."));
+        return RunOnUi(() =>
+        {
+            if (SpinSpeedSlider != null) SpinSpeedSlider.Value = secs; // fires OnSpinSpeedChanged
+        });
     }
 
     private Task<ActionResult> DispatchSetSpinPhaseOffsetAsync(string parametersJson)
