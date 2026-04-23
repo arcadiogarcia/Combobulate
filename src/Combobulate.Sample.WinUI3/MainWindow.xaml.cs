@@ -138,6 +138,10 @@ public sealed partial class MainWindow : Window
     // after StartGpuSpin. Used as the epoch to convert subsequent
     // RenderingTime values into "seconds since spin start".
     private float _spinStartCompositorMs;
+    // Double-precision copy used by the yaw math. The float version above is
+    // kept only for legacy instrumentation fields (DriftMs). All yaw math must
+    // use this to avoid ULP drift that grows with app lifetime.
+    private double _spinStartCompositorMsD;
 
     /// <summary>
     /// Begin the spin. <c>SpinYaw</c> is driven on the GPU by a Composition
@@ -177,6 +181,7 @@ public sealed partial class MainWindow : Window
         _prevTickElapsedTicks = 0;
         Array.Clear(_spinRing, 0, _spinRing.Length);
         _spinStartCompositorMs = 0f;
+        _spinStartCompositorMsD = 0.0;
         _gc0AtStart = GC.CollectionCount(0);
         _gc1AtStart = GC.CollectionCount(1);
         _gc2AtStart = GC.CollectionCount(2);
@@ -333,27 +338,43 @@ public sealed partial class MainWindow : Window
                 var yaw   = (float)(YawSlider?.Value ?? 0);
                 var roll  = (float)(RollSlider?.Value ?? 0);
                 float spinYawRaw = 0f, spinYawWrapped = 0f;
-                float compMs = (float)renderingTime.TotalMilliseconds;
+                // Keep compositor time in DOUBLE throughout yaw math. Casting
+                // to float here would quantize by up to 1ms once the app has
+                // been running a few hours (compMs > 2^23 ms ~= 2.3 hours),
+                // producing a growing jitter that compounds with spin duration.
+                double compMsD = renderingTime.TotalMilliseconds;
+                float compMs = (float)compMsD;  // for instrumentation only
                 if (_spinStart != null)
                 {
                     // Latch the compositor-time epoch the FIRST time the
-                    // sampler runs after StartGpuSpin. We must do this BEFORE
-                    // computing yaw, otherwise the first tick computes yaw
-                    // off a 0 epoch (which is the app's start-of-time, hours
-                    // ago) and would push a wildly wrong initial yaw.
-                    //
-                    // Subtract _spinPhaseOffsetMs (default ~1 frame) to
-                    // compensate for the gap between StartAnimation queue and
-                    // first observed render tick. See the field comment for
-                    // why this is necessary.
-                    if (_spinStartCompositorMs == 0f && compMs > 0f)
+                    // sampler runs after StartGpuSpin. Subtract _spinPhaseOffsetMs
+                    // (~1 frame) to compensate for the gap between the KFA's
+                    // true start on the compositor and the first render tick
+                    // the UI thread observes.
+                    if (_spinStartCompositorMsD == 0.0 && compMsD > 0.0)
                     {
-                        _spinStartCompositorMs = compMs - _spinPhaseOffsetMs;
+                        _spinStartCompositorMsD = compMsD - _spinPhaseOffsetMs;
+                        _spinStartCompositorMs  = (float)_spinStartCompositorMsD;
                     }
-                    var secs = (compMs - _spinStartCompositorMs) / 1000f;
-                    if (secs < 0) secs = 0;
-                    spinYawRaw = (secs / SpinSecondsPerTurn) * 360f;
-                    spinYawWrapped = spinYawRaw - MathF.Floor(spinYawRaw / 360f) * 360f;
+                    // Match the GPU KFA's internal math precisely: wrap elapsed
+                    // time modulo the iteration period BEFORE scaling to yaw.
+                    // The compositor evaluates IterationBehavior.Forever by
+                    // computing (elapsed mod duration), keeping its intermediate
+                    // in [0, duration), so precision stays constant regardless
+                    // of how long the spin has run. Our previous formula grew
+                    // spinYawRaw unbounded and wrapped after scaling, which
+                    // introduced a drift that compounded with spin duration
+                    // (float32 ULP of a value at 10 min of 60deg/s is ~0.004 deg,
+                    // at 1 hr ~0.016 deg, at 10 hr ~0.25 deg - and each crossing
+                    // of a power-of-two boundary DOUBLES the quantization step).
+                    double elapsedMsD = compMsD - _spinStartCompositorMsD;
+                    if (elapsedMsD < 0) elapsedMsD = 0;
+                    double periodMsD  = SpinSecondsPerTurn * 1000.0;
+                    double phaseMsD   = elapsedMsD - Math.Floor(elapsedMsD / periodMsD) * periodMsD;
+                    double yawD       = phaseMsD / periodMsD * 360.0;
+                    spinYawWrapped    = (float)yawD;
+                    // spinYawRaw kept for the diagnostic ring buffer; NOT used for cull.
+                    spinYawRaw        = (float)(elapsedMsD / periodMsD * 360.0);
                     yaw += spinYawWrapped;
                     // SpinYaw is driven by the GPU KFA — do NOT InsertScalar it
                     // here, that would freeze the GPU animation. The CPU value

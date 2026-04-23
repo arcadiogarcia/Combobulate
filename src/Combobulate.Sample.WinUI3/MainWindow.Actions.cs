@@ -271,9 +271,10 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             // epoch BACKWARDS, which advances CPU yaw FORWARD.)
             var delta = _spinPhaseOffsetMs - offset;  // old - new
             _spinPhaseOffsetMs = offset;
-            if (_spinStartCompositorMs != 0f)
+            if (_spinStartCompositorMsD != 0.0)
             {
-                _spinStartCompositorMs += delta;
+                _spinStartCompositorMsD += delta;
+                _spinStartCompositorMs   = (float)_spinStartCompositorMsD;
             }
         });
     }
