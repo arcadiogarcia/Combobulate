@@ -113,12 +113,19 @@ public sealed partial class MainWindow : Window
         public byte VisibleMask;        // bit i = sprite i was last set IsVisible=true
         public byte VisibleCount;       // popcount of VisibleMask
         public float GpuSpinYawCached;  // TryGetScalar("SpinYaw") at this tick (often stale=0 for animated, but log it)
+        public float CompositorMs;      // RenderingEventArgs.RenderingTime in ms (0 if sampler had no time)
+        public float WallMs;            // _spinClock elapsed ms at the same instant
+        public float DriftMs;           // WallMs - CompositorMs (positive = wall ahead of compositor)
     }
     private SpinTick[] _spinRing = new SpinTick[1024]; // ~17s at 60Hz
     private int _spinRingHead;       // next slot to write
     private long _spinTickCount;     // total sampler invocations since spin start
     private long _prevTickElapsedTicks;
     private int _gc0AtStart, _gc1AtStart, _gc2AtStart;
+    // Compositor RenderingTime (ms) captured on the first sampler tick
+    // after StartGpuSpin. Used as the epoch to convert subsequent
+    // RenderingTime values into "seconds since spin start".
+    private float _spinStartCompositorMs;
 
     /// <summary>
     /// Start the looping Composition KFA that drives <c>SpinYaw</c> on the GPU,
@@ -149,6 +156,7 @@ public sealed partial class MainWindow : Window
         _spinTickCount = 0;
         _prevTickElapsedTicks = 0;
         Array.Clear(_spinRing, 0, _spinRing.Length);
+        _spinStartCompositorMs = 0f;
         _gc0AtStart = GC.CollectionCount(0);
         _gc1AtStart = GC.CollectionCount(1);
         _gc2AtStart = GC.CollectionCount(2);
@@ -235,13 +243,29 @@ public sealed partial class MainWindow : Window
         lines.Add($"gpu.spinYaw.cached={gpuSpinYaw:F3}");
         lines.Add($"cpu_minus_gpu={(spinning && !float.IsNaN(gpuSpinYaw) ? cpuYawNow - gpuSpinYaw : 0):F3}");
 
+        // Drift stats from the ring buffer: max abs(WallMs - (CompositorMs -
+        // _spinStartCompositorMs)). If the new compositor-time sampler is
+        // working as designed, this should stay tiny (sub-frame). If we ever
+        // see this grow into double-digit ms, something is reclocking the
+        // sampler off a different source than expected.
+        float maxAbsDrift = 0f, lastDrift = 0f;
+        for (int i = 0; i < _spinRing.Length; i++)
+        {
+            var d = _spinRing[i].DriftMs;
+            var ad = MathF.Abs(d);
+            if (ad > maxAbsDrift) maxAbsDrift = ad;
+            if (_spinRing[i].ElapsedTicks != 0) lastDrift = d;
+        }
+        lines.Add($"drift.maxAbsMs={maxAbsDrift:F3}");
+        lines.Add($"drift.lastMs={lastDrift:F3}");
+
         if (lastN > 0)
         {
             // Walk backwards from head over the last N entries, dump in chronological order.
             int len = _spinRing.Length;
             int n = (int)Math.Min(lastN, total);
             int start = ((_spinRingHead - n) % len + len) % len;
-            lines.Add($"--- last {n} ticks (chronological, ms.relative cpuYawWrap cpuYawRaw deltaMs visMask visCnt gpuYaw gc0 gc1 gc2) ---");
+            lines.Add($"--- last {n} ticks (chronological, ms.relative cpuYawWrap cpuYawRaw deltaMs visMask visCnt gpuYaw drift gc0 gc1 gc2) ---");
             double tickMsPerCount = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             for (int i = 0; i < n; i++)
             {
@@ -249,7 +273,7 @@ public sealed partial class MainWindow : Window
                 var t = _spinRing[idx];
                 if (t.ElapsedTicks == 0 && t.CpuYawWrapped == 0 && t.CpuYawRaw == 0) continue;
                 var ms = t.ElapsedTicks * tickMsPerCount;
-                lines.Add($"t={ms:F2} yawW={t.CpuYawWrapped:F2} yawR={t.CpuYawRaw:F2} dt={t.DeltaMsSincePrev:F2} vis=0x{t.VisibleMask:X2}({t.VisibleCount}) gpuY={t.GpuSpinYawCached:F2} g0={t.Gc0} g1={t.Gc1} g2={t.Gc2}");
+                lines.Add($"t={ms:F2} yawW={t.CpuYawWrapped:F2} yawR={t.CpuYawRaw:F2} dt={t.DeltaMsSincePrev:F2} vis=0x{t.VisibleMask:X2}({t.VisibleCount}) gpuY={t.GpuSpinYawCached:F2} drift={t.DriftMs:F2} g0={t.Gc0} g1={t.Gc1} g2={t.Gc2}");
             }
         }
         return lines;
@@ -274,15 +298,28 @@ public sealed partial class MainWindow : Window
 
         if (wantAuto)
         {
-            combobulate.EnableAutoRefresh(() =>
+            // Use the compositor-time overload of EnableAutoRefresh: the
+            // sampler is given the SAME RenderingTime the compositor will
+            // use to evaluate the SpinYaw KFA on the GPU, so the CPU yaw
+            // we feed into the cull is the EXACT yaw the compositor will
+            // draw. No wall-clock vs compositor-clock drift is possible.
+            // (Previously this used DateTime.UtcNow, which would drift
+            // ahead of the compositor every time the compositor stalled
+            // — accumulating into visible cull/order glitches after ~30s.)
+            combobulate.EnableAutoRefresh((TimeSpan renderingTime) =>
             {
                 var pitch = (float)(PitchSlider?.Value ?? 0);
                 var yaw   = (float)(YawSlider?.Value ?? 0);
                 var roll  = (float)(RollSlider?.Value ?? 0);
                 float spinYawRaw = 0f, spinYawWrapped = 0f;
-                if (_spinStart is DateTime t0)
+                float compMs = (float)renderingTime.TotalMilliseconds;
+                if (_spinStart != null)
                 {
-                    var secs = (float)(DateTime.UtcNow - t0).TotalSeconds;
+                    // Clock the spin off the compositor's own RenderingTime.
+                    // SpinYaw KFA started at SpinStartCompositorMs, so:
+                    //   secs = (RenderingTime - SpinStartCompositorMs) / 1000
+                    var secs = (compMs - _spinStartCompositorMs) / 1000f;
+                    if (secs < 0) secs = 0; // first tick before epoch captured
                     spinYawRaw = (secs / SpinSecondsPerTurn) * 360f;
                     spinYawWrapped = spinYawRaw - MathF.Floor(spinYawRaw / 360f) * 360f;
                     yaw += spinYawWrapped;
@@ -292,21 +329,13 @@ public sealed partial class MainWindow : Window
                 // so piggy-back the same per-frame tick to keep its mesh in sync.
                 combobulateSceneVisual.RebuildForExternalRotation(live);
                 // Instrumentation: record one ring-buffer entry per sampler tick.
-                // Stopwatch is QPC-based so deltas reflect the compositor's clock, not
-                // wall-clock NTP corrections. Taking GC counts here lets us correlate
-                // any single-frame deltaMs spike with a GC at exactly that frame.
                 if (_spinStart != null)
                 {
                     var nowTicks = _spinClock.ElapsedTicks;
                     var dtTicks  = nowTicks - _prevTickElapsedTicks;
                     var deltaMs  = (float)((dtTicks * 1000.0) / System.Diagnostics.Stopwatch.Frequency);
-                    // Allocation-free read of the cull state from the
-                    // PREVIOUS frame's rebuild — the sampler returned a
-                    // Vector3 above, then Combobulate's OnRenderingTick
-                    // calls RebuildForExternalRotation with it. Reading
-                    // here records the state we just consumed; trend
-                    // analysis (drift is monotonic) is unaffected by the
-                    // one-frame skew.
+                    var wallMs   = (float)((nowTicks * 1000.0) / System.Diagnostics.Stopwatch.Frequency);
+                    var driftMs  = compMs > 0f ? (wallMs - (compMs - _spinStartCompositorMs)) : 0f;
                     combobulate.CopyVisibleMaskByte(8, out byte mask, out byte cnt, out _);
                     float gpuYaw = 0f;
                     _externalRotationProps?.TryGetScalar("SpinYaw", out gpuYaw);
@@ -322,10 +351,23 @@ public sealed partial class MainWindow : Window
                         VisibleMask       = mask,
                         VisibleCount      = cnt,
                         GpuSpinYawCached  = gpuYaw,
+                        CompositorMs      = compMs,
+                        WallMs            = wallMs,
+                        DriftMs           = driftMs,
                     };
                     _spinRingHead = (_spinRingHead + 1) % _spinRing.Length;
                     _prevTickElapsedTicks = nowTicks;
                     _spinTickCount++;
+                    // Lazily capture the compositor-time origin on the very
+                    // first tick after StartGpuSpin(). The KFA was started
+                    // on the previous UI-thread call but the compositor only
+                    // begins evaluating it at the next frame; whatever
+                    // RenderingTime we observe on the first tick is the
+                    // closest we can get to "KFA epoch in compositor units."
+                    if (_spinStartCompositorMs == 0f && compMs > 0f)
+                    {
+                        _spinStartCompositorMs = compMs;
+                    }
                 }
                 return live;
             });

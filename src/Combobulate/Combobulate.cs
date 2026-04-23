@@ -639,6 +639,7 @@ public sealed class Combobulate : Control
 
     // Auto-refresh subscription state.
     private Func<Vector3>? _autoRefreshSampler;
+    private Func<TimeSpan, Vector3>? _autoRefreshSamplerWithTime;
     private EventHandler<object>? _renderingHandler;
 
     /// <summary>
@@ -728,6 +729,30 @@ public sealed class Combobulate : Control
         if (rotationSampler is null) throw new ArgumentNullException(nameof(rotationSampler));
         DisableAutoRefresh();
         _autoRefreshSampler = rotationSampler;
+        _renderingHandler = OnRenderingTick;
+#if WINAPPSDK
+        Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
+#else
+        Windows.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
+#endif
+    }
+
+    /// <summary>
+    /// Variant of <see cref="EnableAutoRefresh(Func{Vector3})"/> that gives the
+    /// sampler the compositor's <c>RenderingEventArgs.RenderingTime</c> for the
+    /// frame being prepared. Use this when the caller derives its rotation from
+    /// a <c>ScalarKeyFrameAnimation</c> driven by the compositor clock — sampling
+    /// from the same clock keeps the CPU-computed rotation (used for cull/sort)
+    /// and the GPU-evaluated rotation (used for drawing) in lock-step. Sampling
+    /// from <c>DateTime.UtcNow</c> or a wall-clock <c>Stopwatch</c> drifts whenever
+    /// the compositor stalls, which produces visible cull/order glitches after the
+    /// drift accumulates past one frame's worth of yaw.
+    /// </summary>
+    public void EnableAutoRefresh(Func<TimeSpan, Vector3> rotationSampler)
+    {
+        if (rotationSampler is null) throw new ArgumentNullException(nameof(rotationSampler));
+        DisableAutoRefresh();
+        _autoRefreshSamplerWithTime = rotationSampler;
         _renderingHandler = OnRenderingTick;
 #if WINAPPSDK
         Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
@@ -844,15 +869,39 @@ public sealed class Combobulate : Control
             _renderingHandler = null;
         }
         _autoRefreshSampler = null;
+        _autoRefreshSamplerWithTime = null;
     }
 
     private void OnRenderingTick(object? sender, object e)
     {
+        var samplerT = _autoRefreshSamplerWithTime;
         var sampler = _autoRefreshSampler;
-        if (sampler == null) return;
+        if (samplerT == null && sampler == null) return;
         try
         {
-            RebuildForExternalRotation(sampler());
+            Vector3 rotation;
+            if (samplerT != null)
+            {
+                // Pull the compositor's RenderingTime out of the event args
+                // so the caller can clock its rotation off the same source
+                // the compositor uses to evaluate ScalarKeyFrameAnimations.
+                // The runtime types differ between WinUI3 and UWP but both
+                // expose a RenderingTime TimeSpan property.
+                TimeSpan ts = default;
+#if WINAPPSDK
+                if (e is Microsoft.UI.Xaml.Media.RenderingEventArgs rea)
+                    ts = rea.RenderingTime;
+#else
+                if (e is Windows.UI.Xaml.Media.RenderingEventArgs rea)
+                    ts = rea.RenderingTime;
+#endif
+                rotation = samplerT(ts);
+            }
+            else
+            {
+                rotation = sampler!();
+            }
+            RebuildForExternalRotation(rotation);
         }
         catch
         {
