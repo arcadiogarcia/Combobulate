@@ -185,6 +185,16 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
     ""offsetMs"": { ""type"": ""number"", ""minimum"": -100, ""maximum"": 100, ""description"": ""Milliseconds to subtract from the latched compositor-time epoch. Negative values shift CPU yaw BEHIND GPU yaw; positive values shift it AHEAD."" }
   }
 }"),
+        new ActionDescriptor(
+            name: "SetRenderingMode",
+            description: "Switches Combobulate's render path. 'SpritePainter' (default) is the original single-tree path with per-frame UI-thread Remove+InsertAtTop reorder — vulnerable to UI/GPU clock drift, which causes the spin flicker. 'DualTreeAtomicSwap' pre-builds a SECOND sprite tree pre-sorted at yaw_now+Δ and drives its Opacity via an ExpressionAnimation referencing the same SpinYaw scalar that drives the rotation matrix — so the swap is GPU-frame-synchronous with the rotation it pre-sorted for, eliminating the drift-induced flicker by construction.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""required"": [""mode""],
+  ""properties"": {
+    ""mode"": { ""type"": ""string"", ""enum"": [""SpritePainter"", ""DualTreeAtomicSwap""] }
+  }
+}"),
     };
 
     public IReadOnlyList<ActionDescriptor> GetAvailableActions() => _actions;
@@ -223,6 +233,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             case "RunAtomicSwapTest": return DispatchRunAtomicSwapTestAsync(parametersJson);
             case "ClearAtomicSwapTest": return RunOnUi(ClearAtomicSwapTest);
             case "RunBspBoundaryEquivalenceTest": return DispatchRunBspBoundaryEquivalenceTestAsync(parametersJson);
+            case "SetRenderingMode": return DispatchSetRenderingModeAsync(parametersJson);
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -791,6 +802,25 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
                 $"order_at_yaw+eps=[{string.Join(",", visList2)}]",
             };
             return Task.FromResult(ActionResult.Ok(lines));
+        }
+        catch (Exception ex)
+        {
+            return Task.FromResult(ActionResult.Fail("execution_error", ex.Message));
+        }
+    }
+
+    private Task<ActionResult> DispatchSetRenderingModeAsync(string parametersJson)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(parametersJson);
+            var modeStr = doc.RootElement.GetProperty("mode").GetString();
+            if (!Enum.TryParse<global::Combobulate.Rendering.RenderingMode>(modeStr, ignoreCase: true, out var mode))
+                return Task.FromResult(ActionResult.Fail("invalid_param", $"Unknown rendering mode '{modeStr}'."));
+            return RunOnUi(() =>
+            {
+                if (combobulate != null) combobulate.RenderingMode = mode;
+            });
         }
         catch (Exception ex)
         {

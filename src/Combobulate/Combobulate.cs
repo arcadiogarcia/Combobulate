@@ -284,6 +284,29 @@ public sealed class Combobulate : Control
             typeof(Combobulate),
             new PropertyMetadata(0.0, (d, _) => ((Combobulate)d).Rebuild()));
 
+    /// <summary>
+    /// Selects the per-frame composition strategy. Default
+    /// <see cref="global::Combobulate.Rendering.RenderingMode.SpritePainter"/>
+    /// preserves existing single-tree behaviour. Switch to
+    /// <see cref="global::Combobulate.Rendering.RenderingMode.DualTreeAtomicSwap"/>
+    /// to drive the order swap from the compositor (eliminating CPU/GPU
+    /// yaw drift) at the cost of 2× sprite count.
+    /// </summary>
+    public global::Combobulate.Rendering.RenderingMode RenderingMode
+    {
+        get => (global::Combobulate.Rendering.RenderingMode)GetValue(RenderingModeProperty);
+        set => SetValue(RenderingModeProperty, value);
+    }
+
+    public static readonly DependencyProperty RenderingModeProperty =
+        DependencyProperty.Register(
+            nameof(RenderingMode),
+            typeof(global::Combobulate.Rendering.RenderingMode),
+            typeof(Combobulate),
+            new PropertyMetadata(
+                global::Combobulate.Rendering.RenderingMode.SpritePainter,
+                (d, _) => { var c = (Combobulate)d; c.OnRenderingModeChanged(); }));
+
     #endregion
 
     protected override void OnApplyTemplate()
@@ -312,6 +335,8 @@ public sealed class Combobulate : Control
     {
         DisableAutoRefresh();
         ClearSpritePool();
+        _dualTree?.Dispose();
+        _dualTree = null;
         if (_host != null)
             ElementCompositionPreview.SetElementChildVisual(_host, null);
         _root?.Dispose();
@@ -562,6 +587,15 @@ public sealed class Combobulate : Control
         return d / scale;
     }
 
+    /// <summary>Converts the user-facing <see cref="CullMarginDegrees"/> DP into
+    /// the cosine-scale value the sorter expects (sin of the margin).</summary>
+    private float ComputeCullMarginCos()
+    {
+        var marginDeg = CullMarginDegrees;
+        if (marginDeg <= 0) return 0f;
+        return MathF.Sin((float)(marginDeg * Math.PI / 180.0));
+    }
+
     private void OnRotationChanged()
     {
         // Setting an internal rotation DP returns the control to internal mode
@@ -655,6 +689,79 @@ public sealed class Combobulate : Control
     private ObjGeometry? _spritePoolGeometry;
     private float _spritePoolScale;
     private float _spritePoolHostW;
+    // ---- DualTreeAtomicSwap state ----
+    private global::Combobulate.Rendering.DualTreeRenderer? _dualTree;
+    private CompositionPropertySet? _spinYawSourceProps;
+    private string _spinYawScalarName = "SpinYaw";
+    private string _yawValScalarName = "YawVal";
+    private string _spinActiveScalarName = "SpinActive";
+    private Func<float, Matrix4x4>? _composedYawToRotation;
+    // Set by RebuildForExternalRotation to the host's just-computed composed
+    // yaw (degrees). Used by the dual-tree renderer instead of TryGetScalar,
+    // because TryGetScalar on a GPU-animated scalar returns the stale CPU
+    // value and would peg the dual-tree windows at 0 forever.
+    private float _lastComposedYawDeg;
+    // Optional live composed-yaw (degrees) accessor, supplied by the host.
+    // When the host can sample the GPU spin clock cheaply on the UI thread
+    // (it does, via CompositionTarget.Rendering's RenderingTime + the spin
+    // KFA's known period), this returns slider.YawVal + spinActive*spinYaw
+    // every Update tick. If null, falls back to _lastComposedYawDeg (which
+    // contains only the slider value and pegs windows during spin).
+    private Func<float>? _composedYawDegLive;
+
+    /// <summary>
+    /// Wires up the rotation property set whose animated yaw scalar drives
+    /// the dual-tree atomic swap when <see cref="RenderingMode"/> is
+    /// <see cref="global::Combobulate.Rendering.RenderingMode.DualTreeAtomicSwap"/>.
+    /// The dual-tree opacity expressions are
+    /// <c>(yawValName + spinActiveName * spinYawName)</c> compared against
+    /// UI-thread-supplied window bounds, so each tree's swap fires at the
+    /// exact GPU yaw the compositor is about to paint with.
+    ///
+    /// <paramref name="composedYawToRotation"/> must, for any composed-yaw
+    /// value <c>y</c> the property set could produce, return the same rotation
+    /// matrix the compositor would compose for that yaw (typically built by
+    /// the host from its current pitch/roll plus the supplied yaw). Without
+    /// this, the dual-tree renderer cannot pre-sort the next tree.
+    /// </summary>
+    public void SetSpinYawSource(
+        CompositionPropertySet props,
+        Func<float, Matrix4x4> composedYawToRotation,
+        string spinYawScalarName = "SpinYaw",
+        string yawValScalarName = "YawVal",
+        string spinActiveScalarName = "SpinActive",
+        Func<float>? composedYawDegLive = null)
+    {
+        _spinYawSourceProps = props;
+        _composedYawToRotation = composedYawToRotation;
+        _spinYawScalarName = spinYawScalarName;
+        _yawValScalarName = yawValScalarName;
+        _spinActiveScalarName = spinActiveScalarName;
+        _composedYawDegLive = composedYawDegLive;
+        if (_dualTree != null)
+        {
+            _dualTree.Dispose();
+            _dualTree = null;
+            Rebuild();
+        }
+    }
+
+    private void OnRenderingModeChanged()
+    {
+        if (_dualTree != null)
+        {
+            _dualTree.Dispose();
+            _dualTree = null;
+        }
+        if (_root != null) _root.Children.RemoveAll();
+        _spritePool = null;
+        _spritePoolGeometry = null;
+        _lastVisible = null;
+        _lastOrder = Array.Empty<int>();
+        _lastOrderCount = 0;
+        _sorter = null;
+        Rebuild();
+    }
     private float _spritePoolHostH;
     private object? _spritePoolPackKey;
     private ResolvedQuadMaterials? _spritePoolBindings;
@@ -689,6 +796,12 @@ public sealed class Combobulate : Control
     public void RebuildForExternalRotation(Vector3 rotationDegrees)
     {
         const float deg2rad = MathF.PI / 180f;
+        // Capture the composed yaw (degrees) the host computed for THIS frame.
+        // The dual-tree renderer needs this exact value to choose which yaw
+        // window each tree should cover; sampling it from the property set via
+        // TryGetScalar returns the stale CPU value (always 0 while the GPU KFA
+        // animates SpinYaw), which would leave both trees invisible.
+        _lastComposedYawDeg = rotationDegrees.Y;
         var rotation = Matrix4x4.CreateFromYawPitchRoll(
             rotationDegrees.Y * deg2rad,
             rotationDegrees.X * deg2rad,
@@ -982,6 +1095,41 @@ public sealed class Combobulate : Control
         var scale = (float)ModelScale;
         var hostW = (float)(_host?.ActualWidth ?? 0);
         var hostH = (float)(_host?.ActualHeight ?? 0);
+
+        // ---- DualTreeAtomicSwap path ----
+        // Active only when the host wired up SetSpinYawSource AND we have a
+        // valid host size to layout sprites into. Otherwise fall through to
+        // the SpritePainter path below (graceful degradation).
+        if (RenderingMode == global::Combobulate.Rendering.RenderingMode.DualTreeAtomicSwap
+            && _spinYawSourceProps != null
+            && _composedYawToRotation != null
+            && hostW > 0 && hostH > 0)
+        {
+            // Resolve material bindings so we can hand brushes to the dual-tree renderer.
+            var dtResolved = MaterialResolver.Resolve(_compositor, geometry, pack);
+            if (_dualTree == null)
+            {
+                _dualTree = new global::Combobulate.Rendering.DualTreeRenderer(_compositor, _root);
+            }
+            _dualTree.Update(
+                geometry: geometry,
+                bindings: dtResolved,
+                scale: scale,
+                hostW: hostW,
+                hostH: hostH,
+                cullMarginCos: ComputeCullMarginCos(),
+                cameraDistance: ComputeSortCameraDistance(scale),
+                sortAlgorithm: SortAlgorithm,
+                spinYawSourceProps: _spinYawSourceProps,
+                spinYawScalarName: _spinYawScalarName,
+                yawValScalarName: _yawValScalarName,
+                spinActiveScalarName: _spinActiveScalarName,
+                composedYawToRotation: _composedYawToRotation,
+                composedYawDegNow: _composedYawDegLive?.Invoke() ?? _lastComposedYawDeg);
+            return;
+        }
+
+        // ---- SpritePainter path (default, unchanged) ----
 
         var packKey = (object?)pack ?? NoPackSentinel;
         bool geometryChanged = !ReferenceEquals(_spritePoolGeometry, geometry);

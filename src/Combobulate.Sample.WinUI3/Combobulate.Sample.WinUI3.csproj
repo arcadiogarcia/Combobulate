@@ -30,7 +30,7 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(Configuration)' == 'Debug'">
-    <PackageReference Include="zRover.WinUI" Version="0.1.4-preview" />
+    <PackageReference Include="zRover.WinUI" Version="0.1.5-preview" />
   </ItemGroup>
 
   <ItemGroup>

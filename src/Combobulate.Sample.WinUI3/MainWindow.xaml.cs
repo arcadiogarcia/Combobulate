@@ -523,6 +523,24 @@ public sealed partial class MainWindow : Window
         return (_externalRotationProps, _externalRotationExpr);
     }
 
+    /// <summary>
+    /// Builds the rotation matrix that the compositor would compose for a given
+    /// composed-yaw value (in degrees), using the CURRENT pitch/roll slider state.
+    /// Matches the convention Combobulate uses internally
+    /// (<see cref="System.Numerics.Matrix4x4.CreateFromYawPitchRoll"/>).
+    /// Used by the dual-tree renderer to pre-sort upcoming yaw windows.
+    /// </summary>
+    private Matrix4x4 ComposedYawToRotationMatrix(float composedYawDeg)
+    {
+        const float deg2rad = MathF.PI / 180f;
+        var pitchDeg = (float)PitchSlider.Value;
+        var rollDeg  = (float)RollSlider.Value;
+        return Matrix4x4.CreateFromYawPitchRoll(
+            composedYawDeg * deg2rad,
+            pitchDeg       * deg2rad,
+            rollDeg        * deg2rad);
+    }
+
     private void ApplyRotation()
     {
         if (combobulate == null) return;
@@ -543,6 +561,11 @@ public sealed partial class MainWindow : Window
             props.InsertScalar("RollVal",  z);
             combobulate.SetExternalRotation(expr);
             combobulateSceneVisual.SetExternalRotation(expr);
+            // Wire the spin yaw source for DualTreeAtomicSwap. The closure captures
+            // the LIVE pitch/roll sliders so the rotation matrix the dual-tree
+            // renderer pre-sorts at any composed yaw value matches what the
+            // compositor will paint with for that yaw at this slider state.
+            combobulate.SetSpinYawSource(props, ComposedYawToRotationMatrix);
         }
         else
         {
