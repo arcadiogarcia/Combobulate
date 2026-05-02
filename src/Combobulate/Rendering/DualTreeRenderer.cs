@@ -255,20 +255,30 @@ internal sealed class DualTreeRenderer : IDisposable
         float lookahead = forward ? lookaheadAbs : -lookaheadAbs;
         float yPredict = yNow + lookahead;
 
-        // Inflate the cull margin generously. The dual-tree pipeline rebuilds
-        // the active tree at yNow each tick, so in principle the host's
-        // baseline margin is sufficient for the active tree. But the inactive
-        // tree is sorted at yPredict (~lookaheadAbs degrees ahead) and will
-        // be promoted on the next handoff while still appearing fresh — so
-        // its sort must not have culled anything that's still front-facing
-        // at the post-handoff GPU yaw. Adding 2*lookaheadAbs of slack covers
-        // both directions of staleness with comfortable margin. For a convex
-        // cube the worst case of "extra cull margin keeps a back-facing face
-        // visible" is harmless: the back-to-front sort paints front faces
-        // over back faces, so a still-IsVisible=true back face is over-
-        // painted into invisibility.
+        // Inflate the cull margin to absorb staleness. The active tree was
+        // built at some yaw `Y_active_built`, and remains active while GPU yaw
+        // advances toward `Y_active_built + lookahead` (where the next handoff
+        // fires). Faces that were marginally back-facing at `Y_active_built`
+        // may have rotated forward by up to `lookahead` degrees by the end of
+        // the active period — so we must keep them IsVisible=true through the
+        // build, otherwise they pop out as missing faces near the handoff.
+        // ONE direction of staleness suffices: the active tree only ever
+        // becomes "more in the future" of its build yaw as time passes; it
+        // never goes "into the past" of its build (we always rebuild at
+        // yPredict in the FORWARD direction).
+        //
+        // Critically, the previous design used 2*lookaheadAbs which leaked
+        // back-facing side faces during normal spin (cullMargin sin~0.07 +
+        // 2*2°≈0.07 = 0.14 → 8° back-facing faces visible). At edge-on yaws
+        // (~90°/270°) the BSP sort can paint such a back face on top of a
+        // forward face, producing a 3-faces-visible artifact.
+        //
+        // Hard cap (`MaxCullInflationDeg`) defends against rare omega spikes
+        // (e.g. immediately after wrap-detect resets smoothing).
         const float deg2rad = MathF.PI / 180f;
-        float effectiveCullMarginCos = cullMarginCos + 2f * lookaheadAbs * deg2rad;
+        const float MaxCullInflationDeg = 6f;
+        float inflationDeg = MathF.Min(MaxCullInflationDeg, lookaheadAbs);
+        float effectiveCullMarginCos = cullMarginCos + inflationDeg * deg2rad;
         if (effectiveCullMarginCos > 1f) effectiveCullMarginCos = 1f;
         tightCullCos = effectiveCullMarginCos;
 
@@ -325,34 +335,68 @@ internal sealed class DualTreeRenderer : IDisposable
         bool handoffFired = _handoffForward
             ? (yNow >= _nextHandoffYaw)
             : (yNow <= _nextHandoffYaw);
+
+        // ---- Two-tick state machine: SWAP, then on next tick BUILD. ----
+        //
+        // Doing SetSelector and BuildTree on the same UI tick exposes a
+        // race: InsertScalar on a CompositionPropertySet commits to the
+        // compositor IMMEDIATELY (before the UI batch flushes), so the
+        // selector flips visible-tree mid-Update. Visual children mutations
+        // (Remove + InsertAtTop loop) inside BuildTree don't commit until
+        // batch flush, so for the rest of this UI tick the compositor sees
+        // the just-flipped tree's PRE-build state — fine. But on the NEXT
+        // compositor frame, BuildTree's mutations have committed atomically
+        // and the tree shows the NEW (post-flip) build, which targets
+        // yPredict (lookahead degrees in the future). That's STALE relative
+        // to the actual yaw at swap time, which is the prior _nextHandoffYaw
+        // (just barely crossed, not yPredict's target).
+        //
+        // To keep the just-promoted tree's sort fresh AND avoid race-y
+        // overlap, split swap and build across two ticks:
+        //   tick T (handoff fires): SWAP. Tree (formerly inactive, sorted
+        //                           at the OLD yPredict, which is now
+        //                           ≈ yNow) becomes active. Do NOT mutate
+        //                           any tree this tick.
+        //   tick T+1 (post-swap):   BUILD now-inactive tree at the NEW
+        //                           yPredict. (No swap this tick.)
+        //   ticks T+2 ... T+N:      BUILD inactive tree at latest yPredict.
+        //                           Keeps the inactive sort fresh while
+        //                           waiting for the next yaw threshold.
         if (handoffFired)
         {
             _activeIsA = !_activeIsA;
             SetSelector(_activeIsA);
+            // The just-promoted tree was built at the old yPredict, so its
+            // sort is already fresh for ~yNow. Don't mutate either tree
+            // this tick.
+            _activeBuildYaw = _inactiveBuildYaw;
+
+            // Arm the next handoff. yPredict is forward of yNow by
+            // `lookahead`; the next swap should fire roughly when GPU yaw
+            // crosses (yNow + lookahead/2).
+            float newHandoff = (yNow + yPredict) * 0.5f;
+            if (forward)
+            {
+                float minHandoff = yNow + MinLookaheadDeg * 0.5f;
+                if (newHandoff < minHandoff) newHandoff = minHandoff;
+            }
+            else
+            {
+                float maxHandoff = yNow - MinLookaheadDeg * 0.5f;
+                if (newHandoff > maxHandoff) newHandoff = maxHandoff;
+            }
+            _nextHandoffYaw = newHandoff;
+            _handoffForward = forward;
+            return;
         }
 
+        // ---- Non-swap tick: rebuild ONLY the inactive tree at latest yPredict. ----
         SpriteVisual?[] inactivePool = _activeIsA ? _poolB! : _poolA!;
         ContainerVisual inactiveTree = _activeIsA ? _treeB : _treeA;
-
-        // Rebuild INACTIVE at yPredict — pre-warmed for the next handoff.
-        // Active tree is left completely untouched this tick.
         BuildTree(inactiveTree, inactivePool, geometry, bindings, scale, hostW, hostH,
             composedYawToRotation(yPredict), cameraDistance, tightCullCos);
 
-        float newHandoff = (yNow + yPredict) * 0.5f;
-        if (forward)
-        {
-            float minHandoff = yNow + MinLookaheadDeg * 0.5f;
-            if (newHandoff < minHandoff) newHandoff = minHandoff;
-        }
-        else
-        {
-            float maxHandoff = yNow - MinLookaheadDeg * 0.5f;
-            if (newHandoff > maxHandoff) newHandoff = maxHandoff;
-        }
-
         _inactiveBuildYaw = yPredict;
-        _nextHandoffYaw = newHandoff;
         _handoffForward = forward;
     }
 

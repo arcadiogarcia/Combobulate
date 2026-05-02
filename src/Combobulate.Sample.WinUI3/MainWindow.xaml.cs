@@ -58,6 +58,18 @@ public sealed partial class MainWindow : Window
 
     private void AutoRefreshToggle_Toggled(object sender, RoutedEventArgs e) => UpdateAutoRefresh();
 
+    private void ShowSceneVisualToggle_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (ShowSceneVisualToggle == null) return;
+        bool on = ShowSceneVisualToggle.IsOn;
+        if (combobulateSceneVisual != null)
+            combobulateSceneVisual.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        if (SceneVisualLabel != null)
+            SceneVisualLabel.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        if (SceneVisualColumn != null)
+            SceneVisualColumn.Width = on ? new GridLength(1, GridUnitType.Star) : new GridLength(0);
+    }
+
     /// <summary>
     /// Autonomous continuous Y-axis spin. Implicitly enables External + Auto-refresh
     /// (spin is meaningless without them: external routes rotation through composition,
@@ -425,7 +437,8 @@ public sealed partial class MainWindow : Window
                 var live = new Vector3(pitch, yaw, roll);
                 // CombobulateSceneVisual doesn't have its own auto-refresh hook yet,
                 // so piggy-back the same per-frame tick to keep its mesh in sync.
-                combobulateSceneVisual.RebuildForExternalRotation(live);
+                if (ShowSceneVisualToggle?.IsOn == true)
+                    combobulateSceneVisual.RebuildForExternalRotation(live);
                 // Instrumentation: record one ring-buffer entry per sampler tick.
                 if (_spinStart != null)
                 {

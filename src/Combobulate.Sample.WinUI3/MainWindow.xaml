@@ -73,6 +73,12 @@
                     VerticalAlignment="Center"
                     ValueChanged="OnSpinSpeedChanged"/>
             <TextBlock x:Name="SpinSpeedValueText" Text="6.0" VerticalAlignment="Center" Width="40"/>
+            <ToggleSwitch x:Name="ShowSceneVisualToggle"
+                          OnContent="z-buffer panel ON"
+                          OffContent="z-buffer panel off"
+                          IsOn="False"
+                          Toggled="ShowSceneVisualToggle_Toggled"
+                          ToolTipService.ToolTip="Show the SceneVisual (z-buffer) reference panel beside the SpriteVisual painter-sort panel. Off by default; the SpriteVisual panel takes the full width when off."/>
             <TextBlock x:Name="StatusText"
                        VerticalAlignment="Center"
                        Opacity="0.7"
@@ -82,7 +88,7 @@
         <Grid Grid.Row="2" ColumnSpacing="12">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="*"/>
+                <ColumnDefinition x:Name="SceneVisualColumn" Width="0"/>
             </Grid.ColumnDefinitions>
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
@@ -93,10 +99,12 @@
                        Text="SpriteVisual (painter sort)"
                        Style="{ThemeResource CaptionTextBlockStyle}"
                        Opacity="0.7" Margin="0,0,0,4"/>
-            <TextBlock Grid.Column="1" Grid.Row="0"
+            <TextBlock x:Name="SceneVisualLabel"
+                       Grid.Column="1" Grid.Row="0"
                        Text="SceneVisual (z-buffer)"
                        Style="{ThemeResource CaptionTextBlockStyle}"
-                       Opacity="0.7" Margin="0,0,0,4"/>
+                       Opacity="0.7" Margin="0,0,0,4"
+                       Visibility="Collapsed"/>
 
             <c:Combobulate x:Name="combobulate"
                            Grid.Column="0" Grid.Row="1"
@@ -115,7 +123,8 @@
                              Model="{x:Bind combobulate.Model, Mode=OneWay}"
                              Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
                              BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}"
-                             BorderThickness="1"/>
+                             BorderThickness="1"
+                             Visibility="Collapsed"/>
         </Grid>
 
         <!--
