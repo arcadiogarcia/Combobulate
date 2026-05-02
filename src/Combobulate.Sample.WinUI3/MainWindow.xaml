@@ -21,7 +21,12 @@
                    Text="Combobulate — OBJ quads via composition"
                    Style="{ThemeResource TitleTextBlockStyle}"/>
 
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="12">
+        <ScrollViewer Grid.Row="1"
+                      HorizontalScrollMode="Enabled"
+                      HorizontalScrollBarVisibility="Auto"
+                      VerticalScrollMode="Disabled"
+                      VerticalScrollBarVisibility="Disabled">
+        <StackPanel Orientation="Horizontal" Spacing="12">
             <Button x:Name="LoadObjButton"
                     Content="Load OBJ…"
                     Click="LoadObjButton_Click"/>
@@ -84,6 +89,7 @@
                        Opacity="0.7"
                        Text="Loaded: built-in cube"/>
         </StackPanel>
+        </ScrollViewer>
 
         <Grid Grid.Row="2" ColumnSpacing="12">
             <Grid.ColumnDefinitions>

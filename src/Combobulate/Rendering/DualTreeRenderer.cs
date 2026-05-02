@@ -79,11 +79,17 @@ internal sealed class DualTreeRenderer : IDisposable
     // ticks so each tree's sort stays fresh. 2 frames @ 60Hz = 33ms.
     private const float PredictFrames = 2f;
 
-    // Wrap detection: if CPU yaw drops by more than this between consecutive
-    // samples, we assume the GPU SpinYaw KFA wrapped 360→0 (or the user did
-    // something extreme like dragging the slider). Re-init both trees from
-    // scratch so the new windows are anchored at the new yaw.
-    private const float WrapDetectDeltaDeg = 180f;
+    // Yaw unwrap detection: if the raw (wrapped) CPU yaw jumps by more than
+    // this between consecutive samples, we treat it as a 360° wrap of the
+    // SpinYaw KFA and shift _yawWrapOffset by ±360 so the unwrapped yaw stays
+    // continuous. Wraps under sustained spin produce a discontinuity of
+    // ~360° (e.g. 359°→1° forward, 1°→359° backward), so a threshold of 180°
+    // unambiguously distinguishes a wrap from a normal per-frame yaw delta
+    // (≤ ω·dt, typically a few ° per frame). The fix is critical for
+    // cumulative-degradation: previously every wrap forced _initialized=false
+    // which re-bootstrapped both trees with smoothed-ω reset to 0, producing
+    // a transient on every revolution that compounded over time.
+    private const float YawUnwrapDeltaDeg = 180f;
 
     // Smoothing factor for the omega estimate: ω_smoothed = (1-α)*ω_prev + α*ω_now.
     // 0.3 = aggressive enough to track changes within a few frames, but rejects
@@ -122,12 +128,21 @@ internal sealed class DualTreeRenderer : IDisposable
     private bool _initialized;
     private bool _activeIsA;            // which tree is currently active
     private float _activeBuildYaw;      // composed yaw at which the active tree's painter sort was computed
-    private float _inactiveBuildYaw;    // composed yaw at which the inactive (just-rebuilt) tree's sort was computed
-    private float _nextHandoffYaw;      // yaw threshold where the next handoff fires
+    private float _inactiveBuildYaw;    // unwrapped yaw at which the inactive (just-rebuilt) tree's sort was computed
+    private float _nextHandoffYaw;      // unwrapped yaw threshold where the next handoff fires
     private bool _handoffForward;       // sign of motion at the time the current handoff was armed (true = ω>=0)
-    private float _lastYawSample;       // composed yaw observed on previous tick (for omega estimate)
+    private float _lastYawSample;       // unwrapped yaw observed on previous tick (for omega estimate)
     private long _lastSampleTicks;      // Stopwatch ticks at previous sample (for omega estimate)
     private float _smoothedOmegaDegPerSec;
+    // Yaw unwrapping: composedYawDegNow comes in wrapped to [sliderYaw, sliderYaw+360).
+    // _yawWrapOffset accumulates ±360° on each detected wrap so that
+    // unwrappedYaw = composedYawDegNow + _yawWrapOffset is continuous and
+    // monotonically grows (forward spin) or shrinks (backward spin) without
+    // any discontinuity at SpinYaw KFA wraps. This is the primary state
+    // variable used by the omega estimate and the handoff state machine —
+    // every revolution becomes math-identical to the first.
+    private float _yawWrapOffset;
+    private float _lastRawYawSample;    // last RAW (wrapped) input observed; used only to detect wraps
 
     public DualTreeRenderer(Compositor compositor, ContainerVisual parent)
     {
@@ -188,7 +203,34 @@ internal sealed class DualTreeRenderer : IDisposable
         }
         _bindings = bindings;
 
-        float yNow = composedYawDegNow;
+        // ---- Unwrap composedYawDegNow into a continuous yaw space. ----
+        //
+        // composedYawDegNow comes in wrapped (the GPU SpinYaw KFA wraps 360→0
+        // forever). Every state-machine variable below — omega estimate,
+        // _nextHandoffYaw threshold, _activeBuildYaw / _inactiveBuildYaw —
+        // must compare with same-epoch yaw values; otherwise wraps cause
+        // discontinuities that either (a) trigger a full reinit or (b)
+        // mis-fire the handoff (forward trigger 1° >= 358° is false → swap
+        // never fires until next wrap → active sort goes increasingly stale).
+        //
+        // By converting the input to a monotonic unwrapped yaw at the top of
+        // Update, every revolution is bit-identical math to the first. The
+        // rotation matrix (composedYawToRotation) only depends on yaw mod 360
+        // so unbounded unwrapped yaw values are harmless — the sort sees the
+        // same matrix at unwrapped yaw 720° as at 0°.
+        if (!_initialized)
+        {
+            _yawWrapOffset = 0f;
+            _lastRawYawSample = composedYawDegNow;
+        }
+        else
+        {
+            float deltaRaw = composedYawDegNow - _lastRawYawSample;
+            if (deltaRaw < -YawUnwrapDeltaDeg) _yawWrapOffset += 360f;
+            else if (deltaRaw > YawUnwrapDeltaDeg) _yawWrapOffset -= 360f;
+            _lastRawYawSample = composedYawDegNow;
+        }
+        float yNow = composedYawDegNow + _yawWrapOffset;
 
         // Use the host's cullMarginCos verbatim — exactly what SpritePainter
         // uses. Hardcoding a wider margin here (we previously used 5°) leaked
@@ -202,19 +244,10 @@ internal sealed class DualTreeRenderer : IDisposable
         // constant remains for documentation but is no longer applied.
         float tightCullCos = cullMarginCos;
 
-        // ---- Wrap detection ----
-        // GPU's SpinYaw scalar is animated by a 0→360 KFA with IterationBehavior.Forever,
-        // so composed yaw wraps every period. When CPU yaw drops by > 180° we
-        // assume the wrap fired (or the user did something extreme like flinging
-        // the slider). Force re-init so the new windows are anchored at the new
-        // yaw — the old _nextHandoffYaw is stale once yaw has discontinuously
-        // jumped.
-        if (_initialized
-            && !float.IsNaN(_lastYawSample)
-            && MathF.Abs(yNow - _lastYawSample) > WrapDetectDeltaDeg)
-        {
-            _initialized = false;
-        }
+        // (Wrap detection removed — see unwrap block above. Yaw is now
+        // continuous so no reinit is ever required for SpinYaw KFA wraps.
+        // The only remaining trigger for !_initialized is geometry/host
+        // change above, which already legitimately requires a tree rebuild.)
 
         // ---- Estimate angular velocity (deg/sec) ----
         long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
