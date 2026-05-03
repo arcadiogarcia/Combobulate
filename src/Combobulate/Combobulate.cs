@@ -892,6 +892,9 @@ public sealed class Combobulate : Control
         {
             ApplyBakedTransformAnimation();
         }
+        // Trigger a rebuild so Update enters the BakedAspectGraph dispatch
+        // branch (which now has _transformNode set) and kicks off the bake.
+        Rebuild();
     }
 
     /// <summary>

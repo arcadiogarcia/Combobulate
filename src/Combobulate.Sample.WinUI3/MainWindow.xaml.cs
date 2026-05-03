@@ -689,6 +689,18 @@ public sealed partial class MainWindow : Window
 
         if (newMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph)
         {
+            // BakedAspectGraph reads slider values from the rotation
+            // property set scalars (PitchVal/YawVal/RollVal/SpinYaw/
+            // SpinActive). Force ExternalRotationToggle ON so ApplyRotation
+            // writes slider values into those scalars. Otherwise sliders
+            // route to RotationX/Y/Z DPs which the bake AST does not see,
+            // and the cube renders permanently at the zero-rotation cell.
+            if (ExternalRotationToggle != null && !ExternalRotationToggle.IsOn)
+            {
+                ExternalRotationToggle.IsOn = true;
+            }
+            ApplyRotation();
+
             // Build a typed Matrix4x4Node mirroring the rotation pipeline:
             //   composedYaw = YawVal + SpinActive * SpinYaw
             //   R = RotZ(RollVal) * RotX(PitchVal) * RotY(composedYaw)

@@ -148,6 +148,17 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
                 // problem so the user/dev can see it during development.
                 System.Diagnostics.Debug.WriteLine(
                     $"[BakedAspectGraphRenderer] Bake failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+                try
+                {
+                    var dir = System.IO.Path.Combine(
+                        Windows.Storage.ApplicationData.Current.LocalFolder.Path,
+                        "debug-artifacts");
+                    System.IO.Directory.CreateDirectory(dir);
+                    System.IO.File.AppendAllText(
+                        System.IO.Path.Combine(dir, "baked-aspect-graph.log"),
+                        $"[{DateTime.Now:HH:mm:ss.fff}] BAKE EXCEPTION: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}\n");
+                }
+                catch { }
             }
         }, ct);
     }

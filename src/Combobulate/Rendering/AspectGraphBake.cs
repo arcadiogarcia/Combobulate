@@ -215,52 +215,34 @@ internal static class AspectGraphBake
             sigs[flat] = (ord, (bool[])visBuf.Clone());
         }
 
-        // Group adjacent cells with identical signatures into axis-aligned
-        // boxes. Greedy: iterate cells in row-major; for each unmarked
-        // cell, expand greedily along axis 0, then 1, then 2, ... while
-        // every expanded slab is a uniform signature.
-        var marked = new bool[total];
-        var result = new List<CellND>();
+        // For each grid cell emit one CellND. The previous greedy adjacency
+        // merge had a subtle bug that produced overlapping cells; we keep
+        // every grid cell separate and rely on the renderer's per-cell
+        // ExpressionAnimation Opacity test to pick exactly one. Memory is
+        // K_yaw * K_pitch * K_roll * Q SpriteVisuals — fine for low-poly
+        // meshes (cube ~ 3456*6 = ~20k sprites at 24x12x12), and the
+        // grid-cell-per-CellND construction is provably gap-free and
+        // overlap-free.
+        var result = new List<CellND>(checked((int)total));
         var idx = new int[axes.Length];
         for (long flat = 0; flat < total; flat++)
         {
-            if (marked[flat]) continue;
-            // Decompose flat to index per axis.
+            // Decompose flat -> indices.
             long rem = flat;
             for (int i = axes.Length - 1; i >= 0; i--)
             {
                 idx[i] = (int)(rem % cellCounts[i]);
                 rem /= cellCounts[i];
             }
-            var seedSig = sigs[flat];
-
-            // Greedy expansion.
-            var sizes = new int[axes.Length];
-            for (int i = 0; i < axes.Length; i++) sizes[i] = 1;
-            for (int axis = 0; axis < axes.Length; axis++)
-            {
-                while (idx[axis] + sizes[axis] < cellCounts[axis]
-                       && SlabHasSameSignature(sigs, cellCounts, idx, sizes, axis, seedSig))
-                {
-                    sizes[axis]++;
-                }
-            }
-
-            // Mark every cell in the expanded box.
-            MarkSlab(marked, cellCounts, idx, sizes);
-
-            // Convert to (lo, hi) input-space bounds.
             var lo = new float[axes.Length];
             var hi = new float[axes.Length];
             for (int i = 0; i < axes.Length; i++)
             {
                 float step = axes[i].Length / cellCounts[i];
                 lo[i] = axes[i].Min + idx[i] * step;
-                hi[i] = axes[i].Min + (idx[i] + sizes[i]) * step;
-                // For periodic axes we keep the linear bounds; the renderer
-                // is responsible for wrapping the live input before testing.
+                hi[i] = axes[i].Min + (idx[i] + 1) * step;
             }
-            result.Add(new CellND(lo, hi, seedSig.order, seedSig.visibility));
+            result.Add(new CellND(lo, hi, sigs[flat].order, sigs[flat].visibility));
         }
 
         return result.ToArray();
@@ -275,78 +257,5 @@ internal static class AspectGraphBake
         for (int i = 0; i < a.visibility.Length; i++)
             if (a.visibility[i] != b.visibility[i]) return false;
         return true;
-    }
-
-    private static bool SlabHasSameSignature(
-        (int[] order, bool[] visibility)[] sigs,
-        int[] cellCounts,
-        int[] idx,
-        int[] sizes,
-        int growAxis,
-        (int[] order, bool[] visibility) seed)
-    {
-        // Visit every cell in the slab where growAxis = idx[growAxis] + sizes[growAxis].
-        var probe = (int[])idx.Clone();
-        probe[growAxis] = idx[growAxis] + sizes[growAxis];
-        return WalkSlab(sigs, cellCounts, idx, sizes, growAxis, probe, 0, seed);
-    }
-
-    private static bool WalkSlab(
-        (int[] order, bool[] visibility)[] sigs,
-        int[] cellCounts,
-        int[] idx,
-        int[] sizes,
-        int growAxis,
-        int[] probe,
-        int axisCursor,
-        (int[] order, bool[] visibility) seed)
-    {
-        if (axisCursor == idx.Length)
-        {
-            long flat = ToFlat(probe, cellCounts);
-            return SignatureEquals(sigs[flat], seed);
-        }
-        if (axisCursor == growAxis)
-        {
-            return WalkSlab(sigs, cellCounts, idx, sizes, growAxis, probe, axisCursor + 1, seed);
-        }
-        for (int j = 0; j < sizes[axisCursor]; j++)
-        {
-            probe[axisCursor] = idx[axisCursor] + j;
-            if (!WalkSlab(sigs, cellCounts, idx, sizes, growAxis, probe, axisCursor + 1, seed)) return false;
-        }
-        return true;
-    }
-
-    private static void MarkSlab(bool[] marked, int[] cellCounts, int[] idx, int[] sizes)
-    {
-        var probe = new int[idx.Length];
-        MarkSlabRecurse(marked, cellCounts, idx, sizes, probe, 0);
-    }
-
-    private static void MarkSlabRecurse(bool[] marked, int[] cellCounts, int[] idx, int[] sizes, int[] probe, int axis)
-    {
-        if (axis == idx.Length)
-        {
-            marked[ToFlat(probe, cellCounts)] = true;
-            return;
-        }
-        for (int j = 0; j < sizes[axis]; j++)
-        {
-            probe[axis] = idx[axis] + j;
-            MarkSlabRecurse(marked, cellCounts, idx, sizes, probe, axis + 1);
-        }
-    }
-
-    private static long ToFlat(int[] idx, int[] cellCounts)
-    {
-        long flat = 0;
-        long stride = 1;
-        for (int i = idx.Length - 1; i >= 0; i--)
-        {
-            flat += idx[i] * stride;
-            stride *= cellCounts[i];
-        }
-        return flat;
     }
 }
