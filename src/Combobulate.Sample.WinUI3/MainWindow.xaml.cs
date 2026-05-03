@@ -3,6 +3,7 @@ using System.IO;
 using System.Numerics;
 using Combobulate.Caching;
 using Combobulate.Parsing;
+using Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork;
 using Microsoft.UI.Composition;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -674,7 +675,49 @@ public sealed partial class MainWindow : Window
             _             => global::Combobulate.Sorting.SortAlgorithm.Bsp,
         };
     }
+    private void RenderingModeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (combobulate == null) return;
+        var label = (RenderingModeBox.SelectedItem as ComboBoxItem)?.Content as string;
+        var newMode = label switch
+        {
+            "DualTreeAtomicSwap" => global::Combobulate.Rendering.RenderingMode.DualTreeAtomicSwap,
+            "BakedAspectGraph"   => global::Combobulate.Rendering.RenderingMode.BakedAspectGraph,
+            _                    => global::Combobulate.Rendering.RenderingMode.SpritePainter,
+        };
+        combobulate.RenderingMode = newMode;
 
+        if (newMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph)
+        {
+            // Build a typed Matrix4x4Node that mirrors what the rotation
+            // ExpressionAnimation in GetOrCreateExternalRotation() / Combobulate's
+            // internal rotation pipeline computes:
+            //   composedYaw = YawVal + SpinActive * SpinYaw
+            //   R = RotZ(RollVal) * RotX(PitchVal) * RotY(composedYaw)
+            // Combobulate auto-wraps R in toOrigin*R*fromOrigin so we don't
+            // include centering here.
+            var (props, _) = GetOrCreateExternalRotation();
+            var pRef = props.GetReference();
+            var pitchVal = pRef.GetScalarProperty("PitchVal");
+            var yawVal   = pRef.GetScalarProperty("YawVal");
+            var rollVal  = pRef.GetScalarProperty("RollVal");
+            var spinYaw  = pRef.GetScalarProperty("SpinYaw");
+            var spinAct  = pRef.GetScalarProperty("SpinActive");
+            var composedYaw = yawVal + spinAct * spinYaw;
+            const float D2R = 0.01745329251994f;
+            var rotZ = ExpressionFunctions.CreateMatrix4x4FromAxisAngle(
+                ExpressionFunctions.Vector3(0f, 0f, 1f), rollVal * D2R);
+            var rotX = ExpressionFunctions.CreateMatrix4x4FromAxisAngle(
+                ExpressionFunctions.Vector3(1f, 0f, 0f), pitchVal * D2R);
+            var rotY = ExpressionFunctions.CreateMatrix4x4FromAxisAngle(
+                ExpressionFunctions.Vector3(0f, 1f, 0f), composedYaw * D2R);
+            var rotation = rotZ * rotX * rotY;
+
+            // Drive the Combobulate control with the typed rotation tree;
+            // `composedYaw` is the periodic primary axis (degrees, period 360).
+            combobulate.SetTransformAnimation(rotation, composedYaw, 360f);
+        }
+    }
     private static string? ResolveSamplePath(string fileName)
     {
         // Walk up from the app base looking for a samples directory containing the file.

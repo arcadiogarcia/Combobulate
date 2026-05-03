@@ -28,6 +28,10 @@
     </PackageReference>
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\CompositionCollectionView\src\CompositionExpressions.WinAppSdk\CompositionExpressions.WinAppSdk.csproj" />
+  </ItemGroup>
+
   <!-- Shared source files from the UWP library project -->
   <ItemGroup>
     <Compile Include="..\Combobulate\**\*.cs"

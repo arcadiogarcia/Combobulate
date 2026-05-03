@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Numerics;
 using Combobulate.Caching;
 using Combobulate.Parsing;
+using Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork;
 
 #if WINAPPSDK
 using Windows.UI;
@@ -446,6 +447,16 @@ public sealed class Combobulate : Control
     {
         if (_root == null || _compositor == null || _host == null) return;
         if (_externalRotationExpression == null) return;
+        // BakedAspectGraph owns _root.TransformMatrix when SetTransformAnimation
+        // has been wired up. Skip installing the legacy external-rotation
+        // expression on top — it would fight with the baked transform animation
+        // and cause unstable visuals ("freezes" while the compositor flips
+        // between conflicting expressions).
+        if (RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph
+            && _transformNode is not null)
+        {
+            return;
+        }
 
         var w = (float)_host.ActualWidth;
         var h = (float)_host.ActualHeight;
@@ -518,6 +529,13 @@ public sealed class Combobulate : Control
     private void UpdateRootTransform()
     {
         if (_root == null || _host == null) return;
+        // BakedAspectGraph owns _root.TransformMatrix while active; don't
+        // overwrite it with a static slider-derived matrix.
+        if (RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph
+            && _transformNode is not null)
+        {
+            return;
+        }
 
         var w = (float)_host.ActualWidth;
         var h = (float)_host.ActualHeight;
@@ -691,6 +709,11 @@ public sealed class Combobulate : Control
     private float _spritePoolHostW;
     // ---- DualTreeAtomicSwap state ----
     private global::Combobulate.Rendering.DualTreeRenderer? _dualTree;
+    // ---- BakedAspectGraph state ----
+    private global::Combobulate.Rendering.BakedAspectGraphRenderer? _baked;
+    private ObjGeometry? _bakedGeometry;
+    private float _bakedScale, _bakedHostW, _bakedHostH;
+    private global::Combobulate.Sorting.SortAlgorithm _bakedAlgorithm;
     private CompositionPropertySet? _spinYawSourceProps;
     private string _spinYawScalarName = "SpinYaw";
     private string _yawValScalarName = "YawVal";
@@ -708,6 +731,24 @@ public sealed class Combobulate : Control
     // every Update tick. If null, falls back to _lastComposedYawDeg (which
     // contains only the slider value and pegs windows during spin).
     private Func<float>? _composedYawDegLive;
+
+    // ---- BakedAspectGraph: typed transform animation state ----
+    // Set via SetTransformAnimation; consumed when RenderingMode == BakedAspectGraph.
+    private Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node? _transformNode;
+    private Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode? _primaryAxisNode;
+    private float _primaryAxisPeriod = 360f;
+    // Snapshot of (transformNode, hostW, hostH) for which the GPU
+    // TransformMatrix animation has been installed. Avoids reinstalling
+    // the animation every Update tick (which leaked composition objects
+    // and destabilised the visual tree until it crashed).
+    private Matrix4x4Node? _bakedInstalledTransform;
+    private float _bakedInstalledW;
+    private float _bakedInstalledH;
+    // Stopwatch ticks of the last MaybeRebake check. We throttle to once
+    // per ~100ms so the bake's secondary-input probe (which Evaluates the
+    // AST 5 times via cross-thread property reads) doesn't run at vsync
+    // frequency and starve the UI thread.
+    private long _lastMaybeRebakeTicks;
 
     /// <summary>
     /// Wires up the rotation property set whose animated yaw scalar drives
@@ -746,6 +787,98 @@ public sealed class Combobulate : Control
         }
     }
 
+    /// <summary>
+    /// Configures Combobulate with a typed transform expression tree and
+    /// the periodic scalar input that the analytical aspect-graph bake
+    /// should sweep over. When <see cref="RenderingMode"/> is
+    /// <see cref="global::Combobulate.Rendering.RenderingMode.BakedAspectGraph"/>,
+    /// Combobulate will:
+    ///
+    /// <list type="bullet">
+    ///   <item>Compile <paramref name="transformNode"/> via
+    ///         <c>ToExpressionString()</c> and start that animation on
+    ///         <c>_root.TransformMatrix</c>, so the GPU paints the same
+    ///         transform the bake reasons about.</item>
+    ///   <item>Bake every constant-painter-order cell across
+    ///         <c>[0, primaryAxisPeriod)</c> by sweeping
+    ///         <paramref name="primaryAxis"/> with its
+    ///         <c>LiveValueProvider</c> overridden, calling
+    ///         <c>transformNode.Evaluate()</c> at each sweep point.</item>
+    ///   <item>Detect changes to any "secondary" input contributing to the
+    ///         tree and re-bake automatically.</item>
+    /// </list>
+    ///
+    /// <para>The contract is that <paramref name="transformNode"/> represents
+    /// the FULL transform applied to the model — orientation, perspective,
+    /// translation-to-host-center, all of it. Combobulate will replace its
+    /// internal rotation pipeline with the supplied expression for the
+    /// duration of the BakedAspectGraph mode.</para>
+    /// </summary>
+    public void SetTransformAnimation(
+        Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node transformNode,
+        Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode primaryAxis,
+        float primaryAxisPeriod = 360f)
+    {
+        if (transformNode is null) throw new ArgumentNullException(nameof(transformNode));
+        if (primaryAxis is null) throw new ArgumentNullException(nameof(primaryAxis));
+        if (primaryAxisPeriod <= 0) throw new ArgumentOutOfRangeException(nameof(primaryAxisPeriod));
+
+        _transformNode = transformNode;
+        _primaryAxisNode = primaryAxis;
+        _primaryAxisPeriod = primaryAxisPeriod;
+
+        // Force a rebake on next Update by tearing down any existing baked state.
+        if (_baked != null)
+        {
+            _baked.Dispose();
+            _baked = null;
+            _bakedGeometry = null;
+        }
+        // Force the GPU TransformMatrix animation to be re-installed once
+        // (the signature comparison in ApplyBakedTransformAnimation will
+        // not match because the transform node identity changed).
+        _bakedInstalledTransform = null;
+
+        // Drive the GPU TransformMatrix from the supplied tree so the
+        // compositor renders exactly what the bake assumes.
+        if (_root != null && RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph)
+        {
+            ApplyBakedTransformAnimation();
+        }
+    }
+
+    private void ApplyBakedTransformAnimation()
+    {
+        if (_root is null || _transformNode is null || _host is null) return;
+        var w = (float)_host.ActualWidth;
+        var h = (float)_host.ActualHeight;
+        if (w <= 0 || h <= 0) return;
+
+        // Idempotent guard: only (re)install when transform identity OR
+        // host size changed. Reinstalling a TransformMatrix animation per
+        // frame leaks composition objects and crashes the app.
+        if (ReferenceEquals(_bakedInstalledTransform, _transformNode)
+            && _bakedInstalledW == w && _bakedInstalledH == h)
+        {
+            return;
+        }
+
+        _root.Size = new Vector2(w, h);
+        _root.StopAnimation("TransformMatrix");
+
+        // Compose toOrigin * userRotation * fromOrigin so the user-supplied
+        // transformNode is interpreted as a rotation around the host center,
+        // matching the convention used elsewhere in the renderer.
+        var toOriginM = Matrix4x4.CreateTranslation(-w / 2f, -h / 2f, 0);
+        var fromOriginM = Matrix4x4.CreateTranslation(w / 2f, h / 2f, 0);
+        Matrix4x4Node centered = (Matrix4x4Node)toOriginM * _transformNode * (Matrix4x4Node)fromOriginM;
+
+        _root.StartAnimation("TransformMatrix", centered);
+        _bakedInstalledTransform = _transformNode;
+        _bakedInstalledW = w;
+        _bakedInstalledH = h;
+    }
+
     private void OnRenderingModeChanged()
     {
         if (_dualTree != null)
@@ -753,6 +886,13 @@ public sealed class Combobulate : Control
             _dualTree.Dispose();
             _dualTree = null;
         }
+        if (_baked != null)
+        {
+            _baked.Dispose();
+            _baked = null;
+            _bakedGeometry = null;
+        }
+        _bakedInstalledTransform = null;
         if (_root != null) _root.Children.RemoveAll();
         _spritePool = null;
         _spritePoolGeometry = null;
@@ -1095,6 +1235,61 @@ public sealed class Combobulate : Control
         var scale = (float)ModelScale;
         var hostW = (float)(_host?.ActualWidth ?? 0);
         var hostH = (float)(_host?.ActualHeight ?? 0);
+
+        // ---- BakedAspectGraph path ----
+        // Active when SetTransformAnimation has been called and we have a
+        // valid host size. The bake is one-shot per (geometry/scale/host/
+        // algorithm/secondary-input) signature; thereafter per-frame UI
+        // cost is zero.
+        if (RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph
+            && _transformNode is not null && _primaryAxisNode is not null
+            && hostW > 0 && hostH > 0)
+        {
+            // Make sure the GPU transform animation is in place.
+            ApplyBakedTransformAnimation();
+
+            bool needRebake = _baked == null
+                || !ReferenceEquals(_bakedGeometry, geometry)
+                || _bakedScale != scale
+                || _bakedHostW != hostW
+                || _bakedHostH != hostH
+                || _bakedAlgorithm != SortAlgorithm;
+            if (needRebake)
+            {
+                if (_baked != null) { _baked.Dispose(); _baked = null; }
+                _baked = new global::Combobulate.Rendering.BakedAspectGraphRenderer(_compositor, _root);
+                var bakedResolved = MaterialResolver.Resolve(_compositor, geometry, pack);
+                _baked.Bake(
+                    transformNode: _transformNode,
+                    primaryAxis: _primaryAxisNode,
+                    primaryAxisPeriod: _primaryAxisPeriod,
+                    geometry: geometry,
+                    bindings: bakedResolved,
+                    scale: scale,
+                    hostW: hostW,
+                    hostH: hostH,
+                    cullMarginCos: ComputeCullMarginCos(),
+                    cameraDistance: ComputeSortCameraDistance(scale),
+                    sortAlgorithm: SortAlgorithm);
+                _bakedGeometry = geometry;
+                _bakedScale = scale;
+                _bakedHostW = hostW;
+                _bakedHostH = hostH;
+                _bakedAlgorithm = SortAlgorithm;
+            }
+            else
+            {
+                // Geometry/host unchanged — throttled secondary-input check.
+                long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                long elapsedMs = (nowTicks - _lastMaybeRebakeTicks) * 1000 / System.Diagnostics.Stopwatch.Frequency;
+                if (elapsedMs >= 100)
+                {
+                    _lastMaybeRebakeTicks = nowTicks;
+                    _baked!.MaybeRebake();
+                }
+            }
+            return;
+        }
 
         // ---- DualTreeAtomicSwap path ----
         // Active only when the host wired up SetSpinYawSource AND we have a

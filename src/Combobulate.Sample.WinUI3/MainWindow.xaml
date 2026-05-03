@@ -49,6 +49,13 @@
                 <ComboBoxItem Content="Newell"/>
                 <ComboBoxItem Content="Topological"/>
             </ComboBox>
+            <ComboBox x:Name="RenderingModeBox"
+                      SelectionChanged="RenderingModeBox_SelectionChanged"
+                      ToolTipService.ToolTip="Rendering pipeline. SpritePainter (default): per-frame UI-thread sort, vulnerable to GPU/CPU clock drift. DualTreeAtomicSwap: predictive two-tree swap via opacity expression. BakedAspectGraph: pre-bake every constant-order interval at setup, drive opacity entirely from compositor expression — zero per-frame UI work, no drift possible by construction.">
+                <ComboBoxItem Content="SpritePainter" IsSelected="True"/>
+                <ComboBoxItem Content="DualTreeAtomicSwap"/>
+                <ComboBoxItem Content="BakedAspectGraph"/>
+            </ComboBox>
             <ToggleSwitch x:Name="ExternalRotationToggle"
                           OnContent="External (composition)"
                           OffContent="Internal (control DPs)"

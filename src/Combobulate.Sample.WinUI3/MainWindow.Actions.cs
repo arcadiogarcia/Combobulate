@@ -192,7 +192,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
   ""type"": ""object"",
   ""required"": [""mode""],
   ""properties"": {
-    ""mode"": { ""type"": ""string"", ""enum"": [""SpritePainter"", ""DualTreeAtomicSwap""] }
+    ""mode"": { ""type"": ""string"", ""enum"": [""SpritePainter"", ""DualTreeAtomicSwap"", ""BakedAspectGraph""] }
   }
 }"),
     };

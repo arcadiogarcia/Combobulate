@@ -19,6 +19,7 @@
     <Compile Include="..\..\src\Combobulate\Parsing\*.cs" LinkBase="Parsing" />
     <Compile Include="..\..\src\Combobulate\Sorting\*.cs" LinkBase="Sorting" />
     <Compile Include="..\..\src\Combobulate\Diagnostics\*.cs" LinkBase="Diagnostics" />
+    <Compile Include="..\..\src\Combobulate\Rendering\AspectGraphBake.cs" LinkBase="Rendering" />
     <!-- Caching depends on Windows.UI types via ObjMaterial/ObjTextureSource; we only need
          CachedQuad + ObjGeometry for the sorter tests. Pull in just what's safe (those two
          live in ObjGeometry.cs and don't reference Windows.UI). -->
