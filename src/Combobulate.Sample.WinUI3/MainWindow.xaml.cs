@@ -724,21 +724,21 @@ public sealed partial class MainWindow : Window
             var rotation = rotZ * rotX * rotY;
 
             // Three live input axes covering the full 3-D rotation space.
-            // Sample counts are deliberately conservative: each cell becomes
-            // a ContainerVisual whose Opacity is driven by an
-            // ExpressionAnimation evaluated on the compositor every frame.
-            // Total expressions = product of samples; keep this <≈1000 to
-            // avoid compositor-thread saturation that manifests as visible
-            // hitching during spin.
-            //   - composedYaw: 0..360°, periodic, 16 samples (22.5° per slab)
-            //   - pitchVal:    -180..180°, non-periodic, 8 samples (45° per slab)
-            //   - rollVal:     -180..180°, non-periodic, 8 samples (45° per slab)
-            // Total grid: 16 × 8 × 8 = 1024 cells.
+            // Sample counts give cell granularity; finer = more correct
+            // painter sort at extreme angles, at the cost of more cells.
+            // Materialisation is chunked across UI ticks (32 cells/tick)
+            // so even thousands of cells don't block the UI thread, and
+            // old trees stay visible during the bake — no perceptible
+            // freeze regardless of cell count.
+            //   - composedYaw: 0..360°, periodic, 24 samples (15°/slab)
+            //   - pitchVal:    -180..180°, non-periodic, 12 samples (30°/slab)
+            //   - rollVal:     -180..180°, non-periodic, 12 samples (30°/slab)
+            // Total grid: 24 × 12 × 12 = 3456 cells.
             var axes = new[]
             {
-                global::Combobulate.Rendering.TransformAnimationAxis.FullCircleDeg(composedYaw, samples: 16),
-                new global::Combobulate.Rendering.TransformAnimationAxis(pitchVal, min: -180f, length: 360f, periodic: false, samples: 8),
-                new global::Combobulate.Rendering.TransformAnimationAxis(rollVal,  min: -180f, length: 360f, periodic: false, samples: 8),
+                global::Combobulate.Rendering.TransformAnimationAxis.FullCircleDeg(composedYaw, samples: 24),
+                new global::Combobulate.Rendering.TransformAnimationAxis(pitchVal, min: -180f, length: 360f, periodic: false, samples: 12),
+                new global::Combobulate.Rendering.TransformAnimationAxis(rollVal,  min: -180f, length: 360f, periodic: false, samples: 12),
             };
 
             combobulate.SetTransformAnimation(rotation, axes);

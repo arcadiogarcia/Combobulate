@@ -894,6 +894,19 @@ public sealed class Combobulate : Control
 
         if (_root != null && RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph)
         {
+            // Mode-switch hygiene: any SpritePainter / DualTree visuals
+            // that were parented to _root before BakedAspectGraph took
+            // over MUST be cleared here, otherwise they sit under the
+            // bake's per-cell ContainerVisuals at Opacity=1 and the
+            // compositor renders them as ghost geometry beneath the
+            // (mostly-Opacity=0) bake. Found via DumpBakedAspectGraph
+            // dump showing parent.Children.Count = _trees.Length + 6
+            // (6 cube faces from the SpritePainter pool).
+            _root.Children.RemoveAll();
+            _spritePool = null;
+            _spritePoolGeometry = null;
+            _lastVisible = null;
+            _lastOrder = Array.Empty<int>();
             ApplyBakedTransformAnimation();
         }
         // Trigger a rebuild so Update enters the BakedAspectGraph dispatch
@@ -1238,6 +1251,27 @@ public sealed class Combobulate : Control
             result[i] = s != null && s.IsVisible;
         }
         return result;
+    }
+
+    /// <summary>
+    /// Diagnostic: produces a human-readable report of the BakedAspectGraph
+    /// renderer's state — cell count, _root.Children leak count, current
+    /// axis live values, and which cell(s) the compositor currently has at
+    /// non-zero opacity. Returns an explanatory string when the renderer is
+    /// inactive.
+    /// </summary>
+    public string GetBakedAspectGraphDiagnostics()
+    {
+        if (_baked == null) return "BakedAspectGraph: renderer is null (mode not active or not yet baked).";
+        if (_transformAxes == null) return "BakedAspectGraph: transform axes not configured.";
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Combobulate.BakedAspectGraph diagnostics:");
+        sb.AppendLine($"  RenderingMode={RenderingMode}");
+        sb.AppendLine($"  _root.Size={_root?.Size}");
+        sb.AppendLine($"  host ActualSize=({_host?.ActualWidth},{_host?.ActualHeight})");
+        sb.AppendLine($"  bakedHost=({_bakedHostW},{_bakedHostH}) bakedScale={_bakedScale}");
+        sb.Append(_baked.GetDiagnosticReport(_transformAxes, _transformNode));
+        return sb.ToString();
     }
 
     /// <summary>Stops the auto-refresh loop installed by <see cref="EnableAutoRefresh"/>.</summary>

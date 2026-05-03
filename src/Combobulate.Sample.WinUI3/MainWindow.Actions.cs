@@ -195,6 +195,10 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
     ""mode"": { ""type"": ""string"", ""enum"": [""SpritePainter"", ""DualTreeAtomicSwap"", ""BakedAspectGraph""] }
   }
 }"),
+        new ActionDescriptor(
+            name: "DumpBakedAspectGraph",
+            description: "Diagnostic dump of the BakedAspectGraph renderer's current state: cell count, _root.Children leak count, current axis live values, and which children currently have non-zero Opacity. Writes to LocalState/debug-artifacts/baked-aspect-state.txt and returns the same content inline.",
+            parameterSchema: @"{ ""type"": ""object"", ""properties"": {} }"),
     };
 
     public IReadOnlyList<ActionDescriptor> GetAvailableActions() => _actions;
@@ -234,6 +238,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             case "ClearAtomicSwapTest": return RunOnUi(ClearAtomicSwapTest);
             case "RunBspBoundaryEquivalenceTest": return DispatchRunBspBoundaryEquivalenceTestAsync(parametersJson);
             case "SetRenderingMode": return DispatchSetRenderingModeAsync(parametersJson);
+            case "DumpBakedAspectGraph": return DispatchDumpBakedAspectGraphAsync();
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -379,6 +384,36 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
         if (!dq.TryEnqueue(DispatcherQueuePriority.Normal, () =>
         {
             try { tcs.SetResult(ActionResult.Ok(DumpSpinDiagnosticsLines(lastN))); }
+            catch (Exception ex) { tcs.SetResult(ActionResult.Fail("execution_error", ex.Message)); }
+        }))
+        {
+            tcs.SetResult(ActionResult.Fail("execution_error", "Failed to enqueue UI work."));
+        }
+        return tcs.Task;
+    }
+
+    private Task<ActionResult> DispatchDumpBakedAspectGraphAsync()
+    {
+        var tcs = new TaskCompletionSource<ActionResult>();
+        var dq = this.DispatcherQueue;
+        if (!dq.TryEnqueue(DispatcherQueuePriority.Normal, () =>
+        {
+            try
+            {
+                string report = combobulate?.GetBakedAspectGraphDiagnostics() ?? "(combobulate is null)";
+                try
+                {
+                    var dir = System.IO.Path.Combine(
+                        Windows.Storage.ApplicationData.Current.LocalFolder.Path,
+                        "debug-artifacts");
+                    System.IO.Directory.CreateDirectory(dir);
+                    var path = System.IO.Path.Combine(dir, "baked-aspect-state.txt");
+                    System.IO.File.WriteAllText(path, report);
+                }
+                catch { /* still return inline */ }
+                var lines = report.Split('\n');
+                tcs.SetResult(ActionResult.Ok(lines));
+            }
             catch (Exception ex) { tcs.SetResult(ActionResult.Fail("execution_error", ex.Message)); }
         }))
         {
