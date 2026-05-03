@@ -424,6 +424,10 @@ public sealed class Combobulate : Control
         // jump that looks "wrong" until the next slider tick recovers.
         if (ReferenceEquals(_externalRotationExpression, rotationDegrees)) return;
         _externalRotationExpression = rotationDegrees;
+        // BakedAspectGraph owns _root.TransformMatrix via the typed AST,
+        // so don't install a competing ExpressionAnimation. Just record
+        // the expression so future mode switches can restore it.
+        if (IsBakedAspectGraphActive()) return;
         TryStartExternalRotationAnimation();
     }
 
@@ -1031,6 +1035,9 @@ public sealed class Combobulate : Control
     /// <param name="rotationDegrees">Current rotation as (X = pitch, Y = yaw, Z = roll), in degrees.</param>
     public void RebuildForExternalRotation(Vector3 rotationDegrees)
     {
+        // BakedAspectGraph owns rotation entirely via the typed AST + GPU
+        // expression; the legacy CPU rotation matrix path does nothing.
+        if (IsBakedAspectGraphActive()) return;
         const float deg2rad = MathF.PI / 180f;
         // Capture the composed yaw (degrees) the host computed for THIS frame.
         // The dual-tree renderer needs this exact value to choose which yaw
@@ -1289,9 +1296,124 @@ public sealed class Combobulate : Control
 
     private void Rebuild() => Rebuild(GetRotationMatrix());
 
+    /// <summary>
+    /// True when BakedAspectGraph mode owns the rendering pipeline. In
+    /// this state Combobulate's legacy per-frame Update path, the
+    /// SpritePainter pool, the dual-tree renderer, and the external-rotation
+    /// composition animations are all suppressed: the bake fully owns
+    /// _root.TransformMatrix and the visual tree, and the only ongoing
+    /// work is the BakedAspectGraphRenderer's own background bake +
+    /// materialise. This guard prevents accidental per-frame UI thread
+    /// activity (e.g. EnableAutoRefresh ticks, slider-driven rebuild
+    /// requests) from racing the bake's primary-axis LiveValueProvider
+    /// overrides and freezing the compositor.
+    /// </summary>
+    private bool IsBakedAspectGraphActive() =>
+        RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph
+        && _transformNode is not null
+        && _transformAxes is not null;
+
+    /// <summary>
+    /// Idempotent update for the BakedAspectGraph path: ensures the GPU
+    /// transform animation is installed, kicks off an async bake if any
+    /// stable input changed (geometry, scale, host size, sort algorithm,
+    /// or — when not currently baking — a probed secondary input). Safe
+    /// to call from any UI-thread entry point; per-call cost is one set
+    /// of cheap field comparisons plus, occasionally, a few AST evaluates
+    /// for the secondary-input probe (throttled to once per 150ms).
+    /// </summary>
+    private void UpdateBakeIfNeeded()
+    {
+        if (!IsBakedAspectGraphActive()) return;
+        if (_compositor == null || _root == null) return;
+        var hostW = (float)(_host?.ActualWidth ?? 0);
+        var hostH = (float)(_host?.ActualHeight ?? 0);
+        if (hostW <= 0 || hostH <= 0) return;
+
+        var model = Model;
+        if (model == null || model.Quads.Count == 0) return;
+
+        ApplyBakedTransformAnimation();
+
+        var geometry = ObjCache.ForModel(model);
+        ObjMaterialPack? pack = null;
+        if (MaterialMode != MaterialMode.UseFallback)
+        {
+            pack = Materials
+                ?? (_sourceKey != null ? ObjCache.TryGetMaterials(_sourceKey) : null);
+            if (pack == null && model.MaterialLibraries.Count > 0)
+            {
+                try { pack = ObjCache.GetOrLoadMtlForModel(model, _sourceDirectory); }
+                catch { pack = null; }
+            }
+            if (pack != null && MaterialMode == MaterialMode.UseDiffuse)
+                pack = StripTextures(pack);
+        }
+        var scale = (float)ModelScale;
+
+        // Detect when secondary inputs (anything in the AST other than the
+        // primary axes) have changed since the last bake. Throttled and
+        // skipped while a bake is in flight to avoid racing the background
+        // task on shared primary-axis LiveValueProviders.
+        bool secondaryChanged = false;
+        long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        long elapsedMs = _baked != null
+            ? (nowTicks - _lastSecondaryProbeTicks) * 1000 / System.Diagnostics.Stopwatch.Frequency
+            : long.MaxValue;
+        if (_baked != null && !_baked.BakeInFlight && elapsedMs >= 150)
+        {
+            _lastSecondaryProbeTicks = nowTicks;
+            secondaryChanged = SecondaryProbeChanged();
+        }
+
+        bool needRebake = _baked == null
+            || !ReferenceEquals(_bakedGeometry, geometry)
+            || _bakedScale != scale
+            || _bakedHostW != hostW
+            || _bakedHostH != hostH
+            || _bakedAlgorithm != SortAlgorithm
+            || secondaryChanged;
+        if (_baked != null && _baked.BakeInFlight) needRebake = false;
+        if (!needRebake) return;
+
+        if (_baked == null)
+        {
+            _baked = new global::Combobulate.Rendering.BakedAspectGraphRenderer(_compositor, _root);
+        }
+        var bakedResolved = MaterialResolver.Resolve(_compositor, geometry, pack);
+        _baked.RequestBake(
+            transformNode: _transformNode!,
+            axes: _transformAxes!,
+            geometry: geometry,
+            bindings: bakedResolved,
+            scale: scale,
+            hostW: hostW,
+            hostH: hostH,
+            cullMarginCos: ComputeCullMarginCos(),
+            cameraDistance: ComputeSortCameraDistance(scale),
+            sortAlgorithm: SortAlgorithm);
+        _bakedGeometry = geometry;
+        _bakedScale = scale;
+        _bakedHostW = hostW;
+        _bakedHostH = hostH;
+        _bakedAlgorithm = SortAlgorithm;
+        CaptureSecondaryProbe();
+    }
+
     private void Rebuild(Matrix4x4 rotation)
     {
         if (_compositor == null || _root == null) return;
+
+        // BakedAspectGraph short-circuit: when the typed transform owns
+        // the visual tree, the legacy Rebuild path (SpritePainter pool,
+        // DualTree renderer, external-rotation TransformMatrix install,
+        // per-frame painter sort) does nothing. The bake schedules its
+        // own work via Combobulate.UpdateBakeIfNeeded.
+        if (IsBakedAspectGraphActive())
+        {
+            UpdateBakeIfNeeded();
+            return;
+        }
 
         var model = Model;
         if (model == null || model.Quads.Count == 0)
@@ -1333,79 +1455,13 @@ public sealed class Combobulate : Control
         var hostH = (float)(_host?.ActualHeight ?? 0);
 
         // ---- BakedAspectGraph path ----
-        // Active when SetTransformAnimation has been called and we have a
-        // valid host size. The bake is one-shot per (geometry/scale/host/
-        // algorithm/secondary-input) signature; thereafter per-frame UI
-        // cost is zero.
-        if (RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph
-            && _transformNode is not null && _transformAxes is not null
-            && hostW > 0 && hostH > 0)
+        // Already handled by UpdateBakeIfNeeded called from the
+        // IsBakedAspectGraphActive() short-circuit above. This branch is
+        // kept only as a safety net if Update is called via a path that
+        // bypasses that guard (e.g. early lifecycle); it just delegates.
+        if (IsBakedAspectGraphActive() && hostW > 0 && hostH > 0)
         {
-            // Make sure the GPU transform animation is in place.
-            ApplyBakedTransformAnimation();
-
-            // Detect when secondary inputs (anything in the AST other than
-            // primary axes) have changed since the last bake. Probe by
-            // overriding all primary axes to known fixed values and
-            // sampling the transform matrix; if the result differs from
-            // the snapshot taken at last bake, rebake. Throttle to once
-            // per ~150ms so this stays cheap during fast slider drags.
-            // Also skip while a bake is in flight: the bake thread is
-            // currently overriding the same primary-axis LiveValueProviders
-            // we'd write to, and racing them produces garbage matrices /
-            // freezes.
-            bool secondaryChanged = false;
-            long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-            long elapsedMs = _baked != null
-                ? (nowTicks - _lastSecondaryProbeTicks) * 1000 / System.Diagnostics.Stopwatch.Frequency
-                : long.MaxValue;
-            if (_baked != null && !_baked.BakeInFlight && elapsedMs >= 150)
-            {
-                _lastSecondaryProbeTicks = nowTicks;
-                secondaryChanged = SecondaryProbeChanged();
-            }
-
-            bool needRebake = _baked == null
-                || !ReferenceEquals(_bakedGeometry, geometry)
-                || _bakedScale != scale
-                || _bakedHostW != hostW
-                || _bakedHostH != hostH
-                || _bakedAlgorithm != SortAlgorithm
-                || secondaryChanged;
-            // Don't kick off another bake while one is already in flight —
-            // we'd cancel it for nothing and block on the same primary-axis
-            // LiveValueProvider state. The Update loop will retry.
-            if (_baked != null && _baked.BakeInFlight) needRebake = false;
-            if (needRebake)
-            {
-                if (_baked == null)
-                {
-                    _baked = new global::Combobulate.Rendering.BakedAspectGraphRenderer(_compositor, _root);
-                }
-                var bakedResolved = MaterialResolver.Resolve(_compositor, geometry, pack);
-                // Async bake: returns immediately. Compute runs on the
-                // thread pool; materialisation hops back to the UI thread
-                // when complete. While in flight, the previously-baked
-                // trees stay visible (or, on first bake, the SpritePainter
-                // path renders below).
-                _baked.RequestBake(
-                    transformNode: _transformNode,
-                    axes: _transformAxes,
-                    geometry: geometry,
-                    bindings: bakedResolved,
-                    scale: scale,
-                    hostW: hostW,
-                    hostH: hostH,
-                    cullMarginCos: ComputeCullMarginCos(),
-                    cameraDistance: ComputeSortCameraDistance(scale),
-                    sortAlgorithm: SortAlgorithm);
-                _bakedGeometry = geometry;
-                _bakedScale = scale;
-                _bakedHostW = hostW;
-                _bakedHostH = hostH;
-                _bakedAlgorithm = SortAlgorithm;
-                CaptureSecondaryProbe();
-            }
+            UpdateBakeIfNeeded();
             return;
         }
 
