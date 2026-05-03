@@ -290,4 +290,137 @@ public class AspectGraphBakeTests
         Assert.True(newellCells.Length >= 4);
         Assert.True(topoCells.Length >= 4);
     }
+
+    [Fact]
+    public void MultiAxis_TwoAxisCellsContainSampledSignatures()
+    {
+        // For each baked cell, sample a point inside it (the center) and
+        // verify that the painter signature at that point matches the
+        // cell's recorded signature.
+        var geometry = TestGeometries.UnitCube();
+        var sorter = FaceSorterFactory.Create(SortAlgorithm.Bsp, geometry);
+
+        var axes = new[]
+        {
+            new AspectGraphBake.AxisSweep(0f, 360f, samples: 16, periodic: true),
+            new AspectGraphBake.AxisSweep(-60f, 120f, samples: 8, periodic: false),
+        };
+        var cells = AspectGraphBake.BakeMultiAxis(
+            sorter, geometry,
+            input => EulerDegToRotation(input[0], input[1], 0f),
+            axes);
+
+        int q = geometry.Quads.Length;
+        var orderBuf = new int[q];
+        var visBuf = new bool[q];
+        foreach (var c in cells)
+        {
+            float yawMid = 0.5f * (c.Lo[0] + c.Hi[0]);
+            float pitchMid = 0.5f * (c.Lo[1] + c.Hi[1]);
+            int n = sorter.Sort(EulerDegToRotation(yawMid, pitchMid, 0f), orderBuf, visBuf);
+            Assert.Equal(c.Order.Length, n);
+            for (int i = 0; i < n; i++) Assert.Equal(c.Order[i], orderBuf[i]);
+            for (int i = 0; i < q; i++) Assert.Equal(c.Visibility[i], visBuf[i]);
+        }
+    }
+
+    [Fact]
+    public void MultiAxis_TotalAreaEqualsInputBoxArea()
+    {
+        // The cells partition the input box, so the sum of their per-cell
+        // 2-D areas equals the input box area.
+        var geometry = TestGeometries.UnitCube();
+        var sorter = FaceSorterFactory.Create(SortAlgorithm.Bsp, geometry);
+
+        var axes = new[]
+        {
+            new AspectGraphBake.AxisSweep(0f, 360f, samples: 12, periodic: true),
+            new AspectGraphBake.AxisSweep(-90f, 180f, samples: 6, periodic: false),
+        };
+        var cells = AspectGraphBake.BakeMultiAxis(
+            sorter, geometry,
+            input => EulerDegToRotation(input[0], input[1], 0f),
+            axes);
+
+        double sumArea = 0.0;
+        foreach (var c in cells)
+        {
+            sumArea += (double)(c.Hi[0] - c.Lo[0]) * (c.Hi[1] - c.Lo[1]);
+        }
+        double expectedArea = (double)axes[0].Length * axes[1].Length;
+        // Floating-point grid arithmetic; allow 1% slack.
+        Assert.InRange(sumArea, expectedArea * 0.999, expectedArea * 1.001);
+    }
+
+    [Fact]
+    public void MultiAxis_ThreeAxisProducesExpectedCellCountForCube()
+    {
+        // 3-axis (yaw, pitch, roll) bake of a cube should produce a number
+        // of cells well below the worst case (12 * 6 * 6 = 432), since
+        // many adjacent grid samples will share signatures and merge.
+        var geometry = TestGeometries.UnitCube();
+        var sorter = FaceSorterFactory.Create(SortAlgorithm.Bsp, geometry);
+        var axes = new[]
+        {
+            new AspectGraphBake.AxisSweep(0f, 360f, samples: 12, periodic: true),
+            new AspectGraphBake.AxisSweep(-90f, 180f, samples: 6, periodic: false),
+            new AspectGraphBake.AxisSweep(-180f, 360f, samples: 6, periodic: true),
+        };
+        var cells = AspectGraphBake.BakeMultiAxis(
+            sorter, geometry,
+            input => EulerDegToRotation(input[0], input[1], input[2]),
+            axes);
+
+        Assert.NotEmpty(cells);
+        Assert.True(cells.Length <= 12 * 6 * 6);
+    }
+
+    [Fact]
+    public void MultiAxis_EveryGridSampleHitsExactlyOneCell()
+    {
+        // Sample a finer grid than the bake used and ensure each sample
+        // hits exactly one cell — the partition should be valid not just
+        // at bake-grid centers but everywhere inside the input box.
+        var geometry = TestGeometries.UnitCube();
+        var sorter = FaceSorterFactory.Create(SortAlgorithm.Bsp, geometry);
+        var axes = new[]
+        {
+            new AspectGraphBake.AxisSweep(0f, 360f, samples: 12, periodic: true),
+            new AspectGraphBake.AxisSweep(-60f, 120f, samples: 6, periodic: false),
+        };
+        var cells = AspectGraphBake.BakeMultiAxis(
+            sorter, geometry,
+            input => EulerDegToRotation(input[0], input[1], 0f),
+            axes);
+
+        for (int yi = 0; yi < 50; yi++)
+            for (int pi = 0; pi < 25; pi++)
+            {
+                float y = axes[0].Min + (yi + 0.5f) * (axes[0].Length / 50f);
+                float p = axes[1].Min + (pi + 0.5f) * (axes[1].Length / 25f);
+                int hits = 0;
+                foreach (var c in cells)
+                {
+                    if (y >= c.Lo[0] && y < c.Hi[0] && p >= c.Lo[1] && p < c.Hi[1]) hits++;
+                }
+                Assert.True(hits == 1, $"(y={y},p={p}) hit {hits} cells");
+            }
+    }
+
+    [Fact]
+    public void OneAxis_NonZeroAxisMin_BakeUsesLocalCoordinates()
+    {
+        // BakeOneAxis takes evaluate(v) where v ∈ [0, period). The renderer
+        // is responsible for translating to absolute axis-input space; the
+        // bake itself produces cells with bounds in [0, period). Verify
+        // that property explicitly.
+        var geometry = TestGeometries.UnitCube();
+        var sorter = FaceSorterFactory.Create(SortAlgorithm.Bsp, geometry);
+        var cells = AspectGraphBake.BakeOneAxis(sorter, geometry, YawDegToRotation, period: 360f);
+        foreach (var c in cells)
+        {
+            Assert.True(c.Lo >= 0 && c.Lo < 360f, $"Lo {c.Lo} out of bake-local range");
+            Assert.True(c.Hi >= 0 && c.Hi <= 360f + 0.01f, $"Hi {c.Hi} out of bake-local range");
+        }
+    }
 }

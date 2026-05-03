@@ -10,58 +10,33 @@ using CompositionExpressions;
 namespace Combobulate.Rendering;
 
 /// <summary>
-/// Analytical "aspect-graph" renderer driven by a typed transform expression
-/// tree (<see cref="Matrix4x4Node"/>). The caller hands Combobulate the
-/// transform AST and identifies which scalar leaf is the periodic "primary"
-/// input (typically an animated yaw scalar in degrees). At setup the
-/// renderer:
+/// Analytical "aspect-graph" renderer. The caller supplies a typed
+/// <see cref="Matrix4x4Node"/> describing the model transform, plus a list
+/// of <see cref="TransformAnimationAxis"/> entries identifying every live
+/// scalar input the AST depends on. At setup the renderer:
 ///
-/// <list type="number">
-///   <item>Sweeps the primary axis across <c>[0, period)</c> with the
-///         primary's <c>LiveValueProvider</c> overridden to return each
-///         sweep value, then evaluates the AST on the UI thread via
-///         <see cref="Matrix4x4Node.Evaluate"/> to obtain the same
-///         <see cref="Matrix4x4"/> the GPU will produce. The matrix is
-///         fed to the configured <see cref="IFaceSorter"/>; every adjacent
-///         yaw pair whose painter signature differs is bisected to find
-///         the exact breakpoint.</item>
+/// <list type="bullet">
+///   <item>Compiles <c>transformNode</c> via <c>ToExpressionString()</c>
+///         and starts that animation on <c>_root.TransformMatrix</c>, so
+///         the GPU paints the same transform the bake reasoned about.</item>
+///   <item>Sweeps the supplied axes (1-D = bisection, 2+D = regular grid)
+///         while overriding each axis's <c>LiveValueProvider</c> so
+///         <c>transformNode.Evaluate()</c> returns the same matrix the
+///         GPU will produce for those input values. The configured
+///         <see cref="IFaceSorter"/> runs at every sample to compute the
+///         painter signature.</item>
 ///   <item>Pre-builds one <c>ContainerVisual</c> per constant-painter-order
-///         cell, populated with sprites in that cell's painter order, with
-///         per-quad <see cref="Visual.IsVisible"/> applied. Each container
-///         starts an <see cref="ExpressionAnimation"/> on its
-///         <see cref="Visual.Opacity"/> built from the same primary-axis
-///         subtree the caller passed, so the references carried by the
-///         primary subtree (slider props, KFAs, trackers...) are correctly
-///         threaded.</item>
+///         cell with sprites already in painter order. Each container's
+///         <c>Opacity</c> is driven by an <c>ExpressionAnimation</c> that
+///         tests whether the live axis values fall inside this cell's
+///         axis-aligned box (modulo the periodic axes).</item>
 /// </list>
 ///
-/// <para>The runtime cost per frame is zero: the compositor evaluates the
-/// rotation expression and all opacity expressions on its own thread. The
-/// only ongoing CPU job is to detect when "secondary" inputs (everything
-/// in the AST other than the primary axis) change, at which point we
-/// trigger a rebake via <see cref="MaybeRebake"/>. By construction
-/// revolution N is bit-identical to revolution 1 because both reference
-/// the same K cells indexed by the same expression.</para>
+/// <para>After bake, the runtime is pure compositor work: zero CPU per
+/// frame, no clock drift possible by construction.</para>
 /// </summary>
 internal sealed class BakedAspectGraphRenderer : IDisposable
 {
-    /// <summary>How many initial samples to take across one yaw period.</summary>
-    private const int CoarseSamples = 720; // 0.5° step
-
-    /// <summary>Bisection terminates when the bracket is below this width (degrees).</summary>
-    private const float BisectEpsilonDeg = 1e-3f;
-
-    /// <summary>Maximum bisection iterations before accepting current bracket.</summary>
-    private const int MaxBisectIterations = 24;
-
-    /// <summary>
-    /// Probe yaws used to detect secondary inputs changing between bakes.
-    /// Spread enough that any non-trivial change in any other input
-    /// (pitch, roll, slider, perspective distance, ...) flips at least
-    /// one element of at least one probe matrix.
-    /// </summary>
-    private static readonly float[] SecondaryProbePrimaryYaws = { 0f, 73f, 137f, 211f, 293f };
-
     private readonly Compositor _compositor;
     private readonly ContainerVisual _parent;
 
@@ -69,14 +44,12 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
 
     // Bake inputs / cached state
     private Matrix4x4Node? _transformNode;
-    private ScalarNode? _primaryAxis;
-    private float _period;
+    private TransformAnimationAxis[]? _axes;
     private ObjGeometry? _bakedGeometry;
     private ResolvedQuadMaterials? _bakedBindings;
     private float _bakedScale, _bakedHostW, _bakedHostH;
     private float _bakedCullMarginCos, _bakedCameraDistance;
     private SortAlgorithm _bakedAlgorithm;
-    private Matrix4x4[]? _secondaryProbes;
 
     public BakedAspectGraphRenderer(Compositor compositor, ContainerVisual parent)
     {
@@ -86,10 +59,10 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
 
     public int CellCount => _trees?.Length ?? 0;
 
+    /// <summary>Bake K cells using either bisection (1-axis) or grid (N-axis).</summary>
     public int Bake(
         Matrix4x4Node transformNode,
-        ScalarNode primaryAxis,
-        float primaryAxisPeriod,
+        TransformAnimationAxis[] axes,
         ObjGeometry geometry,
         ResolvedQuadMaterials bindings,
         float scale,
@@ -99,13 +72,13 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         float cameraDistance,
         SortAlgorithm sortAlgorithm)
     {
-        if (primaryAxisPeriod <= 0) throw new ArgumentOutOfRangeException(nameof(primaryAxisPeriod));
+        if (axes is null || axes.Length == 0)
+            throw new ArgumentException("At least one axis required.", nameof(axes));
 
         DisposeTrees();
 
         _transformNode = transformNode;
-        _primaryAxis = primaryAxis;
-        _period = primaryAxisPeriod;
+        _axes = axes;
         _bakedGeometry = geometry;
         _bakedBindings = bindings;
         _bakedScale = scale;
@@ -117,109 +90,165 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
 
         var sorter = FaceSorterFactory.Create(sortAlgorithm, geometry);
 
-        // Override the primary axis's UI-thread provider so tree.Evaluate()
-        // returns the matrix at our chosen sweep yaw. Always restore on exit.
-        var sweepYaw = 0f;
-        primaryAxis.SetLiveValueProvider(() => sweepYaw);
+        // Override each axis's UI-thread provider; restore on completion.
+        var sweep = new float[axes.Length];
+        for (int i = 0; i < axes.Length; i++)
+        {
+            int idx = i;
+            axes[i].Scalar.SetLiveValueProvider(() => sweep[idx]);
+        }
 
         try
         {
-            // Delegate the bake math to the pure-CPU helper so the algorithm
-            // is exercised by the test project (which can't reference the
-            // renderer due to Composition deps).
-            var cells = AspectGraphBake.BakeOneAxis(
-                sorter,
-                geometry,
-                yaw =>
-                {
-                    sweepYaw = yaw;
-                    return transformNode.Evaluate();
-                },
-                primaryAxisPeriod,
-                cullMarginCos,
-                cameraDistance);
-
-            _trees = new ContainerVisual[cells.Length];
-            for (int i = 0; i < _trees.Length; i++)
+            if (axes.Length == 1)
             {
-                var c = cells[i];
-                var tree = _compositor.CreateContainerVisual();
-                BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Order, c.Visibility);
-                InstallOpacityExpression(tree, primaryAxis, primaryAxisPeriod, c.Lo, c.Hi);
-                _parent.Children.InsertAtTop(tree);
-                _trees[i] = tree;
+                BakeOneAxisInternal(sorter, geometry, bindings, scale, hostW, hostH,
+                    cullMarginCos, cameraDistance, axes[0], transformNode, sweep);
             }
-
-            // Snapshot secondary-input fingerprint.
-            _secondaryProbes = new Matrix4x4[SecondaryProbePrimaryYaws.Length];
-            for (int p = 0; p < SecondaryProbePrimaryYaws.Length; p++)
+            else
             {
-                sweepYaw = SecondaryProbePrimaryYaws[p];
-                _secondaryProbes[p] = transformNode.Evaluate();
+                BakeMultiAxisInternal(sorter, geometry, bindings, scale, hostW, hostH,
+                    cullMarginCos, cameraDistance, axes, transformNode, sweep);
             }
         }
         finally
         {
-            primaryAxis.SetLiveValueProvider(null);
+            for (int i = 0; i < axes.Length; i++)
+                axes[i].Scalar.SetLiveValueProvider(null);
         }
 
         return _trees!.Length;
     }
 
-    /// <summary>
-    /// Re-bake if any non-primary input contributed to the AST has changed
-    /// since the last bake. Returns true iff a re-bake happened.
-    /// </summary>
-    public bool MaybeRebake()
+    private void BakeOneAxisInternal(
+        IFaceSorter sorter,
+        ObjGeometry geometry,
+        ResolvedQuadMaterials bindings,
+        float scale, float hostW, float hostH,
+        float cullMarginCos, float cameraDistance,
+        TransformAnimationAxis axis,
+        Matrix4x4Node transformNode,
+        float[] sweep)
     {
-        if (_transformNode is null || _primaryAxis is null || _secondaryProbes is null) return false;
-        if (!SecondaryInputsChanged()) return false;
+        var cells = AspectGraphBake.BakeOneAxis(
+            sorter, geometry,
+            v =>
+            {
+                sweep[0] = axis.Min + v;   // shift coarse-sweep [0, Length) to axis input space
+                return transformNode.Evaluate();
+            },
+            axis.Length,
+            cullMarginCos,
+            cameraDistance);
 
-        Bake(
-            _transformNode,
-            _primaryAxis,
-            _period,
-            _bakedGeometry!,
-            _bakedBindings!,
-            _bakedScale,
-            _bakedHostW,
-            _bakedHostH,
-            _bakedCullMarginCos,
-            _bakedCameraDistance,
-            _bakedAlgorithm);
-        return true;
+        _trees = new ContainerVisual[cells.Length];
+        for (int i = 0; i < _trees.Length; i++)
+        {
+            var c = cells[i];
+            var tree = _compositor.CreateContainerVisual();
+            BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Order, c.Visibility);
+            // Translate relative-bounds back to absolute axis-input space.
+            float lo = axis.Min + c.Lo;
+            float hi = axis.Min + c.Hi;
+            tree.StartAnimation("Opacity",
+                BuildAxisInCellExpression(new[] { axis }, new[] { lo }, new[] { hi }));
+            _parent.Children.InsertAtTop(tree);
+            _trees[i] = tree;
+        }
     }
 
-    private bool SecondaryInputsChanged()
+    private void BakeMultiAxisInternal(
+        IFaceSorter sorter,
+        ObjGeometry geometry,
+        ResolvedQuadMaterials bindings,
+        float scale, float hostW, float hostH,
+        float cullMarginCos, float cameraDistance,
+        TransformAnimationAxis[] axes,
+        Matrix4x4Node transformNode,
+        float[] sweep)
     {
-        if (_transformNode is null || _primaryAxis is null || _secondaryProbes is null) return false;
-        var sweepYaw = 0f;
-        _primaryAxis.SetLiveValueProvider(() => sweepYaw);
-        try
-        {
-            for (int p = 0; p < SecondaryProbePrimaryYaws.Length; p++)
+        var bakeAxes = new AspectGraphBake.AxisSweep[axes.Length];
+        for (int i = 0; i < axes.Length; i++)
+            bakeAxes[i] = new AspectGraphBake.AxisSweep(axes[i].Min, axes[i].Length, axes[i].Samples, axes[i].Periodic);
+
+        var cells = AspectGraphBake.BakeMultiAxis(
+            sorter, geometry,
+            input =>
             {
-                sweepYaw = SecondaryProbePrimaryYaws[p];
-                var current = _transformNode.Evaluate();
-                if (current != _secondaryProbes[p]) return true;
-            }
-        }
-        finally
+                Array.Copy(input, sweep, axes.Length);
+                return transformNode.Evaluate();
+            },
+            bakeAxes,
+            cullMarginCos,
+            cameraDistance);
+
+        _trees = new ContainerVisual[cells.Length];
+        for (int i = 0; i < _trees.Length; i++)
         {
-            _primaryAxis.SetLiveValueProvider(null);
+            var c = cells[i];
+            var tree = _compositor.CreateContainerVisual();
+            BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Order, c.Visibility);
+            tree.StartAnimation("Opacity",
+                BuildAxisInCellExpression(axes, c.Lo, c.Hi));
+            _parent.Children.InsertAtTop(tree);
+            _trees[i] = tree;
         }
-        return false;
+    }
+
+    /// <summary>
+    /// Build a typed opacity expression that returns 1 iff the live axes
+    /// fall inside the supplied [lo, hi) box (per-axis, AND-ed across all
+    /// axes). Periodic axes are wrapped mod Length before the test.
+    /// </summary>
+    private static ScalarNode BuildAxisInCellExpression(
+        TransformAnimationAxis[] axes, float[] lo, float[] hi)
+    {
+        BooleanNode? acc = null;
+        for (int i = 0; i < axes.Length; i++)
+        {
+            var axis = axes[i];
+            ScalarNode raw = axis.Scalar - (ScalarNode)axis.Min;
+            ScalarNode normRange;
+            if (axis.Periodic)
+            {
+                // (scalar - min) - floor((scalar - min)/Length) * Length, gives [0, Length).
+                ScalarNode ratio = raw / (ScalarNode)axis.Length;
+                normRange = raw - ExpressionFunctions.Floor(ratio) * (ScalarNode)axis.Length;
+            }
+            else
+            {
+                normRange = raw;
+            }
+
+            float relLo = lo[i] - axis.Min;
+            float relHi = hi[i] - axis.Min;
+            BooleanNode test;
+            if (axis.Periodic && relHi <= relLo)
+            {
+                // Wrap cell: [relLo, Length) ∪ [0, relHi).
+                test = ExpressionFunctions.Or(
+                    normRange >= (ScalarNode)relLo,
+                    normRange < (ScalarNode)relHi);
+            }
+            else
+            {
+                test = ExpressionFunctions.And(
+                    normRange >= (ScalarNode)relLo,
+                    normRange < (ScalarNode)relHi);
+            }
+
+            acc = acc is null ? test : ExpressionFunctions.And(acc, test);
+        }
+
+        return ExpressionFunctions.Conditional(acc!, (ScalarNode)1f, (ScalarNode)0f);
     }
 
     private void BuildTreeContent(
         ContainerVisual tree,
         ObjGeometry geometry,
         ResolvedQuadMaterials bindings,
-        float scale,
-        float hostW,
-        float hostH,
-        int[] order,
-        bool[] visibility)
+        float scale, float hostW, float hostH,
+        int[] order, bool[] visibility)
     {
         var origin = new Vector3(hostW / 2f, hostH / 2f, 0);
         var quads = geometry.Quads;
@@ -244,50 +273,12 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             sprite.IsVisible = visibility[q];
             sprites[q] = sprite;
         }
-
         for (int i = 0; i < order.Length; i++)
         {
             int qi = order[i];
             if (!visibility[qi]) continue;
             tree.Children.InsertAtTop(sprites[qi]);
         }
-    }
-
-    /// <summary>
-    /// Build a typed opacity expression for this cell from the same primary
-    /// axis subtree the rotation expression uses, then start it on the
-    /// tree's <see cref="Visual.Opacity"/>.
-    /// </summary>
-    private void InstallOpacityExpression(
-        ContainerVisual tree,
-        ScalarNode primaryAxis,
-        float period,
-        float lo,
-        float hi)
-    {
-        // ScalarNode has implicit conversion from float, so we can write
-        // bound checks using ordinary literals.
-        ScalarNode periodNode = period;
-        var ratio = primaryAxis / periodNode;
-        var yawN = ratio - ExpressionFunctions.Floor(ratio);
-
-        ScalarNode loN = lo / period;
-        ScalarNode hiN = hi / period;
-
-        BooleanNode inCell;
-        if (hi > lo)
-        {
-            inCell = ExpressionFunctions.And(yawN >= loN, yawN < hiN);
-        }
-        else
-        {
-            // Wraparound: [loN, 1) ∪ [0, hiN).
-            inCell = ExpressionFunctions.Or(yawN >= loN, yawN < hiN);
-        }
-
-        ScalarNode opacity = ExpressionFunctions.Conditional(inCell, (ScalarNode)1f, (ScalarNode)0f);
-
-        tree.StartAnimation("Opacity", opacity);
     }
 
     public void Dispose()

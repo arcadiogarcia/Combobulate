@@ -735,8 +735,7 @@ public sealed class Combobulate : Control
     // ---- BakedAspectGraph: typed transform animation state ----
     // Set via SetTransformAnimation; consumed when RenderingMode == BakedAspectGraph.
     private Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node? _transformNode;
-    private Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode? _primaryAxisNode;
-    private float _primaryAxisPeriod = 360f;
+    private global::Combobulate.Rendering.TransformAnimationAxis[]? _transformAxes;
     // Snapshot of (transformNode, hostW, hostH) for which the GPU
     // TransformMatrix animation has been installed. Avoids reinstalling
     // the animation every Update tick (which leaked composition objects
@@ -744,11 +743,6 @@ public sealed class Combobulate : Control
     private Matrix4x4Node? _bakedInstalledTransform;
     private float _bakedInstalledW;
     private float _bakedInstalledH;
-    // Stopwatch ticks of the last MaybeRebake check. We throttle to once
-    // per ~100ms so the bake's secondary-input probe (which Evaluates the
-    // AST 5 times via cross-thread property reads) doesn't run at vsync
-    // frequency and starve the UI thread.
-    private long _lastMaybeRebakeTicks;
 
     /// <summary>
     /// Wires up the rotation property set whose animated yaw scalar drives
@@ -816,35 +810,43 @@ public sealed class Combobulate : Control
     /// </summary>
     public void SetTransformAnimation(
         Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node transformNode,
-        Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode primaryAxis,
-        float primaryAxisPeriod = 360f)
+        global::Combobulate.Rendering.TransformAnimationAxis[] axes)
     {
         if (transformNode is null) throw new ArgumentNullException(nameof(transformNode));
-        if (primaryAxis is null) throw new ArgumentNullException(nameof(primaryAxis));
-        if (primaryAxisPeriod <= 0) throw new ArgumentOutOfRangeException(nameof(primaryAxisPeriod));
+        if (axes is null || axes.Length == 0) throw new ArgumentException("At least one axis required.", nameof(axes));
 
         _transformNode = transformNode;
-        _primaryAxisNode = primaryAxis;
-        _primaryAxisPeriod = primaryAxisPeriod;
+        _transformAxes = axes;
 
-        // Force a rebake on next Update by tearing down any existing baked state.
         if (_baked != null)
         {
             _baked.Dispose();
             _baked = null;
             _bakedGeometry = null;
         }
-        // Force the GPU TransformMatrix animation to be re-installed once
-        // (the signature comparison in ApplyBakedTransformAnimation will
-        // not match because the transform node identity changed).
         _bakedInstalledTransform = null;
 
-        // Drive the GPU TransformMatrix from the supplied tree so the
-        // compositor renders exactly what the bake assumes.
         if (_root != null && RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph)
         {
             ApplyBakedTransformAnimation();
         }
+    }
+
+    /// <summary>
+    /// Single-axis convenience overload of
+    /// <see cref="SetTransformAnimation(Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node, Combobulate.Rendering.TransformAnimationAxis[])"/>.
+    /// Equivalent to passing one axis with the given period and full periodic flag.
+    /// </summary>
+    public void SetTransformAnimation(
+        Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node transformNode,
+        Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode primaryAxis,
+        float primaryAxisPeriod = 360f)
+    {
+        if (primaryAxis is null) throw new ArgumentNullException(nameof(primaryAxis));
+        SetTransformAnimation(
+            transformNode,
+            new[] { new global::Combobulate.Rendering.TransformAnimationAxis(
+                primaryAxis, min: 0f, length: primaryAxisPeriod, periodic: true) });
     }
 
     private void ApplyBakedTransformAnimation()
@@ -1242,7 +1244,7 @@ public sealed class Combobulate : Control
         // algorithm/secondary-input) signature; thereafter per-frame UI
         // cost is zero.
         if (RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph
-            && _transformNode is not null && _primaryAxisNode is not null
+            && _transformNode is not null && _transformAxes is not null
             && hostW > 0 && hostH > 0)
         {
             // Make sure the GPU transform animation is in place.
@@ -1261,8 +1263,7 @@ public sealed class Combobulate : Control
                 var bakedResolved = MaterialResolver.Resolve(_compositor, geometry, pack);
                 _baked.Bake(
                     transformNode: _transformNode,
-                    primaryAxis: _primaryAxisNode,
-                    primaryAxisPeriod: _primaryAxisPeriod,
+                    axes: _transformAxes,
                     geometry: geometry,
                     bindings: bakedResolved,
                     scale: scale,
@@ -1276,17 +1277,6 @@ public sealed class Combobulate : Control
                 _bakedHostW = hostW;
                 _bakedHostH = hostH;
                 _bakedAlgorithm = SortAlgorithm;
-            }
-            else
-            {
-                // Geometry/host unchanged — throttled secondary-input check.
-                long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-                long elapsedMs = (nowTicks - _lastMaybeRebakeTicks) * 1000 / System.Diagnostics.Stopwatch.Frequency;
-                if (elapsedMs >= 100)
-                {
-                    _lastMaybeRebakeTicks = nowTicks;
-                    _baked!.MaybeRebake();
-                }
             }
             return;
         }

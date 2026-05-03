@@ -689,9 +689,7 @@ public sealed partial class MainWindow : Window
 
         if (newMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph)
         {
-            // Build a typed Matrix4x4Node that mirrors what the rotation
-            // ExpressionAnimation in GetOrCreateExternalRotation() / Combobulate's
-            // internal rotation pipeline computes:
+            // Build a typed Matrix4x4Node mirroring the rotation pipeline:
             //   composedYaw = YawVal + SpinActive * SpinYaw
             //   R = RotZ(RollVal) * RotX(PitchVal) * RotY(composedYaw)
             // Combobulate auto-wraps R in toOrigin*R*fromOrigin so we don't
@@ -713,9 +711,19 @@ public sealed partial class MainWindow : Window
                 ExpressionFunctions.Vector3(0f, 1f, 0f), composedYaw * D2R);
             var rotation = rotZ * rotX * rotY;
 
-            // Drive the Combobulate control with the typed rotation tree;
-            // `composedYaw` is the periodic primary axis (degrees, period 360).
-            combobulate.SetTransformAnimation(rotation, composedYaw, 360f);
+            // Three live input axes: composedYaw (full circle), pitch
+            // (slider range -180..180), roll (slider range -180..180). Yaw
+            // sweeps a full periodic 360° so the spin animation lives
+            // entirely inside the bake; pitch and roll are non-periodic
+            // slider inputs whose live values are tested directly.
+            var axes = new[]
+            {
+                global::Combobulate.Rendering.TransformAnimationAxis.FullCircleDeg(composedYaw, samples: 36),
+                new global::Combobulate.Rendering.TransformAnimationAxis(pitchVal, min: -180f, length: 360f, periodic: false, samples: 18),
+                new global::Combobulate.Rendering.TransformAnimationAxis(rollVal,  min: -180f, length: 360f, periodic: false, samples: 18),
+            };
+
+            combobulate.SetTransformAnimation(rotation, axes);
         }
     }
     private static string? ResolveSamplePath(string fileName)
