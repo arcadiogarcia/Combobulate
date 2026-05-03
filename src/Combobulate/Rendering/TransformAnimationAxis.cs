@@ -41,7 +41,7 @@ public sealed class TransformAnimationAxis
         float min,
         float length,
         bool periodic,
-        int samples = 24)
+        int samples = 12)
     {
         if (scalar is null) throw new ArgumentNullException(nameof(scalar));
         if (length <= 0f) throw new ArgumentOutOfRangeException(nameof(length));
@@ -55,6 +55,6 @@ public sealed class TransformAnimationAxis
 
     /// <summary>Convenience: construct a 0..360° periodic yaw/pitch/roll
     /// axis from the supplied scalar.</summary>
-    public static TransformAnimationAxis FullCircleDeg(ScalarNode scalar, int samples = 36)
+    public static TransformAnimationAxis FullCircleDeg(ScalarNode scalar, int samples = 12)
         => new TransformAnimationAxis(scalar, min: 0f, length: 360f, periodic: true, samples: samples);
 }

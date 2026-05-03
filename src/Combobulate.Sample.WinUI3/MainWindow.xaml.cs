@@ -711,16 +711,19 @@ public sealed partial class MainWindow : Window
                 ExpressionFunctions.Vector3(0f, 1f, 0f), composedYaw * D2R);
             var rotation = rotZ * rotX * rotY;
 
-            // Three live input axes: composedYaw (full circle), pitch
-            // (slider range -180..180), roll (slider range -180..180). Yaw
-            // sweeps a full periodic 360° so the spin animation lives
-            // entirely inside the bake; pitch and roll are non-periodic
-            // slider inputs whose live values are tested directly.
+            // Three live input axes covering the full 3-D rotation space:
+            // - composedYaw: 0..360°, periodic, 24 samples (15° per slab)
+            // - pitchVal:    -180..180°, non-periodic, 12 samples (30° per slab)
+            // - rollVal:     -180..180°, non-periodic, 12 samples (30° per slab)
+            // Total grid: 24 × 12 × 12 = 3456 sort+evaluate calls. Bake
+            // runs on a background thread (~hundreds of ms for a cube),
+            // then materialises on the UI thread. While in flight, the
+            // last-rendered cell set stays visible.
             var axes = new[]
             {
-                global::Combobulate.Rendering.TransformAnimationAxis.FullCircleDeg(composedYaw, samples: 36),
-                new global::Combobulate.Rendering.TransformAnimationAxis(pitchVal, min: -180f, length: 360f, periodic: false, samples: 18),
-                new global::Combobulate.Rendering.TransformAnimationAxis(rollVal,  min: -180f, length: 360f, periodic: false, samples: 18),
+                global::Combobulate.Rendering.TransformAnimationAxis.FullCircleDeg(composedYaw, samples: 24),
+                new global::Combobulate.Rendering.TransformAnimationAxis(pitchVal, min: -180f, length: 360f, periodic: false, samples: 12),
+                new global::Combobulate.Rendering.TransformAnimationAxis(rollVal,  min: -180f, length: 360f, periodic: false, samples: 12),
             };
 
             combobulate.SetTransformAnimation(rotation, axes);

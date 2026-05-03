@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using Combobulate.Caching;
 using Combobulate.Parsing;
+using CompositionExpressions;
 using Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork;
 
 #if WINAPPSDK
@@ -743,6 +745,66 @@ public sealed class Combobulate : Control
     private Matrix4x4Node? _bakedInstalledTransform;
     private float _bakedInstalledW;
     private float _bakedInstalledH;
+    // Secondary-input change detection: snapshots of the transform matrix
+    // sampled at known primary-axis probe points captured during the last
+    // bake. Compared against fresh probes (throttled) on each Update tick.
+    private Matrix4x4[]? _secondaryProbeSnapshots;
+    private long _lastSecondaryProbeTicks;
+    private static readonly float[] s_secondaryProbeFractions = { 0.0f, 0.27f, 0.61f };
+
+    private void CaptureSecondaryProbe()
+    {
+        if (_transformNode is null || _transformAxes is null || _transformAxes.Length == 0)
+        {
+            _secondaryProbeSnapshots = null;
+            return;
+        }
+        _secondaryProbeSnapshots = SampleSecondaryProbe();
+    }
+
+    private bool SecondaryProbeChanged()
+    {
+        if (_secondaryProbeSnapshots is null) return false;
+        var fresh = SampleSecondaryProbe();
+        if (fresh.Length != _secondaryProbeSnapshots.Length) return true;
+        for (int i = 0; i < fresh.Length; i++)
+        {
+            if (fresh[i] != _secondaryProbeSnapshots[i]) return true;
+        }
+        return false;
+    }
+
+    private Matrix4x4[] SampleSecondaryProbe()
+    {
+        // For each fraction f in [0,1), set every primary axis to its
+        // (Min + f * Length) value and Evaluate. Captures how the
+        // transform's "fixed" inputs (everything not in _transformAxes)
+        // contribute by overriding the dynamic ones.
+        var axes = _transformAxes!;
+        var sweep = new float[axes.Length];
+        for (int i = 0; i < axes.Length; i++)
+        {
+            int idx = i;
+            axes[i].Scalar.SetLiveValueProvider(() => sweep[idx]);
+        }
+        try
+        {
+            var probes = new Matrix4x4[s_secondaryProbeFractions.Length];
+            for (int p = 0; p < probes.Length; p++)
+            {
+                float f = s_secondaryProbeFractions[p];
+                for (int i = 0; i < axes.Length; i++)
+                    sweep[i] = axes[i].Min + f * axes[i].Length;
+                probes[p] = _transformNode!.Evaluate();
+            }
+            return probes;
+        }
+        finally
+        {
+            for (int i = 0; i < axes.Length; i++)
+                axes[i].Scalar.SetLiveValueProvider(null);
+        }
+    }
 
     /// <summary>
     /// Wires up the rotation property set whose animated yaw scalar drives
@@ -830,6 +892,35 @@ public sealed class Combobulate : Control
         {
             ApplyBakedTransformAnimation();
         }
+    }
+
+    /// <summary>
+    /// Convenience overload: auto-discover live scalar inputs by walking
+    /// <paramref name="transformNode"/>'s AST and treating every property-
+    /// reference scalar leaf as a full-circle (0..360°) periodic axis with
+    /// 24 grid samples. Callers needing custom ranges, periodicity, or
+    /// sample counts should use the explicit-axes overload.
+    /// </summary>
+    public void SetTransformAnimation(
+        Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node transformNode)
+    {
+        if (transformNode is null) throw new ArgumentNullException(nameof(transformNode));
+        var leaves = CompositionExpressions.LiveValueOverride
+            .EnumerateAnimatableScalarLeaves(transformNode)
+            .ToArray();
+        if (leaves.Length == 0)
+        {
+            throw new ArgumentException(
+                "transformNode contains no animatable scalar leaves; baked aspect graph cannot be built. " +
+                "Reference at least one CompositionPropertySet scalar from the expression.",
+                nameof(transformNode));
+        }
+        var axes = new global::Combobulate.Rendering.TransformAnimationAxis[leaves.Length];
+        for (int i = 0; i < leaves.Length; i++)
+        {
+            axes[i] = global::Combobulate.Rendering.TransformAnimationAxis.FullCircleDeg(leaves[i]);
+        }
+        SetTransformAnimation(transformNode, axes);
     }
 
     /// <summary>
@@ -1250,18 +1341,43 @@ public sealed class Combobulate : Control
             // Make sure the GPU transform animation is in place.
             ApplyBakedTransformAnimation();
 
+            // Detect when secondary inputs (anything in the AST other than
+            // primary axes) have changed since the last bake. Probe by
+            // overriding all primary axes to known fixed values and
+            // sampling the transform matrix; if the result differs from
+            // the snapshot taken at last bake, rebake. Throttle to once
+            // per ~150ms so this stays cheap during fast slider drags.
+            bool secondaryChanged = false;
+            long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            long elapsedMs = _baked != null
+                ? (nowTicks - _lastSecondaryProbeTicks) * 1000 / System.Diagnostics.Stopwatch.Frequency
+                : long.MaxValue;
+            if (_baked != null && elapsedMs >= 150)
+            {
+                _lastSecondaryProbeTicks = nowTicks;
+                secondaryChanged = SecondaryProbeChanged();
+            }
+
             bool needRebake = _baked == null
                 || !ReferenceEquals(_bakedGeometry, geometry)
                 || _bakedScale != scale
                 || _bakedHostW != hostW
                 || _bakedHostH != hostH
-                || _bakedAlgorithm != SortAlgorithm;
+                || _bakedAlgorithm != SortAlgorithm
+                || secondaryChanged;
             if (needRebake)
             {
-                if (_baked != null) { _baked.Dispose(); _baked = null; }
-                _baked = new global::Combobulate.Rendering.BakedAspectGraphRenderer(_compositor, _root);
+                if (_baked == null)
+                {
+                    _baked = new global::Combobulate.Rendering.BakedAspectGraphRenderer(_compositor, _root);
+                }
                 var bakedResolved = MaterialResolver.Resolve(_compositor, geometry, pack);
-                _baked.Bake(
+                // Async bake: returns immediately. Compute runs on the
+                // thread pool; materialisation hops back to the UI thread
+                // when complete. While in flight, the previously-baked
+                // trees stay visible (or, on first bake, the SpritePainter
+                // path renders below).
+                _baked.RequestBake(
                     transformNode: _transformNode,
                     axes: _transformAxes,
                     geometry: geometry,
@@ -1277,6 +1393,7 @@ public sealed class Combobulate : Control
                 _bakedHostW = hostW;
                 _bakedHostH = hostH;
                 _bakedAlgorithm = SortAlgorithm;
+                CaptureSecondaryProbe();
             }
             return;
         }

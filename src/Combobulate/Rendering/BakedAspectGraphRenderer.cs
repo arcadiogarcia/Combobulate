@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.UI.Composition;
 using Combobulate.Caching;
 using Combobulate.Sorting;
@@ -11,29 +13,31 @@ namespace Combobulate.Rendering;
 
 /// <summary>
 /// Analytical "aspect-graph" renderer. The caller supplies a typed
-/// <see cref="Matrix4x4Node"/> describing the model transform, plus a list
+/// <see cref="Matrix4x4Node"/> describing the model transform plus a list
 /// of <see cref="TransformAnimationAxis"/> entries identifying every live
-/// scalar input the AST depends on. At setup the renderer:
+/// scalar input the AST depends on. The renderer:
 ///
 /// <list type="bullet">
-///   <item>Compiles <c>transformNode</c> via <c>ToExpressionString()</c>
-///         and starts that animation on <c>_root.TransformMatrix</c>, so
-///         the GPU paints the same transform the bake reasoned about.</item>
-///   <item>Sweeps the supplied axes (1-D = bisection, 2+D = regular grid)
-///         while overriding each axis's <c>LiveValueProvider</c> so
-///         <c>transformNode.Evaluate()</c> returns the same matrix the
-///         GPU will produce for those input values. The configured
-///         <see cref="IFaceSorter"/> runs at every sample to compute the
-///         painter signature.</item>
-///   <item>Pre-builds one <c>ContainerVisual</c> per constant-painter-order
-///         cell with sprites already in painter order. Each container's
-///         <c>Opacity</c> is driven by an <c>ExpressionAnimation</c> that
-///         tests whether the live axis values fall inside this cell's
-///         axis-aligned box (modulo the periodic axes).</item>
+///   <item>Runs the bake compute (sweeping the axes, evaluating the AST,
+///         and running the painter sorter at every sample) on a background
+///         thread so the UI stays responsive even when the input space is
+///         large (3-axis rotation can mean thousands of evaluations).</item>
+///   <item>Materialises one <see cref="ContainerVisual"/> per painter
+///         cell on the UI thread once compute completes, with sprites
+///         already in painter order. Each container's <c>Opacity</c> is
+///         driven by an <see cref="ExpressionAnimation"/> that tests
+///         whether the live axis values fall inside the cell's box (per
+///         axis, AND-ed, periodic axes wrapped in-expression).</item>
 /// </list>
 ///
+/// <para>While compute is in flight the renderer keeps the previously-
+/// baked trees visible (so the user keeps seeing a valid render),
+/// scheduling at most one bake at a time and discarding stale results.</para>
+///
 /// <para>After bake, the runtime is pure compositor work: zero CPU per
-/// frame, no clock drift possible by construction.</para>
+/// frame. By construction, revolutions of any periodic axis are bit-
+/// identical because the same K cells are referenced via the same
+/// expression every revolution.</para>
 /// </summary>
 internal sealed class BakedAspectGraphRenderer : IDisposable
 {
@@ -42,7 +46,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
 
     private ContainerVisual[]? _trees;
 
-    // Bake inputs / cached state
+    // Cached bake inputs (so MaybeRebake / completion callbacks can compare).
     private Matrix4x4Node? _transformNode;
     private TransformAnimationAxis[]? _axes;
     private ObjGeometry? _bakedGeometry;
@@ -51,16 +55,35 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
     private float _bakedCullMarginCos, _bakedCameraDistance;
     private SortAlgorithm _bakedAlgorithm;
 
+    // Background-thread bake coordination. _bakeGeneration is bumped by
+    // the UI thread on every fresh bake request; the background task
+    // checks the generation when it completes and discards its result if
+    // the world has moved on.
+    private int _bakeGeneration;
+    private CancellationTokenSource? _bakeCts;
+
+    /// <summary>
+    /// Set whenever a bake request is in flight; UI-thread <c>Update</c>
+    /// reads this to decide whether to skip starting another bake.
+    /// </summary>
+    public bool BakeInFlight => _bakeCts != null;
+
+    public int CellCount => _trees?.Length ?? 0;
+
     public BakedAspectGraphRenderer(Compositor compositor, ContainerVisual parent)
     {
         _compositor = compositor;
         _parent = parent;
     }
 
-    public int CellCount => _trees?.Length ?? 0;
-
-    /// <summary>Bake K cells using either bisection (1-axis) or grid (N-axis).</summary>
-    public int Bake(
+    /// <summary>
+    /// Begin a fresh bake. The compute runs on the thread pool;
+    /// materialisation happens on the UI thread when compute completes,
+    /// scheduled via <see cref="DispatcherQueue.GetForCurrentThread"/>.
+    /// Returns immediately. If a previous bake is still in flight, it is
+    /// cancelled.
+    /// </summary>
+    public void RequestBake(
         Matrix4x4Node transformNode,
         TransformAnimationAxis[] axes,
         ObjGeometry geometry,
@@ -75,8 +98,6 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         if (axes is null || axes.Length == 0)
             throw new ArgumentException("At least one axis required.", nameof(axes));
 
-        DisposeTrees();
-
         _transformNode = transformNode;
         _axes = axes;
         _bakedGeometry = geometry;
@@ -88,9 +109,74 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         _bakedCameraDistance = cameraDistance;
         _bakedAlgorithm = sortAlgorithm;
 
+        // Cancel any in-flight bake; bump generation so the previous one's
+        // completion callback (if it raced past cancellation) sees a stale
+        // generation and bails out.
+        _bakeCts?.Cancel();
+        _bakeCts = new CancellationTokenSource();
+        var ct = _bakeCts.Token;
+        int myGeneration = ++_bakeGeneration;
+
+        // Capture the UI dispatcher so we can hop back for materialisation.
+        var ui = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                ComputedBake computed = ComputeBake(transformNode, axes, geometry,
+                    cullMarginCos, cameraDistance, sortAlgorithm, ct);
+
+                if (ct.IsCancellationRequested) return;
+
+                // Hop back to UI thread to materialise.
+                ui.TryEnqueue(() =>
+                {
+                    // Discard if the world has moved on.
+                    if (myGeneration != _bakeGeneration) return;
+                    if (ct.IsCancellationRequested) return;
+
+                    Materialise(computed, geometry, bindings, scale, hostW, hostH, axes);
+                    _bakeCts?.Dispose();
+                    _bakeCts = null;
+                });
+            }
+            catch (OperationCanceledException) { /* normal */ }
+            catch
+            {
+                // Diagnostics belong in the host's logging; we don't want a
+                // background-thread exception to take the app down.
+            }
+        }, ct);
+    }
+
+    /// <summary>Pure-CPU phase: produces one <see cref="CellSig"/> per cell.</summary>
+    private struct CellSig
+    {
+        public float[] Lo;
+        public float[] Hi;
+        public int[] Order;
+        public bool[] Visibility;
+    }
+
+    private struct ComputedBake { public CellSig[] Cells; }
+
+    /// <summary>Background-thread compute: sweep axes + sort. No Composition deps.</summary>
+    private static ComputedBake ComputeBake(
+        Matrix4x4Node transformNode,
+        TransformAnimationAxis[] axes,
+        ObjGeometry geometry,
+        float cullMarginCos,
+        float cameraDistance,
+        SortAlgorithm sortAlgorithm,
+        CancellationToken ct)
+    {
         var sorter = FaceSorterFactory.Create(sortAlgorithm, geometry);
 
-        // Override each axis's UI-thread provider; restore on completion.
+        // Override each axis's UI-thread provider to read from a shared
+        // sweep array. The Evaluate() walk reads the override on each
+        // matching leaf — same-thread reads, no cross-thread compositor
+        // call, fast.
         var sweep = new float[axes.Length];
         for (int i = 0; i < axes.Length; i++)
         {
@@ -100,106 +186,92 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
 
         try
         {
+            CellSig[] cellSigs;
             if (axes.Length == 1)
             {
-                BakeOneAxisInternal(sorter, geometry, bindings, scale, hostW, hostH,
-                    cullMarginCos, cameraDistance, axes[0], transformNode, sweep);
+                var axis = axes[0];
+                var cells = AspectGraphBake.BakeOneAxis(
+                    sorter, geometry,
+                    v =>
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        sweep[0] = axis.Min + v;
+                        return transformNode.Evaluate();
+                    },
+                    axis.Length,
+                    cullMarginCos,
+                    cameraDistance);
+                cellSigs = new CellSig[cells.Length];
+                for (int i = 0; i < cells.Length; i++)
+                {
+                    cellSigs[i] = new CellSig
+                    {
+                        Lo = new[] { axis.Min + cells[i].Lo },
+                        Hi = new[] { axis.Min + cells[i].Hi },
+                        Order = cells[i].Order,
+                        Visibility = cells[i].Visibility,
+                    };
+                }
             }
             else
             {
-                BakeMultiAxisInternal(sorter, geometry, bindings, scale, hostW, hostH,
-                    cullMarginCos, cameraDistance, axes, transformNode, sweep);
+                var bakeAxes = new AspectGraphBake.AxisSweep[axes.Length];
+                for (int i = 0; i < axes.Length; i++)
+                    bakeAxes[i] = new AspectGraphBake.AxisSweep(axes[i].Min, axes[i].Length, axes[i].Samples, axes[i].Periodic);
+                var cells = AspectGraphBake.BakeMultiAxis(
+                    sorter, geometry,
+                    input =>
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        Array.Copy(input, sweep, axes.Length);
+                        return transformNode.Evaluate();
+                    },
+                    bakeAxes,
+                    cullMarginCos,
+                    cameraDistance);
+                cellSigs = new CellSig[cells.Length];
+                for (int i = 0; i < cells.Length; i++)
+                {
+                    cellSigs[i] = new CellSig
+                    {
+                        Lo = cells[i].Lo,
+                        Hi = cells[i].Hi,
+                        Order = cells[i].Order,
+                        Visibility = cells[i].Visibility,
+                    };
+                }
             }
+            return new ComputedBake { Cells = cellSigs };
         }
         finally
         {
             for (int i = 0; i < axes.Length; i++)
                 axes[i].Scalar.SetLiveValueProvider(null);
         }
-
-        return _trees!.Length;
     }
 
-    private void BakeOneAxisInternal(
-        IFaceSorter sorter,
+    /// <summary>UI-thread phase: materialise cells into Composition trees.</summary>
+    private void Materialise(
+        ComputedBake computed,
         ObjGeometry geometry,
         ResolvedQuadMaterials bindings,
         float scale, float hostW, float hostH,
-        float cullMarginCos, float cameraDistance,
-        TransformAnimationAxis axis,
-        Matrix4x4Node transformNode,
-        float[] sweep)
+        TransformAnimationAxis[] axes)
     {
-        var cells = AspectGraphBake.BakeOneAxis(
-            sorter, geometry,
-            v =>
-            {
-                sweep[0] = axis.Min + v;   // shift coarse-sweep [0, Length) to axis input space
-                return transformNode.Evaluate();
-            },
-            axis.Length,
-            cullMarginCos,
-            cameraDistance);
+        DisposeTrees();
 
-        _trees = new ContainerVisual[cells.Length];
+        _trees = new ContainerVisual[computed.Cells.Length];
         for (int i = 0; i < _trees.Length; i++)
         {
-            var c = cells[i];
+            var c = computed.Cells[i];
             var tree = _compositor.CreateContainerVisual();
             BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Order, c.Visibility);
-            // Translate relative-bounds back to absolute axis-input space.
-            float lo = axis.Min + c.Lo;
-            float hi = axis.Min + c.Hi;
-            tree.StartAnimation("Opacity",
-                BuildAxisInCellExpression(new[] { axis }, new[] { lo }, new[] { hi }));
+            tree.StartAnimation("Opacity", BuildAxisInCellExpression(axes, c.Lo, c.Hi));
             _parent.Children.InsertAtTop(tree);
             _trees[i] = tree;
         }
     }
 
-    private void BakeMultiAxisInternal(
-        IFaceSorter sorter,
-        ObjGeometry geometry,
-        ResolvedQuadMaterials bindings,
-        float scale, float hostW, float hostH,
-        float cullMarginCos, float cameraDistance,
-        TransformAnimationAxis[] axes,
-        Matrix4x4Node transformNode,
-        float[] sweep)
-    {
-        var bakeAxes = new AspectGraphBake.AxisSweep[axes.Length];
-        for (int i = 0; i < axes.Length; i++)
-            bakeAxes[i] = new AspectGraphBake.AxisSweep(axes[i].Min, axes[i].Length, axes[i].Samples, axes[i].Periodic);
-
-        var cells = AspectGraphBake.BakeMultiAxis(
-            sorter, geometry,
-            input =>
-            {
-                Array.Copy(input, sweep, axes.Length);
-                return transformNode.Evaluate();
-            },
-            bakeAxes,
-            cullMarginCos,
-            cameraDistance);
-
-        _trees = new ContainerVisual[cells.Length];
-        for (int i = 0; i < _trees.Length; i++)
-        {
-            var c = cells[i];
-            var tree = _compositor.CreateContainerVisual();
-            BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Order, c.Visibility);
-            tree.StartAnimation("Opacity",
-                BuildAxisInCellExpression(axes, c.Lo, c.Hi));
-            _parent.Children.InsertAtTop(tree);
-            _trees[i] = tree;
-        }
-    }
-
-    /// <summary>
-    /// Build a typed opacity expression that returns 1 iff the live axes
-    /// fall inside the supplied [lo, hi) box (per-axis, AND-ed across all
-    /// axes). Periodic axes are wrapped mod Length before the test.
-    /// </summary>
     private static ScalarNode BuildAxisInCellExpression(
         TransformAnimationAxis[] axes, float[] lo, float[] hi)
     {
@@ -211,7 +283,6 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             ScalarNode normRange;
             if (axis.Periodic)
             {
-                // (scalar - min) - floor((scalar - min)/Length) * Length, gives [0, Length).
                 ScalarNode ratio = raw / (ScalarNode)axis.Length;
                 normRange = raw - ExpressionFunctions.Floor(ratio) * (ScalarNode)axis.Length;
             }
@@ -225,7 +296,6 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             BooleanNode test;
             if (axis.Periodic && relHi <= relLo)
             {
-                // Wrap cell: [relLo, Length) ∪ [0, relHi).
                 test = ExpressionFunctions.Or(
                     normRange >= (ScalarNode)relLo,
                     normRange < (ScalarNode)relHi);
@@ -236,10 +306,8 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
                     normRange >= (ScalarNode)relLo,
                     normRange < (ScalarNode)relHi);
             }
-
             acc = acc is null ? test : ExpressionFunctions.And(acc, test);
         }
-
         return ExpressionFunctions.Conditional(acc!, (ScalarNode)1f, (ScalarNode)0f);
     }
 
@@ -283,6 +351,9 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
 
     public void Dispose()
     {
+        _bakeCts?.Cancel();
+        _bakeCts?.Dispose();
+        _bakeCts = null;
         DisposeTrees();
     }
 
