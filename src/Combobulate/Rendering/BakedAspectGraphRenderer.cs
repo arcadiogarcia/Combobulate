@@ -45,6 +45,13 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
     private readonly ContainerVisual _parent;
 
     private ContainerVisual[]? _trees;
+    // Staging trees from the in-flight bake. They are inserted into
+    // _parent.Children at Opacity=0 as ChunkBuild progresses; on Dispose
+    // (or on stale-generation bail-out) we walk this and remove them so
+    // they don't accumulate as ghost geometry in _root when the bake is
+    // cancelled mid-materialise (e.g. mode-toggle off-and-on).
+    private System.Collections.Generic.List<ContainerVisual>? _stagingTrees;
+    private bool _disposed;
 
     // Cached bake inputs (so MaybeRebake / completion callbacks can compare).
     private Matrix4x4Node? _transformNode;
@@ -309,7 +316,16 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         Microsoft.UI.Dispatching.DispatcherQueue ui,
         int generation)
     {
-        if (generation != _bakeGeneration) return; // stale
+        if (_disposed || generation != _bakeGeneration)
+        {
+            // Stale or disposed: evict any staging visuals we already
+            // parented so they don't become ghost geometry. _trees stays
+            // intact (it's the previously-baked, currently-visible set).
+            EvictStaging();
+            return;
+        }
+
+        if (startIndex == 0) _stagingTrees = new System.Collections.Generic.List<ContainerVisual>(computed.Cells.Length);
 
         int end = Math.Min(startIndex + MaterialiseChunkSize, computed.Cells.Length);
         for (int i = startIndex; i < end; i++)
@@ -325,6 +341,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             newOpacityExprs[i] = BuildAxisInCellExpression(axes, c.Lo, c.Hi);
             _parent.Children.InsertAtTop(tree);
             newTrees[i] = tree;
+            _stagingTrees!.Add(tree);
         }
 
         if (end < computed.Cells.Length)
@@ -338,9 +355,10 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             // Final tick: swap. Stop old animations, drop old trees,
             // then start new opacity animations. The compositor commits
             // these state changes as a single batch on the next vsync.
-            if (generation != _bakeGeneration) return;
+            if (_disposed || generation != _bakeGeneration) { EvictStaging(); return; }
             DisposeTrees();
             _trees = newTrees;
+            _stagingTrees = null;
             for (int i = 0; i < newTrees.Length; i++)
             {
                 newTrees[i].StartAnimation("Opacity", newOpacityExprs[i]);
@@ -523,10 +541,31 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
 
     public void Dispose()
     {
+        _disposed = true;
         _bakeCts?.Cancel();
         _bakeCts?.Dispose();
         _bakeCts = null;
+        // Bump generation so any deferred chunk-build callbacks scheduled
+        // before Dispose see a stale value and bail before parenting more
+        // visuals into _parent.
+        _bakeGeneration++;
+        EvictStaging();
         DisposeTrees();
+    }
+
+    private void EvictStaging()
+    {
+        if (_stagingTrees == null) return;
+        foreach (var t in _stagingTrees)
+        {
+            try
+            {
+                if (_parent.Children.Contains(t)) _parent.Children.Remove(t);
+                t.Dispose();
+            }
+            catch { }
+        }
+        _stagingTrees = null;
     }
 
     private void DisposeTrees()
