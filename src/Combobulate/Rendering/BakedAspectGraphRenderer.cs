@@ -142,10 +142,12 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
                 });
             }
             catch (OperationCanceledException) { /* normal */ }
-            catch
+            catch (Exception ex)
             {
-                // Diagnostics belong in the host's logging; we don't want a
-                // background-thread exception to take the app down.
+                // Don't take the app down on a bake error, but surface the
+                // problem so the user/dev can see it during development.
+                System.Diagnostics.Debug.WriteLine(
+                    $"[BakedAspectGraphRenderer] Bake failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
             }
         }, ct);
     }
@@ -279,32 +281,41 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         for (int i = 0; i < axes.Length; i++)
         {
             var axis = axes[i];
-            ScalarNode raw = axis.Scalar - (ScalarNode)axis.Min;
-            ScalarNode normRange;
+            // Compute the "live" axis value to compare against absolute
+            // [lo, hi). For a periodic axis we wrap into [Min, Min+Length).
+            // Avoid subtracting axis.Min from axis.Scalar directly: when
+            // axis.Min is negative the toolkit emits "(scalar - -180)" which
+            // some Composition expression evaluators reject. Instead add
+            // (-Min) when needed.
+            ScalarNode liveVal;
             if (axis.Periodic)
             {
-                ScalarNode ratio = raw / (ScalarNode)axis.Length;
-                normRange = raw - ExpressionFunctions.Floor(ratio) * (ScalarNode)axis.Length;
+                // shifted = axis.Scalar + (-axis.Min) → maps the live value
+                // into [0, +Length+epsilon). Then normalise mod Length and
+                // shift back: liveVal = wrapped + axis.Min.
+                ScalarNode shifted = axis.Scalar + (ScalarNode)(-axis.Min);
+                ScalarNode ratio = shifted / (ScalarNode)axis.Length;
+                ScalarNode wrapped = shifted - ExpressionFunctions.Floor(ratio) * (ScalarNode)axis.Length;
+                liveVal = wrapped + (ScalarNode)axis.Min;
             }
             else
             {
-                normRange = raw;
+                liveVal = axis.Scalar;
             }
 
-            float relLo = lo[i] - axis.Min;
-            float relHi = hi[i] - axis.Min;
             BooleanNode test;
-            if (axis.Periodic && relHi <= relLo)
+            if (axis.Periodic && hi[i] <= lo[i])
             {
+                // Wrap cell across the periodic boundary.
                 test = ExpressionFunctions.Or(
-                    normRange >= (ScalarNode)relLo,
-                    normRange < (ScalarNode)relHi);
+                    liveVal >= (ScalarNode)lo[i],
+                    liveVal < (ScalarNode)hi[i]);
             }
             else
             {
                 test = ExpressionFunctions.And(
-                    normRange >= (ScalarNode)relLo,
-                    normRange < (ScalarNode)relHi);
+                    liveVal >= (ScalarNode)lo[i],
+                    liveVal < (ScalarNode)hi[i]);
             }
             acc = acc is null ? test : ExpressionFunctions.And(acc, test);
         }
