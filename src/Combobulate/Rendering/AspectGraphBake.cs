@@ -215,14 +215,18 @@ internal static class AspectGraphBake
             sigs[flat] = (ord, (bool[])visBuf.Clone());
         }
 
-        // For each grid cell emit one CellND. The previous greedy adjacency
-        // merge had a subtle bug that produced overlapping cells; we keep
-        // every grid cell separate and rely on the renderer's per-cell
-        // ExpressionAnimation Opacity test to pick exactly one. Memory is
-        // K_yaw * K_pitch * K_roll * Q SpriteVisuals — fine for low-poly
-        // meshes (cube ~ 3456*6 = ~20k sprites at 24x12x12), and the
-        // grid-cell-per-CellND construction is provably gap-free and
-        // overlap-free.
+        // For each grid cell emit one CellND. We deliberately don't merge
+        // adjacent same-signature cells: the merge is only correct if the
+        // BOUNDARY between them also has the same signature, which isn't
+        // guaranteed by sampling at cell centers (a critical yaw can lie
+        // between two centers and flip the BSP tie-break). Without
+        // verifying boundaries, a merged cell can include points that
+        // produce a different painter ordering, which would render a
+        // visibly wrong frame as the user crosses that point. Per-grid-
+        // cell representation is provably gap-free, overlap-free, and
+        // correct at every interior point. Total cell count = product of
+        // axis sample counts; tune by reducing per-axis samples in the
+        // caller.
         var result = new List<CellND>(checked((int)total));
         var idx = new int[axes.Length];
         for (long flat = 0; flat < total; flat++)
