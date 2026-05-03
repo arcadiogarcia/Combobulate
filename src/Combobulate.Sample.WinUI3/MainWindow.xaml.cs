@@ -49,15 +49,35 @@ public sealed partial class MainWindow : Window
         // ValueChanged fires which routes through ApplyRotation.
     }
 
-    private void Rotation_ValueChanged(object sender, RangeBaseValueChangedEventArgs e) => ApplyRotation();
+    // ===== UI re-entrancy guard =====
+    // Programmatic ToggleSwitch.IsOn writes still raise Toggled. Without
+    // this guard, RenderingModeBox_SelectionChanged → ExternalRotationToggle.IsOn=true
+    // → ExternalRotationToggle_Toggled → ApplyRotation runs the LEGACY rotation
+    // pipeline mid-mode-switch, racing the BakedAspectGraph activation that's
+    // still in progress two stack frames up. Held during any composite UI
+    // operation that toggles multiple ToggleSwitches; sub-handlers see the
+    // flag and short-circuit. The outer composite re-runs ApplyRotation /
+    // UpdateAutoRefresh once at the end.
+    private bool _suspendUiHandlers;
+
+    private void Rotation_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
+    {
+        if (_suspendUiHandlers) return;
+        ApplyRotation();
+    }
 
     private void ExternalRotationToggle_Toggled(object sender, RoutedEventArgs e)
     {
+        if (_suspendUiHandlers) return;
         ApplyRotation();
         UpdateAutoRefresh();
     }
 
-    private void AutoRefreshToggle_Toggled(object sender, RoutedEventArgs e) => UpdateAutoRefresh();
+    private void AutoRefreshToggle_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_suspendUiHandlers) return;
+        UpdateAutoRefresh();
+    }
 
     private void ShowSceneVisualToggle_Toggled(object sender, RoutedEventArgs e)
     {
@@ -94,18 +114,26 @@ public sealed partial class MainWindow : Window
     private void SpinToggle_Toggled(object sender, RoutedEventArgs e)
     {
         if (SpinToggle == null) return;
-        if (SpinToggle.IsOn)
+        if (_suspendUiHandlers) return;
+        _suspendUiHandlers = true;
+        try
         {
-            if (ExternalRotationToggle != null && !ExternalRotationToggle.IsOn)
-                ExternalRotationToggle.IsOn = true;
-            if (AutoRefreshToggle != null && !AutoRefreshToggle.IsOn)
-                AutoRefreshToggle.IsOn = true;
-            StartGpuSpin();
+            if (SpinToggle.IsOn)
+            {
+                if (ExternalRotationToggle != null && !ExternalRotationToggle.IsOn)
+                    ExternalRotationToggle.IsOn = true;
+                if (AutoRefreshToggle != null && !AutoRefreshToggle.IsOn)
+                    AutoRefreshToggle.IsOn = true;
+                StartGpuSpin();
+            }
+            else
+            {
+                StopGpuSpin();
+            }
         }
-        else
-        {
-            StopGpuSpin();
-        }
+        finally { _suspendUiHandlers = false; }
+        // Single coalesced reapply at end of composite operation.
+        ApplyRotation();
         UpdateAutoRefresh();
     }
 
@@ -562,24 +590,34 @@ public sealed partial class MainWindow : Window
         var y = (float)YawSlider.Value;
         var z = (float)RollSlider.Value;
         bool external = ExternalRotationToggle?.IsOn == true;
+        bool bag = combobulate.RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph;
 
-        if (external)
+        if (external || bag)
         {
+            // Always materialise the property set so the bake's ScalarNode
+            // references resolve, even if external is implicitly required
+            // by BAG.
             var (props, expr) = GetOrCreateExternalRotation();
-            // Per-axis scalar updates: the composed expression rebuilds the Vector3
-            // on the compositor without any UI-thread Vector3 write. During spin
-            // the YawVal here is the slider base; the GPU KFA on SpinYaw adds the
-            // per-frame delta automatically.
             props.InsertScalar("PitchVal", x);
             props.InsertScalar("YawVal",   y);
             props.InsertScalar("RollVal",  z);
-            combobulate.SetExternalRotation(expr);
-            combobulateSceneVisual.SetExternalRotation(expr);
-            // Wire the spin yaw source for DualTreeAtomicSwap. The closure captures
-            // the LIVE pitch/roll sliders so the rotation matrix the dual-tree
-            // renderer pre-sorts at any composed yaw value matches what the
-            // compositor will paint with for that yaw at this slider state.
-            combobulate.SetSpinYawSource(props, ComposedYawToRotationMatrix);
+
+            if (bag)
+            {
+                // BakedAspectGraph owns _root.TransformMatrix via
+                // SetTransformAnimation; do NOT call SetExternalRotation
+                // (which would reinstall a competing legacy animation
+                // and trigger a SpritePainter rebuild) or SetSpinYawSource
+                // (DualTree-only). The slider values flow into the bake
+                // via the property-set scalars referenced by the typed
+                // Matrix4x4Node AST.
+            }
+            else
+            {
+                combobulate.SetExternalRotation(expr);
+                combobulateSceneVisual.SetExternalRotation(expr);
+                combobulate.SetSpinYawSource(props, ComposedYawToRotationMatrix);
+            }
         }
         else
         {
@@ -588,7 +626,6 @@ public sealed partial class MainWindow : Window
             combobulate.RotationX = x;
             combobulate.RotationY = y;
             combobulate.RotationZ = z;
-            // combobulateSceneVisual mirrors combobulate's rotation via x:Bind.
         }
 #if DEBUG
         LogCurrentRotation();
@@ -678,6 +715,7 @@ public sealed partial class MainWindow : Window
     private void RenderingModeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (combobulate == null) return;
+        if (_suspendUiHandlers) return;
         var label = (RenderingModeBox.SelectedItem as ComboBoxItem)?.Content as string;
         var newMode = label switch
         {
@@ -685,64 +723,66 @@ public sealed partial class MainWindow : Window
             "BakedAspectGraph"   => global::Combobulate.Rendering.RenderingMode.BakedAspectGraph,
             _                    => global::Combobulate.Rendering.RenderingMode.SpritePainter,
         };
-        combobulate.RenderingMode = newMode;
 
-        if (newMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph)
+        _suspendUiHandlers = true;
+        try
         {
-            // BakedAspectGraph reads slider values from the rotation
-            // property set scalars (PitchVal/YawVal/RollVal/SpinYaw/
-            // SpinActive). Force ExternalRotationToggle ON so ApplyRotation
-            // writes slider values into those scalars. Otherwise sliders
-            // route to RotationX/Y/Z DPs which the bake AST does not see,
-            // and the cube renders permanently at the zero-rotation cell.
-            if (ExternalRotationToggle != null && !ExternalRotationToggle.IsOn)
+            // Setting RenderingMode triggers OnRenderingModeChanged inside
+            // Combobulate which disposes any active baked/dual-tree renderer
+            // and clears _root.Children. We do this BEFORE touching the
+            // property set so no legacy ApplyRotation can race with the
+            // mode change.
+            combobulate.RenderingMode = newMode;
+
+            if (newMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph)
             {
-                ExternalRotationToggle.IsOn = true;
+                // BakedAspectGraph reads slider values from the rotation
+                // property set scalars. Force ExternalRotationToggle ON so
+                // the bake's Matrix4x4Node references resolve.
+                if (ExternalRotationToggle != null && !ExternalRotationToggle.IsOn)
+                    ExternalRotationToggle.IsOn = true;
+
+                // Materialise property-set scalars BEFORE building the AST
+                // so GetScalarProperty references resolve cleanly.
+                var (props, _) = GetOrCreateExternalRotation();
+                props.InsertScalar("PitchVal", (float)PitchSlider.Value);
+                props.InsertScalar("YawVal",   (float)YawSlider.Value);
+                props.InsertScalar("RollVal",  (float)RollSlider.Value);
+
+                var pRef = props.GetReference();
+                var pitchVal = pRef.GetScalarProperty("PitchVal");
+                var yawVal   = pRef.GetScalarProperty("YawVal");
+                var rollVal  = pRef.GetScalarProperty("RollVal");
+                var spinYaw  = pRef.GetScalarProperty("SpinYaw");
+                var spinAct  = pRef.GetScalarProperty("SpinActive");
+                var composedYaw = yawVal + spinAct * spinYaw;
+                const float D2R = 0.01745329251994f;
+                var rotZ = ExpressionFunctions.CreateMatrix4x4FromAxisAngle(
+                    ExpressionFunctions.Vector3(0f, 0f, 1f), rollVal * D2R);
+                var rotX = ExpressionFunctions.CreateMatrix4x4FromAxisAngle(
+                    ExpressionFunctions.Vector3(1f, 0f, 0f), pitchVal * D2R);
+                var rotY = ExpressionFunctions.CreateMatrix4x4FromAxisAngle(
+                    ExpressionFunctions.Vector3(0f, 1f, 0f), composedYaw * D2R);
+                var rotation = rotZ * rotX * rotY;
+
+                var axes = new[]
+                {
+                    global::Combobulate.Rendering.TransformAnimationAxis.FullCircleDeg(composedYaw, samples: 24),
+                    new global::Combobulate.Rendering.TransformAnimationAxis(pitchVal, min: -180f, length: 360f, periodic: false, samples: 12),
+                    new global::Combobulate.Rendering.TransformAnimationAxis(rollVal,  min: -180f, length: 360f, periodic: false, samples: 12),
+                };
+
+                combobulate.SetTransformAnimation(rotation, axes);
             }
-            ApplyRotation();
-
-            // Build a typed Matrix4x4Node mirroring the rotation pipeline:
-            //   composedYaw = YawVal + SpinActive * SpinYaw
-            //   R = RotZ(RollVal) * RotX(PitchVal) * RotY(composedYaw)
-            // Combobulate auto-wraps R in toOrigin*R*fromOrigin so we don't
-            // include centering here.
-            var (props, _) = GetOrCreateExternalRotation();
-            var pRef = props.GetReference();
-            var pitchVal = pRef.GetScalarProperty("PitchVal");
-            var yawVal   = pRef.GetScalarProperty("YawVal");
-            var rollVal  = pRef.GetScalarProperty("RollVal");
-            var spinYaw  = pRef.GetScalarProperty("SpinYaw");
-            var spinAct  = pRef.GetScalarProperty("SpinActive");
-            var composedYaw = yawVal + spinAct * spinYaw;
-            const float D2R = 0.01745329251994f;
-            var rotZ = ExpressionFunctions.CreateMatrix4x4FromAxisAngle(
-                ExpressionFunctions.Vector3(0f, 0f, 1f), rollVal * D2R);
-            var rotX = ExpressionFunctions.CreateMatrix4x4FromAxisAngle(
-                ExpressionFunctions.Vector3(1f, 0f, 0f), pitchVal * D2R);
-            var rotY = ExpressionFunctions.CreateMatrix4x4FromAxisAngle(
-                ExpressionFunctions.Vector3(0f, 1f, 0f), composedYaw * D2R);
-            var rotation = rotZ * rotX * rotY;
-
-            // Three live input axes covering the full 3-D rotation space.
-            // Sample counts give cell granularity; finer = more correct
-            // painter sort at extreme angles, at the cost of more cells.
-            // Materialisation is chunked across UI ticks (32 cells/tick)
-            // so even thousands of cells don't block the UI thread, and
-            // old trees stay visible during the bake — no perceptible
-            // freeze regardless of cell count.
-            //   - composedYaw: 0..360°, periodic, 24 samples (15°/slab)
-            //   - pitchVal:    -180..180°, non-periodic, 12 samples (30°/slab)
-            //   - rollVal:     -180..180°, non-periodic, 12 samples (30°/slab)
-            // Total grid: 24 × 12 × 12 = 3456 cells.
-            var axes = new[]
-            {
-                global::Combobulate.Rendering.TransformAnimationAxis.FullCircleDeg(composedYaw, samples: 24),
-                new global::Combobulate.Rendering.TransformAnimationAxis(pitchVal, min: -180f, length: 360f, periodic: false, samples: 12),
-                new global::Combobulate.Rendering.TransformAnimationAxis(rollVal,  min: -180f, length: 360f, periodic: false, samples: 12),
-            };
-
-            combobulate.SetTransformAnimation(rotation, axes);
         }
+        finally { _suspendUiHandlers = false; }
+
+        // Single coalesced apply at end. For BAG this is a no-op for the
+        // rendering pipeline (slider scalars already inserted above) but
+        // leaves SceneVisual in sync. For other modes this installs the
+        // expression / clears it as needed.
+        ApplyRotation();
+        UpdateAutoRefresh();
     }
     private static string? ResolveSamplePath(string fileName)
     {
