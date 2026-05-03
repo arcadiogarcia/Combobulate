@@ -1350,12 +1350,16 @@ public sealed class Combobulate : Control
             // sampling the transform matrix; if the result differs from
             // the snapshot taken at last bake, rebake. Throttle to once
             // per ~150ms so this stays cheap during fast slider drags.
+            // Also skip while a bake is in flight: the bake thread is
+            // currently overriding the same primary-axis LiveValueProviders
+            // we'd write to, and racing them produces garbage matrices /
+            // freezes.
             bool secondaryChanged = false;
             long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
             long elapsedMs = _baked != null
                 ? (nowTicks - _lastSecondaryProbeTicks) * 1000 / System.Diagnostics.Stopwatch.Frequency
                 : long.MaxValue;
-            if (_baked != null && elapsedMs >= 150)
+            if (_baked != null && !_baked.BakeInFlight && elapsedMs >= 150)
             {
                 _lastSecondaryProbeTicks = nowTicks;
                 secondaryChanged = SecondaryProbeChanged();
@@ -1368,6 +1372,10 @@ public sealed class Combobulate : Control
                 || _bakedHostH != hostH
                 || _bakedAlgorithm != SortAlgorithm
                 || secondaryChanged;
+            // Don't kick off another bake while one is already in flight —
+            // we'd cancel it for nothing and block on the same primary-axis
+            // LiveValueProvider state. The Update loop will retry.
+            if (_baked != null && _baked.BakeInFlight) needRebake = false;
             if (needRebake)
             {
                 if (_baked == null)
