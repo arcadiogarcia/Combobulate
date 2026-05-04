@@ -44,14 +44,10 @@ internal static class PredicateCompiler
 
     /// <summary>
     /// Build the BooleanNode predicate for one signature. Phase-0
-    /// signatures are now identified by face-visibility ALONE (pair
-    /// painter-orderings are constant per-pair under pure rotation, so
-    /// they're encoded in <see cref="SignatureBake.Signature.Order"/> at
-    /// bake time and don't need runtime testing). The predicate is the
-    /// conjunction of N face-front comparisons; per-cell expression size
-    /// is linear in face count regardless of model complexity, so even
-    /// large models stay well within the compositor expression-string
-    /// length limit.
+    /// signatures are identified by face-visibility plus the signs of
+    /// any rotation-dependent pair orderings. Constant pair orderings
+    /// are encoded statically in <see cref="SignatureBake.Signature.Order"/>
+    /// and don't need a runtime test.
     /// </summary>
     public static BooleanNode BuildPredicate(
         Matrix4x4Node bakedMatrix,
@@ -71,6 +67,31 @@ internal static class PredicateCompiler
                 ? normalZ > (ScalarNode)(-PredicateEpsilon)
                 : normalZ < (ScalarNode)(+PredicateEpsilon);
             acc = acc is null ? test : ExpressionFunctions.And(acc, test);
+        }
+
+        // Pair-order tests for VARYING pairs only (PairSigns[i,j] != 0
+        // means the pair's painter-order flips somewhere in the swept
+        // parameter space; the bake's reduction left these alone in the
+        // signature and dropped constant pairs to 0).
+        // Sign convention: PairSigns[i,j] = +1 iff face j is drawn AFTER
+        // face i (j in front). Test: dot(M·(c_j − c_i), z_view) > 0
+        // means c_j is further along +Z than c_i, i.e. j is in front
+        // under the viewer-looking-at-+Z convention.
+        for (int i = 0; i < n; i++)
+        {
+            if (sig.FaceSigns[i] < 0) continue;
+            for (int j = i + 1; j < n; j++)
+            {
+                if (sig.FaceSigns[j] < 0) continue;
+                sbyte s = sig.PairSigns[i, j];
+                if (s == 0) continue;
+                var diff = quads[j].Centroid - quads[i].Centroid;
+                var diffZ = EventFunctions.TransformedDirectionZ(bakedMatrix, diff);
+                BooleanNode test = s > 0
+                    ? diffZ > (ScalarNode)(-PredicateEpsilon)
+                    : diffZ < (ScalarNode)(+PredicateEpsilon);
+                acc = ExpressionFunctions.And(acc!, test);
+            }
         }
 
         return acc!;

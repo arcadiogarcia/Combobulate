@@ -152,41 +152,24 @@ public class BakedAspectPainterOrderTests
     }
 
     /// <summary>
-    /// Replicates the bake's per-sample painter-order computation
-    /// (<c>SignatureBake.ProcessSample</c> + <c>EmitSignature</c>) without
-    /// any Composition or ExpressionsFork dependencies. If this gets out
-    /// of step with the bake the tests are silently testing the wrong
-    /// thing, so any change to the bake's painter logic must be mirrored
-    /// here. Keeping it short on purpose so divergence is obvious in code
-    /// review.
+    /// Replicates the bake's per-sample painter-order computation by
+    /// running the same reference sorter (BSP) the bake uses. Mirrors
+    /// <c>SignatureBake.ProcessSample</c>'s logic: sort to get the
+    /// painter order, derive face visibility from the sorter's
+    /// <c>visBuf</c>. If the bake's painter logic ever diverges from
+    /// this, the tests are silently testing the wrong thing — keep them
+    /// in lock-step.
     /// </summary>
     private static (bool[] visibility, int[] order) ComputeBakedAspectOrder(ObjGeometry geom, in Matrix4x4 M)
     {
-        var quads = geom.Quads;
-        int n = quads.Length;
-        var visibility = new bool[n];
-        for (int q = 0; q < n; q++)
-        {
-            var nrm = quads[q].Normal;
-            float nz = nrm.X * M.M13 + nrm.Y * M.M23 + nrm.Z * M.M33;
-            visibility[q] = nz > 0f;
-        }
-
-        // Static plane-side relations (rotation-invariant): planeSide[a,b] =
-        // sign(n_b · (c_a − c_b)). +1 → a is on the viewer-facing side of b.
-        var visibleIdxs = new List<int>(n);
-        for (int q = 0; q < n; q++) if (visibility[q]) visibleIdxs.Add(q);
-        visibleIdxs.Sort((a, b) =>
-        {
-            // a in front of b iff a is on the +n_b side AND b is on the -n_a side.
-            float ab = Vector3.Dot(quads[b].Normal, quads[a].Centroid - quads[b].Centroid);
-            float ba = Vector3.Dot(quads[a].Normal, quads[b].Centroid - quads[a].Centroid);
-            if (ab < 0f && ba > 0f) return -1; // a behind b → a drawn first
-            if (ab > 0f && ba < 0f) return +1; // a in front → drawn last
-            return a.CompareTo(b); // tie-break by face index for stability
-        });
-
-        return (visibility, visibleIdxs.ToArray());
+        var sorter = FaceSorterFactory.Create(SortAlgorithm.Bsp, geom);
+        int n = geom.Quads.Length;
+        var orderBuf = new int[n];
+        var visBuf = new bool[n];
+        int visibleCount = sorter.Sort(M, orderBuf, visBuf, cameraDistance: 0f, cullMarginCos: 0f);
+        var order = new int[visibleCount];
+        Array.Copy(orderBuf, order, visibleCount);
+        return (visBuf, order);
     }
 
     private static Matrix4x4 MakeRotation(float yawDeg, float pitchDeg, float rollDeg)

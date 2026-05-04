@@ -209,12 +209,12 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         SortAlgorithm sortAlgorithm,
         CancellationToken ct)
     {
-        // Phase 0: ignore the configured sortAlgorithm/cullMarginCos/cameraDistance.
-        // BakedAspectGraph commits to centroid-Z painter sort and
-        // (M·n).z visibility, regardless of the host control's
-        // SortAlgorithm DP. The sort algorithm DP still applies to the
-        // SpritePainter / DualTree paths.
-        var sigs = SignatureBake.Bake(transformNode, axes, geometry, ct);
+        // BakedAspectGraph delegates per-sample painter ordering to the
+        // configured SortAlgorithm (BSP/Newell/Topological) so it gets
+        // the same order the SpritePainter path would. Pair signs that
+        // vary across rotation samples become rotation-dependent
+        // predicates at runtime.
+        var sigs = SignatureBake.Bake(transformNode, axes, geometry, sortAlgorithm, cameraDistance, cullMarginCos, ct);
         var cellSigs = new CellSig[sigs.Length];
         for (int i = 0; i < sigs.Length; i++) cellSigs[i] = new CellSig { Sig = sigs[i] };
         return new ComputedBake { Cells = cellSigs };
