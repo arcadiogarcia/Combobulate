@@ -96,6 +96,14 @@ public sealed partial class MainWindow : Window
 
     private void RefreshDiag_Click(object sender, RoutedEventArgs e) => RefreshDiagPane();
 
+    private void RebakeButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (combobulate == null) return;
+        combobulate.ForceRebakeAspectGraph();
+        if (StatusText != null)
+            StatusText.Text = $"Rebake requested at {DateTime.Now:HH:mm:ss}";
+    }
+
     private void AutoDiagToggle_Toggled(object sender, RoutedEventArgs e)
     {
         if (AutoDiagToggle?.IsOn == true)

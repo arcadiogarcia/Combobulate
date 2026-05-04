@@ -960,6 +960,26 @@ public sealed class Combobulate : Control
                 primaryAxis, min: 0f, length: primaryAxisPeriod, periodic: true) });
     }
 
+    /// <summary>
+    /// Force a fresh BakedAspectGraph bake on the next UI tick. No-op
+    /// outside <see cref="Rendering.RenderingMode.BakedAspectGraph"/>
+    /// mode or before <see cref="SetTransformAnimation(Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node, Combobulate.Rendering.TransformAnimationAxis[])"/>
+    /// has been called. Useful for diagnostic UI ("Rebake" button) and
+    /// for callers that mutate model geometry / axis sample density at
+    /// runtime in ways the secondary-input probe wouldn't detect.
+    /// </summary>
+    public void ForceRebakeAspectGraph()
+    {
+        if (_baked != null)
+        {
+            _baked.Dispose();
+            _baked = null;
+            _bakedGeometry = null;
+        }
+        if (IsBakedAspectGraphActive())
+            UpdateBakeIfNeeded();
+    }
+
     private void ApplyBakedTransformAnimation()
     {
         if (_root is null || _transformNode is null || _host is null) return;

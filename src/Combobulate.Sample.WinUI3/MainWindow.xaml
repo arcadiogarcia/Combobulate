@@ -26,6 +26,7 @@
                       HorizontalScrollBarVisibility="Auto"
                       VerticalScrollMode="Disabled"
                       VerticalScrollBarVisibility="Disabled">
+        <StackPanel Orientation="Vertical" Spacing="6">
         <StackPanel Orientation="Horizontal" Spacing="12">
             <Button x:Name="LoadObjButton"
                     Content="Load OBJ…"
@@ -56,6 +57,16 @@
                 <ComboBoxItem Content="DualTreeAtomicSwap"/>
                 <ComboBoxItem Content="BakedAspectGraph"/>
             </ComboBox>
+            <Button x:Name="RebakeButton"
+                    Content="Rebake"
+                    Click="RebakeButton_Click"
+                    ToolTipService.ToolTip="Force a fresh BakedAspectGraph bake right now. Useful after editing geometry / sample density at runtime, or to confirm the bake reproduces the same signature set deterministically. No-op outside BakedAspectGraph mode."/>
+            <TextBlock x:Name="StatusText"
+                       VerticalAlignment="Center"
+                       Opacity="0.7"
+                       Text="Loaded: built-in cube"/>
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" Spacing="12">
             <ToggleSwitch x:Name="ExternalRotationToggle"
                           OnContent="External (composition)"
                           OffContent="Internal (control DPs)"
@@ -91,10 +102,7 @@
                           IsOn="False"
                           Toggled="ShowSceneVisualToggle_Toggled"
                           ToolTipService.ToolTip="Show the SceneVisual (z-buffer) reference panel beside the SpriteVisual painter-sort panel. Off by default; the SpriteVisual panel takes the full width when off."/>
-            <TextBlock x:Name="StatusText"
-                       VerticalAlignment="Center"
-                       Opacity="0.7"
-                       Text="Loaded: built-in cube"/>
+        </StackPanel>
         </StackPanel>
         </ScrollViewer>
 
