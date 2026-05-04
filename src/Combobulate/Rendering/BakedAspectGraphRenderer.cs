@@ -53,6 +53,17 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
     private System.Collections.Generic.List<ContainerVisual>? _stagingTrees;
     private bool _disposed;
 
+    // Phase-0 baked-matrix property set: the renderer evaluates the user's
+    // entire transform AST exactly once per frame on the compositor and
+    // writes the resulting Matrix4x4 here. Per-cell predicates then
+    // reference this single matrix's subchannels rather than rebuilding
+    // the user AST per event — essential to keep per-cell expression
+    // strings small enough for the compositor parser at higher cell
+    // counts.
+    private CompositionPropertySet? _bakedMatrixProps;
+    private ExpressionAnimation? _bakedMatrixAnim;
+    private const string BakedMatrixPropertyName = "M";
+
     // Cached bake inputs (so MaybeRebake / completion callbacks can compare).
     private Matrix4x4Node? _transformNode;
     private TransformAnimationAxis[]? _axes;
@@ -169,18 +180,21 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         }, ct);
     }
 
-    /// <summary>Pure-CPU phase: produces one <see cref="CellSig"/> per cell.</summary>
+    /// <summary>
+    /// One unique painter signature lifted to the renderer. Replaces the
+    /// previous axis-rectangle <c>CellSig</c>: cells in θ-space are now
+    /// implicitly defined by the sign vectors of <see cref="EventFunctions"/>
+    /// rather than axis-aligned bounds.
+    /// </summary>
     private struct CellSig
     {
-        public float[] Lo;
-        public float[] Hi;
-        public int[] Order;
-        public bool[] Visibility;
+        public SignatureBake.Signature Sig;
     }
 
     private struct ComputedBake { public CellSig[] Cells; }
 
-    /// <summary>Background-thread compute: sweep axes + sort. No Composition deps.</summary>
+    /// <summary>Background-thread compute: enumerate signatures via
+    /// <see cref="SignatureBake"/>. No Composition deps.</summary>
     private static ComputedBake ComputeBake(
         Matrix4x4Node transformNode,
         TransformAnimationAxis[] axes,
@@ -190,83 +204,15 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         SortAlgorithm sortAlgorithm,
         CancellationToken ct)
     {
-        var sorter = FaceSorterFactory.Create(sortAlgorithm, geometry);
-
-        // Override each axis's UI-thread provider to read from a shared
-        // sweep array. The Evaluate() walk reads the override on each
-        // matching leaf — same-thread reads, no cross-thread compositor
-        // call, fast.
-        var sweep = new float[axes.Length];
-        for (int i = 0; i < axes.Length; i++)
-        {
-            int idx = i;
-            axes[i].Scalar.SetLiveValueProvider(() => sweep[idx]);
-        }
-
-        try
-        {
-            CellSig[] cellSigs;
-            if (axes.Length == 1)
-            {
-                var axis = axes[0];
-                var cells = AspectGraphBake.BakeOneAxis(
-                    sorter, geometry,
-                    v =>
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        sweep[0] = axis.Min + v;
-                        return transformNode.Evaluate();
-                    },
-                    axis.Length,
-                    cullMarginCos,
-                    cameraDistance);
-                cellSigs = new CellSig[cells.Length];
-                for (int i = 0; i < cells.Length; i++)
-                {
-                    cellSigs[i] = new CellSig
-                    {
-                        Lo = new[] { axis.Min + cells[i].Lo },
-                        Hi = new[] { axis.Min + cells[i].Hi },
-                        Order = cells[i].Order,
-                        Visibility = cells[i].Visibility,
-                    };
-                }
-            }
-            else
-            {
-                var bakeAxes = new AspectGraphBake.AxisSweep[axes.Length];
-                for (int i = 0; i < axes.Length; i++)
-                    bakeAxes[i] = new AspectGraphBake.AxisSweep(axes[i].Min, axes[i].Length, axes[i].Samples, axes[i].Periodic);
-                var cells = AspectGraphBake.BakeMultiAxis(
-                    sorter, geometry,
-                    input =>
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        Array.Copy(input, sweep, axes.Length);
-                        return transformNode.Evaluate();
-                    },
-                    bakeAxes,
-                    cullMarginCos,
-                    cameraDistance);
-                cellSigs = new CellSig[cells.Length];
-                for (int i = 0; i < cells.Length; i++)
-                {
-                    cellSigs[i] = new CellSig
-                    {
-                        Lo = cells[i].Lo,
-                        Hi = cells[i].Hi,
-                        Order = cells[i].Order,
-                        Visibility = cells[i].Visibility,
-                    };
-                }
-            }
-            return new ComputedBake { Cells = cellSigs };
-        }
-        finally
-        {
-            for (int i = 0; i < axes.Length; i++)
-                axes[i].Scalar.SetLiveValueProvider(null);
-        }
+        // Phase 0: ignore the configured sortAlgorithm/cullMarginCos/cameraDistance.
+        // BakedAspectGraph commits to centroid-Z painter sort and
+        // (M·n).z visibility, regardless of the host control's
+        // SortAlgorithm DP. The sort algorithm DP still applies to the
+        // SpritePainter / DualTree paths.
+        var sigs = SignatureBake.Bake(transformNode, axes, geometry, ct);
+        var cellSigs = new CellSig[sigs.Length];
+        for (int i = 0; i < sigs.Length; i++) cellSigs[i] = new CellSig { Sig = sigs[i] };
+        return new ComputedBake { Cells = cellSigs };
     }
 
     /// <summary>
@@ -292,16 +238,37 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         Microsoft.UI.Dispatching.DispatcherQueue ui,
         int generation)
     {
-        // Stage new trees into _stagingTrees, keeping _trees visible
-        // throughout. Each new ContainerVisual is parented immediately
-        // (so the compositor knows about it) but its Opacity stays at 0
-        // because we don't start the animation until the swap step.
-        // Result: the visual tree shows the OLD cells until the swap,
-        // then the new ones; UI thread never blocks for the full bake.
-        var newTrees = new ContainerVisual[computed.Cells.Length];
-        var newOpacityExprs = new Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode[computed.Cells.Length];
-        ChunkBuild(computed, geometry, bindings, scale, hostW, hostH, axes,
-                   newTrees, newOpacityExprs, startIndex: 0, ui, generation);
+        try
+        {
+            try
+            {
+                var dir = System.IO.Path.Combine(
+                    Windows.Storage.ApplicationData.Current.LocalFolder.Path, "debug-artifacts");
+                System.IO.Directory.CreateDirectory(dir);
+                System.IO.File.AppendAllText(
+                    System.IO.Path.Combine(dir, "baked-aspect-graph.log"),
+                    $"[{DateTime.Now:HH:mm:ss.fff}] Materialise begin: {computed.Cells.Length} cells\n");
+            }
+            catch { }
+            EnsureBakedMatrixSource();
+            var newTrees = new ContainerVisual[computed.Cells.Length];
+            var newOpacityExprs = new Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode[computed.Cells.Length];
+            ChunkBuild(computed, geometry, bindings, scale, hostW, hostH, axes,
+                       newTrees, newOpacityExprs, startIndex: 0, ui, generation);
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                var dir = System.IO.Path.Combine(
+                    Windows.Storage.ApplicationData.Current.LocalFolder.Path, "debug-artifacts");
+                System.IO.Directory.CreateDirectory(dir);
+                System.IO.File.AppendAllText(
+                    System.IO.Path.Combine(dir, "baked-aspect-graph.log"),
+                    $"[{DateTime.Now:HH:mm:ss.fff}] Materialise FAIL: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}\n");
+            }
+            catch { }
+        }
     }
 
     private void ChunkBuild(
@@ -333,12 +300,15 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             var c = computed.Cells[i];
             var tree = _compositor.CreateContainerVisual();
             tree.Opacity = 0; // hidden until swap
-            BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Order, c.Visibility);
+            BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Sig.Order, c.Sig.Visibility);
             // Build (but don't start) the opacity expression — we'll start
             // them all in the swap step so the new tree set lights up
             // atomically and the old one disappears in the same compositor
-            // commit.
-            newOpacityExprs[i] = BuildAxisInCellExpression(axes, c.Lo, c.Hi);
+            // commit. The predicate is the conjunction of signed
+            // event-function inequalities baked from this cell's
+            // signature; cells are mutually exclusive by construction.
+            var predicate = PredicateCompiler.BuildPredicate(GetBakedMatrixReference(), geometry, c.Sig);
+            newOpacityExprs[i] = ExpressionFunctions.Conditional(predicate, (ScalarNode)1f, (ScalarNode)0f);
             _parent.Children.InsertAtTop(tree);
             newTrees[i] = tree;
             _stagingTrees!.Add(tree);
@@ -359,9 +329,19 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             DisposeTrees();
             _trees = newTrees;
             _stagingTrees = null;
+            int started = 0;
+            string? firstError = null;
             for (int i = 0; i < newTrees.Length; i++)
             {
-                newTrees[i].StartAnimation("Opacity", newOpacityExprs[i]);
+                try
+                {
+                    newTrees[i].StartAnimation("Opacity", newOpacityExprs[i]);
+                    started++;
+                }
+                catch (Exception ex)
+                {
+                    if (firstError == null) firstError = $"cell {i}: {ex.GetType().Name}: {ex.Message}";
+                }
             }
             _bakeCts?.Dispose();
             _bakeCts = null;
@@ -375,59 +355,20 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
                 System.IO.Directory.CreateDirectory(dir);
                 var path = System.IO.Path.Combine(dir, "baked-aspect-state.txt");
                 System.IO.File.WriteAllText(path,
-                    $"[{DateTime.Now:HH:mm:ss.fff}] post-bake snapshot\n"
+                    $"[{DateTime.Now:HH:mm:ss.fff}] post-bake snapshot — animations started: {started}/{newTrees.Length}; firstError={firstError ?? "none"}\n"
                     + GetDiagnosticReport(axes, null));
             }
             catch { }
         }
     }
 
-    private static ScalarNode BuildAxisInCellExpression(
+    private static ScalarNode BuildAxisInCellExpression_OBSOLETE(
         TransformAnimationAxis[] axes, float[] lo, float[] hi)
     {
-        BooleanNode? acc = null;
-        for (int i = 0; i < axes.Length; i++)
-        {
-            var axis = axes[i];
-            // Compute the "live" axis value to compare against absolute
-            // [lo, hi). For a periodic axis we wrap into [Min, Min+Length).
-            // Avoid subtracting axis.Min from axis.Scalar directly: when
-            // axis.Min is negative the toolkit emits "(scalar - -180)" which
-            // some Composition expression evaluators reject. Instead add
-            // (-Min) when needed.
-            ScalarNode liveVal;
-            if (axis.Periodic)
-            {
-                // shifted = axis.Scalar + (-axis.Min) → maps the live value
-                // into [0, +Length+epsilon). Then normalise mod Length and
-                // shift back: liveVal = wrapped + axis.Min.
-                ScalarNode shifted = axis.Scalar + (ScalarNode)(-axis.Min);
-                ScalarNode ratio = shifted / (ScalarNode)axis.Length;
-                ScalarNode wrapped = shifted - ExpressionFunctions.Floor(ratio) * (ScalarNode)axis.Length;
-                liveVal = wrapped + (ScalarNode)axis.Min;
-            }
-            else
-            {
-                liveVal = axis.Scalar;
-            }
-
-            BooleanNode test;
-            if (axis.Periodic && hi[i] <= lo[i])
-            {
-                // Wrap cell across the periodic boundary.
-                test = ExpressionFunctions.Or(
-                    liveVal >= (ScalarNode)lo[i],
-                    liveVal < (ScalarNode)hi[i]);
-            }
-            else
-            {
-                test = ExpressionFunctions.And(
-                    liveVal >= (ScalarNode)lo[i],
-                    liveVal < (ScalarNode)hi[i]);
-            }
-            acc = acc is null ? test : ExpressionFunctions.And(acc, test);
-        }
-        return ExpressionFunctions.Conditional(acc!, (ScalarNode)1f, (ScalarNode)0f);
+        // Phase 0 replaced this with PredicateCompiler.BuildPredicate.
+        // Kept as a no-op stub to avoid churn elsewhere; not called.
+        _ = axes; _ = lo; _ = hi;
+        return (ScalarNode)0f;
     }
 
     private void BuildTreeContent(
@@ -511,8 +452,19 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         }
 
         if (_trees == null) return sb.ToString();
-
-        // Identify the cell that the live values fall inside, by querying
+        // Read the live baked matrix property to verify the user-AST animation is firing.
+        if (_bakedMatrixProps != null)
+        {
+            try
+            {
+                _bakedMatrixProps.TryGetMatrix4x4(BakedMatrixPropertyName, out var liveM);
+                sb.AppendLine($"  bakedMatrix.live = M11={liveM.M11:F3} M12={liveM.M12:F3} M13={liveM.M13:F3} M14={liveM.M14:F3}");
+                sb.AppendLine($"                     M21={liveM.M21:F3} M22={liveM.M22:F3} M23={liveM.M23:F3} M24={liveM.M24:F3}");
+                sb.AppendLine($"                     M31={liveM.M31:F3} M32={liveM.M32:F3} M33={liveM.M33:F3} M34={liveM.M34:F3}");
+                sb.AppendLine($"                     M41={liveM.M41:F3} M42={liveM.M42:F3} M43={liveM.M43:F3} M44={liveM.M44:F3}");
+            }
+            catch (Exception ex) { sb.AppendLine($"  bakedMatrix.TryGetMatrix4x4 THREW: {ex.Message}"); }
+        }
         // each cell's bounds we cached at bake time. We don't have direct
         // access to CellSig from here (private struct), so we enumerate
         // the parent.Children stack and report each child's static Opacity.
@@ -551,6 +503,59 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         _bakeGeneration++;
         EvictStaging();
         DisposeTrees();
+        if (_bakedMatrixAnim != null)
+        {
+            try { _bakedMatrixProps?.StopAnimation(BakedMatrixPropertyName); } catch { }
+            _bakedMatrixAnim.Dispose();
+            _bakedMatrixAnim = null;
+        }
+        _bakedMatrixProps?.Dispose();
+        _bakedMatrixProps = null;
+    }
+
+    /// <summary>
+    /// Lazily creates the per-renderer CompositionPropertySet that holds
+    /// the live transform matrix as a single Matrix4x4 property "M",
+    /// driven by a single ExpressionAnimation evaluating the user's
+    /// transform AST. All per-cell predicates reference this property,
+    /// so the user-AST size never multiplies per cell.
+    /// </summary>
+    private void EnsureBakedMatrixSource()
+    {
+        if (_transformNode is null) return;
+        try
+        {
+            if (_bakedMatrixProps == null)
+            {
+                _bakedMatrixProps = _compositor.CreatePropertySet();
+                _bakedMatrixProps.InsertMatrix4x4(BakedMatrixPropertyName, System.Numerics.Matrix4x4.Identity);
+            }
+            try { _bakedMatrixProps.StopAnimation(BakedMatrixPropertyName); } catch { }
+            _bakedMatrixAnim = null;
+            _bakedMatrixProps.StartAnimation(BakedMatrixPropertyName, _transformNode!);
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                var dir = System.IO.Path.Combine(
+                    Windows.Storage.ApplicationData.Current.LocalFolder.Path, "debug-artifacts");
+                System.IO.Directory.CreateDirectory(dir);
+                System.IO.File.AppendAllText(
+                    System.IO.Path.Combine(dir, "baked-aspect-graph.log"),
+                    $"[{DateTime.Now:HH:mm:ss.fff}] EnsureBakedMatrixSource FAIL: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}\n");
+            }
+            catch { }
+            throw;
+        }
+    }
+
+    /// <summary>Returns the typed Matrix4x4Node referencing <c>props.M</c>.</summary>
+    private Matrix4x4Node GetBakedMatrixReference()
+    {
+        if (_bakedMatrixProps == null)
+            throw new InvalidOperationException("Baked matrix property set not initialised.");
+        return _bakedMatrixProps.GetReference().GetMatrix4x4Property(BakedMatrixPropertyName);
     }
 
     private void EvictStaging()
