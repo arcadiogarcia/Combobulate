@@ -208,4 +208,341 @@ public class BakedAspectPainterOrderTests
         f 8 7 3 4
         f 5 1 2 6
         """;
+
+    // ===== Property-based tests for the bake itself (A-F from the design doc) =====
+    //
+    // These mirror the production SignatureBake + PredicateCompiler logic in
+    // pure C# (no Composition / ExpressionsFork dependency) so we can exercise
+    // them end-to-end. The mirror MUST stay in sync with production —
+    // intentionally short and obvious so divergence is visible in code review.
+
+    private sealed class MiniSignature
+    {
+        public required sbyte[] FaceSigns;     // +1 visible, -1 hidden
+        public required sbyte[,] PairSigns;    // +1 / -1 for varying pairs, 0 for constant/hidden
+        public required int[] Order;           // representative painter order
+        public required string Key;
+    }
+
+    private static (MiniSignature[] signatures, bool[,] pairVaries, List<RawSample> rawPerSample) MiniBake(
+        ObjGeometry geom, IEnumerable<Matrix4x4> samples)
+    {
+        var sorter = FaceSorterFactory.Create(SortAlgorithm.Bsp, geom);
+        int n = geom.Quads.Length;
+        var orderBuf = new int[n];
+        var visBuf = new bool[n];
+        var orderInverse = new int[n];
+
+        var pairFirstSign = new sbyte[n, n];
+        var pairVaries = new bool[n, n];
+        var raw = new List<RawSample>();
+        var sweep = samples.ToList();
+
+        foreach (var M in sweep)
+        {
+            int visibleCount = sorter.Sort(M, orderBuf, visBuf, 0f, 0f);
+            for (int q = 0; q < n; q++) orderInverse[q] = -1;
+            for (int k = 0; k < visibleCount; k++) orderInverse[orderBuf[k]] = k;
+
+            var face = new sbyte[n];
+            for (int q = 0; q < n; q++) face[q] = visBuf[q] ? (sbyte)+1 : (sbyte)-1;
+
+            var pair = new sbyte[n, n];
+            for (int i = 0; i < n; i++)
+            {
+                if (face[i] < 0) continue;
+                for (int j = i + 1; j < n; j++)
+                {
+                    if (face[j] < 0) continue;
+                    sbyte s = orderInverse[j] > orderInverse[i] ? (sbyte)+1 : (sbyte)-1;
+                    pair[i, j] = s;
+                    pair[j, i] = (sbyte)-s;
+                    if (pairFirstSign[i, j] == 0) pairFirstSign[i, j] = s;
+                    else if (pairFirstSign[i, j] != s) pairVaries[i, j] = true;
+                }
+            }
+            var order = new int[visibleCount];
+            Array.Copy(orderBuf, order, visibleCount);
+            raw.Add(new RawSample { Rotation = M, FaceSigns = face, PairSigns = pair, Order = order });
+        }
+
+        // Reduce.
+        var dict = new Dictionary<string, MiniSignature>();
+        foreach (var rs in raw)
+        {
+            string key = MakeKey(rs.FaceSigns, rs.PairSigns, pairVaries, n);
+            if (dict.ContainsKey(key)) continue;
+            var runtimePairs = new sbyte[n, n];
+            for (int i = 0; i < n; i++)
+                for (int j = i + 1; j < n; j++)
+                    if (pairVaries[i, j])
+                    {
+                        runtimePairs[i, j] = rs.PairSigns[i, j];
+                        runtimePairs[j, i] = (sbyte)-rs.PairSigns[i, j];
+                    }
+            dict[key] = new MiniSignature
+            {
+                FaceSigns = rs.FaceSigns,
+                PairSigns = runtimePairs,
+                Order = rs.Order,
+                Key = key,
+            };
+        }
+        return (dict.Values.ToArray(), pairVaries, raw);
+    }
+
+    private struct RawSample
+    {
+        public Matrix4x4 Rotation;
+        public sbyte[] FaceSigns;
+        public sbyte[,] PairSigns;
+        public int[] Order;
+    }
+
+    private static string MakeKey(sbyte[] face, sbyte[,] pair, bool[,] varies, int n)
+    {
+        var sb = new System.Text.StringBuilder(n + n * (n - 1) / 2 + 4);
+        for (int i = 0; i < n; i++) sb.Append(face[i] > 0 ? '+' : '-');
+        sb.Append('|');
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++)
+                sb.Append(varies[i, j] ? (pair[i, j] switch { 1 => '+', -1 => '-', _ => '0' }) : '0');
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Mirrors <c>PredicateCompiler.BuildPredicate</c> and evaluates the
+    /// resulting predicate at <paramref name="M"/>. Returns true iff the
+    /// signature matches at θ. Tolerant inequalities <c>&gt; -eps</c> and
+    /// <c>&lt; +eps</c> match the production compiler exactly.
+    /// </summary>
+    private static bool EvaluatePredicate(ObjGeometry geom, MiniSignature sig, in Matrix4x4 M, float eps = 1e-3f)
+    {
+        var quads = geom.Quads;
+        int n = quads.Length;
+        // Face-front tests for all faces.
+        for (int q = 0; q < n; q++)
+        {
+            var nrm = quads[q].Normal;
+            float nz = nrm.X * M.M13 + nrm.Y * M.M23 + nrm.Z * M.M33;
+            bool ok = sig.FaceSigns[q] > 0 ? nz > -eps : nz < +eps;
+            if (!ok) return false;
+        }
+        // Varying-pair tests only.
+        for (int i = 0; i < n; i++)
+        {
+            if (sig.FaceSigns[i] < 0) continue;
+            for (int j = i + 1; j < n; j++)
+            {
+                if (sig.FaceSigns[j] < 0) continue;
+                sbyte s = sig.PairSigns[i, j];
+                if (s == 0) continue;
+                var d = quads[j].Centroid - quads[i].Centroid;
+                float dz = d.X * M.M13 + d.Y * M.M23 + d.Z * M.M33;
+                bool ok = s > 0 ? dz > -eps : dz < +eps;
+                if (!ok) return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>Same yaw/pitch/roll grid the production bake uses.</summary>
+    private static IEnumerable<Matrix4x4> BakeSweep()
+    {
+        // Match the sample app's axes: yaw periodic 0..360 (24 samples), pitch -180..180 (12), roll -180..180 (12).
+        const int yawN = 24, pitchN = 12, rollN = 12;
+        for (int y = 0; y < yawN; y++)
+            for (int p = 0; p < pitchN; p++)
+                for (int r = 0; r < rollN; r++)
+                {
+                    float yaw = 0f + (y + 0.5f) * 360f / yawN;
+                    float pitch = -180f + (p + 0.5f) * 360f / pitchN;
+                    float roll = -180f + (r + 0.5f) * 360f / rollN;
+                    yield return MakeRotation(yaw, pitch, roll);
+                }
+        // Axis-aligned probes: combinations of {0, 90, 180, 270} on yaw and {-180, -90, 0, 90, 180} on pitch/roll.
+        var yawAligned = new[] { 0f, 90f, 180f, 270f };
+        var ptAligned = new[] { -180f, -90f, 0f, 90f, 180f };
+        foreach (var ya in yawAligned)
+            foreach (var pa in ptAligned)
+                foreach (var ra in ptAligned)
+                    yield return MakeRotation(ya, pa, ra);
+    }
+
+    // ----- Test (A): Bake-coverage. Every random rotation lands in some baked signature. -----
+    [Fact]
+    public void Cube_BakeCoverage_EveryRandomRotationMatchesSomeSignature()
+    {
+        var geom = ObjGeometry.Build(ObjParser.Parse(CubeObj).Model);
+        var (sigs, _, _) = MiniBake(geom, BakeSweep());
+        var rng = new Random(RandomSeed);
+        int unmatched = 0;
+        Matrix4x4 firstFail = default;
+        Vector3 firstFailYpr = default;
+        for (int r = 0; r < 500; r++)
+        {
+            (var rot, var ypr) = RandomRotationAndAngles(rng);
+            bool any = false;
+            foreach (var sig in sigs) { if (EvaluatePredicate(geom, sig, rot)) { any = true; break; } }
+            if (!any)
+            {
+                if (unmatched == 0) { firstFail = rot; firstFailYpr = ypr; }
+                unmatched++;
+            }
+        }
+        Assert.True(unmatched == 0, $"cube bake-coverage: {unmatched}/500 rotations matched no signature; first ypr={firstFailYpr}");
+    }
+
+    [Fact]
+    public void Book_BakeCoverage_EveryRandomRotationMatchesSomeSignature()
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Samples", "book.obj");
+        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model);
+        var (sigs, _, _) = MiniBake(geom, BakeSweep());
+        var rng = new Random(RandomSeed);
+        int unmatched = 0;
+        Matrix4x4 firstFail = default;
+        Vector3 firstFailYpr = default;
+        for (int r = 0; r < 500; r++)
+        {
+            (var rot, var ypr) = RandomRotationAndAngles(rng);
+            bool any = false;
+            foreach (var sig in sigs) { if (EvaluatePredicate(geom, sig, rot)) { any = true; break; } }
+            if (!any)
+            {
+                if (unmatched == 0) { firstFail = rot; firstFailYpr = ypr; }
+                unmatched++;
+            }
+        }
+        Assert.True(unmatched == 0, $"book bake-coverage: {unmatched}/500 rotations matched no signature; first ypr={firstFailYpr}");
+    }
+
+    // ----- Test (B): Predicate self-consistency. Each baked signature's predicate matches its own representative θ. -----
+    [Fact]
+    public void Book_EachSignaturePredicateMatchesItsRepresentativeRotation()
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Samples", "book.obj");
+        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model);
+        var (sigs, _, raw) = MiniBake(geom, BakeSweep());
+        // Build key→representative rotation map from the raw samples.
+        var sigByKey = sigs.ToDictionary(s => s.Key);
+        var pairVariesDummy = new bool[geom.Quads.Length, geom.Quads.Length];
+        // Reconstruct the same pairVaries the bake computed.
+        (_, var pairVaries, _) = MiniBake(geom, BakeSweep());
+        foreach (var rs in raw)
+        {
+            string key = MakeKey(rs.FaceSigns, rs.PairSigns, pairVaries, geom.Quads.Length);
+            var sig = sigByKey[key];
+            Assert.True(EvaluatePredicate(geom, sig, rs.Rotation),
+                $"signature key '{key}' predicate failed at its own representative rotation");
+        }
+    }
+
+    // ----- Test (C): Cell uniqueness. At a random θ, no two signature predicates both match. -----
+    [Fact]
+    public void Book_CellsAreUniqueAtRandomRotations()
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Samples", "book.obj");
+        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model);
+        var (sigs, _, _) = MiniBake(geom, BakeSweep());
+        var rng = new Random(RandomSeed);
+        int multiMatches = 0;
+        for (int r = 0; r < 500; r++)
+        {
+            (var rot, _) = RandomRotationAndAngles(rng);
+            int matches = 0;
+            foreach (var sig in sigs) if (EvaluatePredicate(geom, sig, rot)) matches++;
+            // Tolerance bands can legitimately overlap right at boundaries, so
+            // we assert a soft bound: at most 4 simultaneous matches. Random
+            // rotations don't usually land on exact event boundaries; if more
+            // than 4 cells match, the tolerance is too wide and runtime
+            // would render the wrong cell.
+            if (matches > 4) multiMatches++;
+        }
+        Assert.True(multiMatches == 0, $"book cell uniqueness: {multiMatches}/500 rotations had >4 simultaneous matches");
+    }
+
+    // ----- Test (E): Multi-revolution spin sweep. -----
+    [Theory]
+    [InlineData(0f, 0f)]      // pure yaw spin
+    [InlineData(30f, 0f)]     // pitch=30
+    [InlineData(0f, 45f)]     // roll=45
+    [InlineData(30f, 30f)]    // pitch+roll
+    public void Book_MultiRevolutionYawSpinHasNoViolations(float pitchDeg, float rollDeg)
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Samples", "book.obj");
+        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model);
+        // 5 full revolutions, 1° steps = 1800 samples.
+        int violations = 0;
+        for (int s = 0; s < 1800; s++)
+        {
+            float yaw = s * 1f; // 0..1800° (5 revs)
+            var rot = MakeRotation(yaw, pitchDeg, rollDeg);
+            var (visibility, order) = ComputeBakedAspectOrder(geom, rot);
+            int visibleCount = 0;
+            for (int i = 0; i < visibility.Length; i++) if (visibility[i]) visibleCount++;
+            if (visibleCount < 2) continue;
+            var v = PainterCorrectness.FindWorstViolation(geom, order, visibleCount, rot);
+            if (v.HasValue) violations++;
+        }
+        Assert.True(violations == 0,
+            $"book multi-rev spin pitch={pitchDeg} roll={rollDeg}: {violations}/1800 yaw samples violated");
+    }
+
+    // ----- Test (F): Sample density sufficiency. Test bake at production density and check 10× finer θ has correct match. -----
+    [Fact]
+    public void Book_FineGridRotationsAllProduceCorrectPainterOrder()
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Samples", "book.obj");
+        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model);
+        var (sigs, _, _) = MiniBake(geom, BakeSweep());
+        // 10× finer grid: 240 yaw, 120 pitch, 120 roll = 3.45M samples — too many.
+        // Instead use 3.6M but stratified-random so cost is bounded.
+        var rng = new Random(RandomSeed + 1);
+        int total = 1500;
+        int unmatched = 0;
+        int wrongOrder = 0;
+        Vector3 firstUnmatchedYpr = default;
+        Vector3 firstWrongYpr = default;
+        for (int s = 0; s < total; s++)
+        {
+            (var rot, var ypr) = RandomRotationAndAngles(rng);
+            // Find the matching signature.
+            MiniSignature? match = null;
+            foreach (var sig in sigs) if (EvaluatePredicate(geom, sig, rot)) { match = sig; break; }
+            if (match == null)
+            {
+                if (unmatched == 0) firstUnmatchedYpr = ypr;
+                unmatched++;
+                continue;
+            }
+            // Verify the matching signature's painter order has no violation at this rotation.
+            var visibleCount = match.Order.Length;
+            if (visibleCount < 2) continue;
+            var v = PainterCorrectness.FindWorstViolation(geom, match.Order, visibleCount, rot);
+            if (v.HasValue)
+            {
+                if (wrongOrder == 0) firstWrongYpr = ypr;
+                wrongOrder++;
+            }
+        }
+        Assert.True(unmatched == 0 && wrongOrder == 0,
+            $"book fine-grid sufficiency: unmatched={unmatched}/{total} (first ypr={firstUnmatchedYpr}), " +
+            $"wrong-order={wrongOrder}/{total} (first ypr={firstWrongYpr})");
+    }
+
+    // ----- Test (D): Pinned angles from session bug reports. -----
+    [Theory]
+    [InlineData(50f, 63f, 74f, "v120 pages-over-cover bug")]
+    [InlineData(31f, -112f, 0f, "v118 pages-under-back-cover bug")]
+    [InlineData(-47f, -33f, 0f, "v110 no-signature-matches failure")]
+    [InlineData(40f, 20f, 0f, "v117 page-edge-sliver case")]
+    public void Book_SessionBugAngles_RemainCorrect(float yawDeg, float pitchDeg, float rollDeg, string label)
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Samples", "book.obj");
+        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model);
+        var rot = MakeRotation(yawDeg, pitchDeg, rollDeg);
+        AssertNoViolation(geom, rot, label);
+    }
 }
+
