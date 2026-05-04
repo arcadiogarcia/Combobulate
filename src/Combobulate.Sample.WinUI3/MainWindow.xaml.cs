@@ -91,6 +91,57 @@ public sealed partial class MainWindow : Window
             SceneVisualColumn.Width = on ? new GridLength(1, GridUnitType.Star) : new GridLength(0);
     }
 
+    // ===== Diagnostics pane =====
+    private DispatcherTimer? _diagTimer;
+
+    private void RefreshDiag_Click(object sender, RoutedEventArgs e) => RefreshDiagPane();
+
+    private void AutoDiagToggle_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (AutoDiagToggle?.IsOn == true)
+        {
+            _diagTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+            _diagTimer.Tick -= DiagTimer_Tick;
+            _diagTimer.Tick += DiagTimer_Tick;
+            _diagTimer.Start();
+        }
+        else
+        {
+            _diagTimer?.Stop();
+        }
+    }
+
+    private void DiagTimer_Tick(object? sender, object e) => RefreshDiagPane();
+
+    private void RefreshDiagPane()
+    {
+        if (DiagText == null) return;
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"RenderingMode: {combobulate?.RenderingMode}");
+            sb.AppendLine($"Source: {combobulate?.Source ?? "(null)"}");
+            var model = combobulate?.Model;
+            sb.AppendLine($"Model.Quads.Count: {(model?.Quads.Count.ToString() ?? "(null)")}");
+            sb.AppendLine($"ModelScale: {combobulate?.ModelScale}");
+            sb.AppendLine($"Sliders: pitch={PitchSlider?.Value:F1} yaw={YawSlider?.Value:F1} roll={RollSlider?.Value:F1}");
+            sb.AppendLine();
+            if (combobulate != null && combobulate.RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph)
+            {
+                sb.AppendLine(combobulate.GetBakedAspectGraphDiagnostics());
+            }
+            else
+            {
+                sb.AppendLine("(BakedAspectGraph not active.)");
+            }
+            DiagText.Text = sb.ToString();
+        }
+        catch (Exception ex)
+        {
+            DiagText.Text = $"Diag error: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
     /// <summary>
     /// Autonomous continuous Y-axis spin. Implicitly enables External + Auto-refresh
     /// (spin is meaningless without them: external routes rotation through composition,

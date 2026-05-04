@@ -64,6 +64,11 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
     private ExpressionAnimation? _bakedMatrixAnim;
     private const string BakedMatrixPropertyName = "M";
 
+    // Last successful bake's signatures (preserved for diagnostic
+    // reporting: live sign vector vs. baked sign vectors).
+    private SignatureBake.Signature[]? _lastBakeSignatures;
+    private ObjGeometry? _lastBakeGeometry;
+
     // Cached bake inputs (so MaybeRebake / completion callbacks can compare).
     private Matrix4x4Node? _transformNode;
     private TransformAnimationAxis[]? _axes;
@@ -214,7 +219,6 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         for (int i = 0; i < sigs.Length; i++) cellSigs[i] = new CellSig { Sig = sigs[i] };
         return new ComputedBake { Cells = cellSigs };
     }
-
     /// <summary>
     /// UI-thread phase: materialise cells into Composition trees, spread
     /// across multiple dispatcher ticks so the UI thread never blocks for
@@ -329,6 +333,12 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             DisposeTrees();
             _trees = newTrees;
             _stagingTrees = null;
+            // Stash signatures + geometry so diagnostics can compare the
+            // current live sign vector against what was baked.
+            var sigs = new SignatureBake.Signature[computed.Cells.Length];
+            for (int k = 0; k < computed.Cells.Length; k++) sigs[k] = computed.Cells[k].Sig;
+            _lastBakeSignatures = sigs;
+            _lastBakeGeometry = geometry;
             int started = 0;
             string? firstError = null;
             for (int i = 0; i < newTrees.Length; i++)
@@ -452,25 +462,93 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         }
 
         if (_trees == null) return sb.ToString();
-        // Read the live baked matrix property to verify the user-AST animation is firing.
-        if (_bakedMatrixProps != null)
+        // Note on bakedMatrix.live: TryGetMatrix4x4 returns the static
+        // seed value, NOT the animated value. The compositor evaluates
+        // the animation per frame on its own thread; the property's CPU
+        // mirror only updates when the animation is stopped or
+        // explicitly snapshotted. So we don't read it here. To verify
+        // the live transform we evaluate the typed AST directly above
+        // (transform.Evaluate()).
+        System.Numerics.Matrix4x4 liveM;
+        bool gotLive = false;
+        if (_transformNode is not null)
         {
-            try
-            {
-                _bakedMatrixProps.TryGetMatrix4x4(BakedMatrixPropertyName, out var liveM);
-                sb.AppendLine($"  bakedMatrix.live = M11={liveM.M11:F3} M12={liveM.M12:F3} M13={liveM.M13:F3} M14={liveM.M14:F3}");
-                sb.AppendLine($"                     M21={liveM.M21:F3} M22={liveM.M22:F3} M23={liveM.M23:F3} M24={liveM.M24:F3}");
-                sb.AppendLine($"                     M31={liveM.M31:F3} M32={liveM.M32:F3} M33={liveM.M33:F3} M34={liveM.M34:F3}");
-                sb.AppendLine($"                     M41={liveM.M41:F3} M42={liveM.M42:F3} M43={liveM.M43:F3} M44={liveM.M44:F3}");
-            }
-            catch (Exception ex) { sb.AppendLine($"  bakedMatrix.TryGetMatrix4x4 THREW: {ex.Message}"); }
+            try { liveM = _transformNode.Evaluate(); gotLive = true; }
+            catch { liveM = System.Numerics.Matrix4x4.Identity; }
         }
-        // each cell's bounds we cached at bake time. We don't have direct
-        // access to CellSig from here (private struct), so we enumerate
-        // the parent.Children stack and report each child's static Opacity.
-        // The static property reflects whatever the last-set scalar was;
-        // for a started ExpressionAnimation it will be the last-evaluated
-        // value (compositor commits propagate back to the property).
+        else liveM = System.Numerics.Matrix4x4.Identity;
+
+        // Compute the live sign vector against the live matrix and compare
+        // against every baked signature. This is the single most useful
+        // diagnostic: if the live key matches no baked signature, the bake
+        // is incomplete and that's why the visual disappears.
+        if (gotLive && _lastBakeSignatures != null && _lastBakeGeometry != null)
+        {
+            var quads = _lastBakeGeometry.Quads;
+            int nq = quads.Length;
+            var liveFace = new sbyte[nq];
+            var liveZ = new float[nq];
+            for (int q = 0; q < nq; q++)
+            {
+                float nz = EventFunctions.EvalDirectionZ(liveM, quads[q].Normal);
+                liveFace[q] = nz > 0f ? (sbyte)+1 : (sbyte)-1;
+                liveZ[q] = EventFunctions.EvalPointZ(liveM, quads[q].Centroid);
+            }
+            var livePair = new sbyte[nq, nq];
+            for (int i = 0; i < nq; i++)
+            {
+                if (liveFace[i] < 0) continue;
+                for (int j = i + 1; j < nq; j++)
+                {
+                    if (liveFace[j] < 0) continue;
+                    float diff = liveZ[j] - liveZ[i];
+                    sbyte s = diff > 0f ? (sbyte)+1 : (sbyte)-1;
+                    livePair[i, j] = s;
+                    livePair[j, i] = (sbyte)-s;
+                }
+            }
+            // Build live key matching SignatureBake's BuildKey format.
+            var keyB = new System.Text.StringBuilder(nq + nq * (nq - 1) / 2 + 4);
+            for (int i = 0; i < nq; i++) keyB.Append(liveFace[i] > 0 ? '+' : '-');
+            keyB.Append('|');
+            for (int i = 0; i < nq; i++)
+                for (int j = i + 1; j < nq; j++)
+                    keyB.Append(livePair[i, j] switch { 1 => '+', -1 => '-', _ => '0' });
+            string liveKey = keyB.ToString();
+
+            sb.AppendLine($"  liveKey = {liveKey}");
+            int matchIdx = -1;
+            int bestHamming = int.MaxValue;
+            int bestIdx = -1;
+            for (int s = 0; s < _lastBakeSignatures.Length; s++)
+            {
+                var bk = _lastBakeSignatures[s].Key;
+                if (bk == liveKey) { matchIdx = s; break; }
+                int h = 0;
+                for (int c = 0; c < bk.Length && c < liveKey.Length; c++) if (bk[c] != liveKey[c]) h++;
+                if (h < bestHamming) { bestHamming = h; bestIdx = s; }
+            }
+            if (matchIdx >= 0)
+            {
+                var ms = _lastBakeSignatures[matchIdx];
+                sb.AppendLine($"  liveKey MATCHES baked sig[{matchIdx}] order=[{string.Join(",", ms.Order)}] vis=[{string.Join("", System.Linq.Enumerable.Select(ms.Visibility, b => b ? '1' : '0'))}]");
+            }
+            else
+            {
+                sb.AppendLine($"  liveKey MATCHES NONE — closest sig[{bestIdx}] hamming={bestHamming}: {_lastBakeSignatures[bestIdx].Key}");
+                // Diff the two keys to show which events disagree.
+                var ck = _lastBakeSignatures[bestIdx].Key;
+                int diffStart = -1;
+                for (int c = 0; c < liveKey.Length && c < ck.Length; c++)
+                {
+                    if (liveKey[c] != ck[c])
+                    {
+                        if (diffStart < 0) diffStart = c;
+                    }
+                }
+                if (diffStart >= 0) sb.AppendLine($"  first diff at column {diffStart}");
+            }
+        }
         sb.AppendLine($"  --- _parent.Children scalar Opacity values ---");
         int idx = 0;
         int nonZero = 0;
@@ -532,6 +610,25 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             }
             try { _bakedMatrixProps.StopAnimation(BakedMatrixPropertyName); } catch { }
             _bakedMatrixAnim = null;
+            // The user's _transformNode is also referenced by Combobulate's
+            // _root.TransformMatrix animation. The ExpressionsFork caches
+            // a single ExpressionAnimation instance on the typed node and
+            // reuses it across StartAnimation calls. A single
+            // CompositionAnimation can only target one object/property,
+            // so when the legacy code path latches the cached animation
+            // onto _root.TransformMatrix, our subsequent
+            // _bakedMatrixProps.StartAnimation receives the SAME instance
+            // and ends up no-op-ed (or steals it back from _root). Either
+            // way the live matrix here stays at identity.
+            //
+            // Force a fresh animation by clearing the cached one via
+            // reflection (the property is internal). This forces the
+            // toolkit's StartAnimation extension to allocate a new
+            // ExpressionAnimation for our property.
+            var animProp = typeof(ExpressionNode).GetProperty(
+                "ExpressionAnimation",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            animProp?.SetValue(_transformNode, null);
             _bakedMatrixProps.StartAnimation(BakedMatrixPropertyName, _transformNode!);
         }
         catch (Exception ex)
