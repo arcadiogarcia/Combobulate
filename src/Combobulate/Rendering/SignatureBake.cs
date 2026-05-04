@@ -103,13 +103,32 @@ internal static class SignatureBake
         var centroidZScratch = new float[n];
         var pairSignsScratch = new sbyte[n, n];
 
-        // Numerical-precision robustness: pairs whose centroid-Z
-        // difference is below precision get sign 0 (don't-care). The
-        // PredicateCompiler skips those tests, so the signature key
-        // collapses across precision boundaries and the compositor
-        // matches the same cell regardless of which side of zero its
-        // arithmetic rounds to. The painter Order for those pairs falls
-        // back to a deterministic by-face-index tie-break.
+        // Plane-side relations are STATIC (rotation-invariant): for pure
+        // rotations the signed distance of c_i from face j's plane is
+        // identical in model space and rotated space, because rotations
+        // preserve dot products. So pair signs depend only on which
+        // faces are present (visibility pattern), not on the angle.
+        // Precompute the constant plane-side matrix once. The runtime
+        // predicate then needs only face-front tests; pair tests collapse
+        // to don't-care, drastically shrinking expression strings and
+        // eliminating the centroid-Z mis-orderings that occur for
+        // non-spherical objects (book pages slipping behind covers, etc).
+        var planeSidePair = new sbyte[n, n];
+        for (int i = 0; i < n; i++)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                if (i == j) continue;
+                // Sign of (n_j · (c_i - c_j)): >0 means c_i lies on the
+                // +n_j side of face j's plane, i.e. c_i is on j's
+                // viewer-facing side when j is front-facing → i should
+                // be drawn AFTER j (in front).
+                float side = Vector3.Dot(
+                    quads[j].Normal,
+                    quads[i].Centroid - quads[j].Centroid);
+                planeSidePair[i, j] = side > 0f ? (sbyte)+1 : (sbyte)-1;
+            }
+        }
 
         try
         {
@@ -220,15 +239,12 @@ internal static class SignatureBake
                     centroidZScratch[q] = EventFunctions.EvalPointZ(M, quads[q].Centroid);
                 }
 
-                // Pair sign: strict comparison so distinct orderings stay
-                // distinct in the signature. The PredicateCompiler
-                // emits TOLERANT inequalities (> -eps / < +eps) so
-                // float-precision differences between bake and compositor
-                // don't cause the matching cell to fail the test. When
-                // multiple cells' tolerance bands overlap, they light
-                // simultaneously — but their painter orders only differ
-                // on near-zero pairs whose visual contribution is below
-                // a pixel anyway.
+                // Pair signs: STATIC plane-side relations from the
+                // model. Only mutually-visible pairs contribute; hidden
+                // faces don't appear in the painter ordering. The pair
+                // sign is the constant we precomputed in planeSidePair
+                // — it does NOT depend on the rotation, only on whether
+                // both faces are visible at this sample.
                 for (int i = 0; i < n; i++)
                     for (int j = 0; j < n; j++) pairSignsScratch[i, j] = 0;
                 for (int i = 0; i < n; i++)
@@ -237,10 +253,8 @@ internal static class SignatureBake
                     for (int j = i + 1; j < n; j++)
                     {
                         if (faceSignsScratch[j] < 0) continue;
-                        float diff = centroidZScratch[j] - centroidZScratch[i];
-                        sbyte s = diff > 0f ? (sbyte)+1 : (sbyte)-1;
-                        pairSignsScratch[i, j] = s;
-                        pairSignsScratch[j, i] = (sbyte)-s;
+                        pairSignsScratch[i, j] = planeSidePair[i, j];
+                        pairSignsScratch[j, i] = planeSidePair[j, i];
                     }
                 }
 
@@ -254,15 +268,21 @@ internal static class SignatureBake
                     var visibleIdxs = new List<int>(n);
                     for (int q = 0; q < n; q++)
                         if (faceSignsScratch[q] > 0) visibleIdxs.Add(q);
+                    // Topological sort by plane-side: a should come
+                    // BEFORE b (drawn first / further from viewer) iff a
+                    // is on the back side of b's plane (n_b·(c_a-c_b) < 0)
+                    // AND b is on the front side of a's plane. If both
+                    // are on each other's back side (e.g. faces meeting
+                    // at a shared edge with no projected overlap) the
+                    // painter order doesn't matter — tie-break by face
+                    // index for stability.
                     visibleIdxs.Sort((a, b) =>
                     {
-                        // Back to front: largest Z first. Tie-break by
-                        // face index so the order is stable across CPU
-                        // and compositor evaluators when Z-difference is
-                        // below precision.
-                        float za = centroidZScratch[a], zb = centroidZScratch[b];
-                        int c = zb.CompareTo(za);
-                        return c != 0 ? c : a.CompareTo(b);
+                        sbyte ab = planeSidePair[a, b]; // +1: a on viewer-side of b → a in front of b
+                        sbyte ba = planeSidePair[b, a]; // +1: b on viewer-side of a → b in front of a
+                        if (ab < 0 && ba > 0) return -1; // a behind b
+                        if (ab > 0 && ba < 0) return +1; // a in front of b
+                        return a.CompareTo(b);
                     });
 
                     var visibility = new bool[n];
