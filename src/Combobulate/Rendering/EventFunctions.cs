@@ -45,32 +45,44 @@ internal static class EventFunctions
 {
     /// <summary>
     /// <c>(M · point).z</c> as a typed <see cref="ScalarNode"/>:
-    /// <c>v.x*M13 + v.y*M23 + v.z*M33 + M43</c>.
+    /// <c>v.x*M13 + v.y*M23 + v.z*M33 + M43</c>. Skips terms whose
+    /// coefficient is exactly 0 (and avoids producing <c>-0</c> literals)
+    /// so the resulting Composition expression string stays as short as
+    /// possible — the compositor parser has a length limit and dense
+    /// per-cell predicates of dozens of events compound the cost
+    /// dramatically.
     /// </summary>
     public static ScalarNode TransformedPointZ(Matrix4x4Node M, Vector3 v)
     {
-        // ExpressionsFork already supports ScalarNode +/- ScalarNode and
-        // ScalarNode * float. Materialise the matrix subchannels once and
-        // use them as ScalarNode leaves; the AST shares them when many
-        // events are built from the same M.
-        var m13 = M.Channel13;
-        var m23 = M.Channel23;
-        var m33 = M.Channel33;
-        var m43 = M.Channel43;
-        return m13 * v.X + m23 * v.Y + m33 * v.Z + m43;
+        ScalarNode? acc = null;
+        if (v.X != 0f) acc = AddTerm(acc, M.Channel13 * NoNegZero(v.X));
+        if (v.Y != 0f) acc = AddTerm(acc, M.Channel23 * NoNegZero(v.Y));
+        if (v.Z != 0f) acc = AddTerm(acc, M.Channel33 * NoNegZero(v.Z));
+        // Translation contribution always present (Channel43 may be
+        // animated at runtime even if at bake time it's 0).
+        acc = AddTerm(acc, M.Channel43);
+        return acc!;
     }
 
     /// <summary>
     /// <c>(M · direction).z</c> as a typed <see cref="ScalarNode"/>: no
-    /// translation contribution. <c>n.x*M13 + n.y*M23 + n.z*M33</c>.
+    /// translation contribution. Skips zero-coefficient terms.
     /// </summary>
     public static ScalarNode TransformedDirectionZ(Matrix4x4Node M, Vector3 n)
     {
-        var m13 = M.Channel13;
-        var m23 = M.Channel23;
-        var m33 = M.Channel33;
-        return m13 * n.X + m23 * n.Y + m33 * n.Z;
+        ScalarNode? acc = null;
+        if (n.X != 0f) acc = AddTerm(acc, M.Channel13 * NoNegZero(n.X));
+        if (n.Y != 0f) acc = AddTerm(acc, M.Channel23 * NoNegZero(n.Y));
+        if (n.Z != 0f) acc = AddTerm(acc, M.Channel33 * NoNegZero(n.Z));
+        // If all components were 0 (degenerate), return a constant 0.
+        return acc ?? (ScalarNode)0f;
     }
+
+    /// <summary>Map -0 to +0 so the toolkit doesn't emit a "-0" literal that
+    /// some compositor expression evaluators reject.</summary>
+    private static float NoNegZero(float f) => f == 0f ? 0f : f;
+
+    private static ScalarNode AddTerm(ScalarNode? acc, ScalarNode term) => acc is null ? term : acc + term;
 
     /// <summary>
     /// CPU evaluation of <c>(M · point).z</c>. Used during the bake's

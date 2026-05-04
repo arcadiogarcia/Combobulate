@@ -103,6 +103,14 @@ internal static class SignatureBake
         var centroidZScratch = new float[n];
         var pairSignsScratch = new sbyte[n, n];
 
+        // Numerical-precision robustness: pairs whose centroid-Z
+        // difference is below precision get sign 0 (don't-care). The
+        // PredicateCompiler skips those tests, so the signature key
+        // collapses across precision boundaries and the compositor
+        // matches the same cell regardless of which side of zero its
+        // arithmetic rounds to. The painter Order for those pairs falls
+        // back to a deterministic by-face-index tie-break.
+
         try
         {
             // Pass 1: regular grid sweep to catch the bulk of distinct signatures.
@@ -213,7 +221,20 @@ internal static class SignatureBake
                 }
 
                 // Compute pair signs only for mutually visible pairs.
-                // Pair convention: diff > 0 → +1, diff <= 0 → -1.
+                // Pair convention: diff > 0 → +1, diff <= 0 → -1, |diff|
+                // below precision threshold → 0 (don't-care). The
+                // PredicateCompiler skips don't-care pairs, so the
+                // signature key collapses across precision boundaries
+                // and the compositor matches the same cell regardless
+                // of which side of zero the diff rounds to.
+                float maxComp = 0f;
+                for (int q = 0; q < n; q++)
+                {
+                    float az = Math.Abs(centroidZScratch[q]);
+                    if (az > maxComp) maxComp = az;
+                }
+                float epsilon = Math.Max(maxComp * 1e-3f, 1e-5f);
+
                 for (int i = 0; i < n; i++)
                     for (int j = 0; j < n; j++) pairSignsScratch[i, j] = 0;
                 for (int i = 0; i < n; i++)
@@ -223,35 +244,46 @@ internal static class SignatureBake
                     {
                         if (faceSignsScratch[j] < 0) continue;
                         float diff = centroidZScratch[j] - centroidZScratch[i];
+                        if (Math.Abs(diff) < epsilon) continue; // don't-care
                         sbyte s = diff > 0f ? (sbyte)+1 : (sbyte)-1;
                         pairSignsScratch[i, j] = s;
                         pairSignsScratch[j, i] = (sbyte)-s;
                     }
                 }
 
-                string key = BuildKey(faceSignsScratch, pairSignsScratch, n);
-                if (signatures.ContainsKey(key)) return;
+                EmitSignature();
 
-                var visibleIdxs = new List<int>(n);
-                for (int q = 0; q < n; q++)
-                    if (faceSignsScratch[q] > 0) visibleIdxs.Add(q);
-                visibleIdxs.Sort((a, b) =>
+                void EmitSignature()
                 {
-                    float za = centroidZScratch[a], zb = centroidZScratch[b];
-                    return zb.CompareTo(za);
-                });
+                    string key = BuildKey(faceSignsScratch, pairSignsScratch, n);
+                    if (signatures.ContainsKey(key)) return;
 
-                var visibility = new bool[n];
-                for (int q = 0; q < n; q++) visibility[q] = faceSignsScratch[q] > 0;
+                    var visibleIdxs = new List<int>(n);
+                    for (int q = 0; q < n; q++)
+                        if (faceSignsScratch[q] > 0) visibleIdxs.Add(q);
+                    visibleIdxs.Sort((a, b) =>
+                    {
+                        // Back to front: largest Z first. Tie-break by
+                        // face index so the order is stable across CPU
+                        // and compositor evaluators when Z-difference is
+                        // below precision.
+                        float za = centroidZScratch[a], zb = centroidZScratch[b];
+                        int c = zb.CompareTo(za);
+                        return c != 0 ? c : a.CompareTo(b);
+                    });
 
-                signatures[key] = new Signature
-                {
-                    FaceSigns = (sbyte[])faceSignsScratch.Clone(),
-                    PairSigns = (sbyte[,])pairSignsScratch.Clone(),
-                    Order = visibleIdxs.ToArray(),
-                    Visibility = visibility,
-                    Key = key,
-                };
+                    var visibility = new bool[n];
+                    for (int q = 0; q < n; q++) visibility[q] = faceSignsScratch[q] > 0;
+
+                    signatures[key] = new Signature
+                    {
+                        FaceSigns = (sbyte[])faceSignsScratch.Clone(),
+                        PairSigns = (sbyte[,])pairSignsScratch.Clone(),
+                        Order = visibleIdxs.ToArray(),
+                        Visibility = visibility,
+                        Key = key,
+                    };
+                }
             }
         }
         finally
