@@ -220,21 +220,15 @@ internal static class SignatureBake
                     centroidZScratch[q] = EventFunctions.EvalPointZ(M, quads[q].Centroid);
                 }
 
-                // Compute pair signs only for mutually visible pairs.
-                // Pair convention: diff > 0 → +1, diff <= 0 → -1, |diff|
-                // below precision threshold → 0 (don't-care). The
-                // PredicateCompiler skips don't-care pairs, so the
-                // signature key collapses across precision boundaries
-                // and the compositor matches the same cell regardless
-                // of which side of zero the diff rounds to.
-                float maxComp = 0f;
-                for (int q = 0; q < n; q++)
-                {
-                    float az = Math.Abs(centroidZScratch[q]);
-                    if (az > maxComp) maxComp = az;
-                }
-                float epsilon = Math.Max(maxComp * 1e-3f, 1e-5f);
-
+                // Pair sign: strict comparison so distinct orderings stay
+                // distinct in the signature. The PredicateCompiler
+                // emits TOLERANT inequalities (> -eps / < +eps) so
+                // float-precision differences between bake and compositor
+                // don't cause the matching cell to fail the test. When
+                // multiple cells' tolerance bands overlap, they light
+                // simultaneously — but their painter orders only differ
+                // on near-zero pairs whose visual contribution is below
+                // a pixel anyway.
                 for (int i = 0; i < n; i++)
                     for (int j = 0; j < n; j++) pairSignsScratch[i, j] = 0;
                 for (int i = 0; i < n; i++)
@@ -244,7 +238,6 @@ internal static class SignatureBake
                     {
                         if (faceSignsScratch[j] < 0) continue;
                         float diff = centroidZScratch[j] - centroidZScratch[i];
-                        if (Math.Abs(diff) < epsilon) continue; // don't-care
                         sbyte s = diff > 0f ? (sbyte)+1 : (sbyte)-1;
                         pairSignsScratch[i, j] = s;
                         pairSignsScratch[j, i] = (sbyte)-s;

@@ -30,6 +30,19 @@ namespace Combobulate.Rendering;
 internal static class PredicateCompiler
 {
     /// <summary>
+    /// Tolerance used for predicate inequalities. Compositor and CPU
+    /// arithmetic disagree on signs of near-zero quantities; using
+    /// strict <c>&gt; 0</c> would leave gaps where no cell matches. With
+    /// <c>&gt; -<see cref="PredicateEpsilon"/></c> (and the symmetric
+    /// <c>&lt; +epsilon</c> for - signs) overlap bands cover the
+    /// disagreement; multiple cells may light simultaneously near
+    /// boundaries, but their painter orders only differ on near-zero
+    /// pairs (sub-pixel depth difference), so the visual result is
+    /// indistinguishable.
+    /// </summary>
+    public const float PredicateEpsilon = 1e-3f;
+
+    /// <summary>
     /// Build the BooleanNode predicate for one signature given a baked-matrix
     /// reference (a CompositionPropertySet's Matrix4x4 property "M" that
     /// holds the live transform). The predicate references that single
@@ -47,14 +60,13 @@ internal static class PredicateCompiler
         BooleanNode? acc = null;
 
         // Face-front tests for every face (visible or hidden in this signature).
-        // Convention: + sign → normalZ > 0; - sign → normalZ <= 0. Faces edge-on
-        // (normalZ exactly 0) are canonically hidden, matching geometry.
+        // Tolerant convention: + sign → normalZ > -eps; - sign → normalZ < +eps.
         for (int q = 0; q < n; q++)
         {
             var normalZ = EventFunctions.TransformedDirectionZ(bakedMatrix, quads[q].Normal);
             BooleanNode test = sig.FaceSigns[q] > 0
-                ? normalZ > (ScalarNode)0f
-                : normalZ <= (ScalarNode)0f;
+                ? normalZ > (ScalarNode)(-PredicateEpsilon)
+                : normalZ < (ScalarNode)(+PredicateEpsilon);
             acc = acc is null ? test : ExpressionFunctions.And(acc, test);
         }
 
@@ -70,8 +82,8 @@ internal static class PredicateCompiler
                 var diff = quads[j].Centroid - quads[i].Centroid;
                 var diffZ = EventFunctions.TransformedDirectionZ(bakedMatrix, diff);
                 BooleanNode test = s > 0
-                    ? diffZ > (ScalarNode)0f
-                    : diffZ <= (ScalarNode)0f;
+                    ? diffZ > (ScalarNode)(-PredicateEpsilon)
+                    : diffZ < (ScalarNode)(+PredicateEpsilon);
                 acc = ExpressionFunctions.And(acc!, test);
             }
         }
