@@ -45,6 +45,21 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
     private readonly ContainerVisual _parent;
 
     private ContainerVisual[]? _trees;
+    /// <summary>
+    /// For each entry of <see cref="_trees"/>, the cached-quad indices of
+    /// the visible sprites in painter order (matches the order in which
+    /// they were inserted as children of the tree). Used by
+    /// <see cref="UpdateBindings"/> to map a child position back to its
+    /// source quad so a hot brush swap can find the right entry in
+    /// <see cref="ResolvedQuadMaterials"/> without touching the bake.
+    /// </summary>
+    private int[][]? _treeVisibleQuadIndices;
+    /// <summary>
+    /// Geometry the current trees were built against; needed by
+    /// <see cref="UpdateBindings"/> when reusing existing trees so we
+    /// can validate the new bindings have the same quad count.
+    /// </summary>
+    private ObjGeometry? _treesGeometry;
     // Staging trees from the in-flight bake. They are inserted into
     // _parent.Children at Opacity=0 as ChunkBuild progresses; on Dispose
     // (or on stale-generation bail-out) we walk this and remove them so
@@ -257,8 +272,9 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             EnsureBakedMatrixSource();
             var newTrees = new ContainerVisual[computed.Cells.Length];
             var newOpacityExprs = new Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode[computed.Cells.Length];
+            var newTreeIndices = new int[computed.Cells.Length][];
             ChunkBuild(computed, geometry, bindings, scale, hostW, hostH, axes,
-                       newTrees, newOpacityExprs, startIndex: 0, ui, generation);
+                       newTrees, newOpacityExprs, newTreeIndices, startIndex: 0, ui, generation);
         }
         catch (Exception ex)
         {
@@ -283,6 +299,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         TransformAnimationAxis[] axes,
         ContainerVisual[] newTrees,
         Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode[] newOpacityExprs,
+        int[][] newTreeIndices,
         int startIndex,
         Microsoft.UI.Dispatching.DispatcherQueue ui,
         int generation)
@@ -304,7 +321,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             var c = computed.Cells[i];
             var tree = _compositor.CreateContainerVisual();
             tree.Opacity = 0; // hidden until swap
-            BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Sig.Order, c.Sig.Visibility);
+            newTreeIndices[i] = BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Sig.Order, c.Sig.Visibility);
             // Build (but don't start) the opacity expression — we'll start
             // them all in the swap step so the new tree set lights up
             // atomically and the old one disappears in the same compositor
@@ -322,7 +339,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         {
             // More to do — schedule the next chunk.
             ui.TryEnqueue(() => ChunkBuild(computed, geometry, bindings, scale, hostW, hostH, axes,
-                                           newTrees, newOpacityExprs, end, ui, generation));
+                                           newTrees, newOpacityExprs, newTreeIndices, end, ui, generation));
         }
         else
         {
@@ -332,6 +349,8 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             if (_disposed || generation != _bakeGeneration) { EvictStaging(); return; }
             DisposeTrees();
             _trees = newTrees;
+            _treeVisibleQuadIndices = newTreeIndices;
+            _treesGeometry = geometry;
             _stagingTrees = null;
             // Stash signatures + geometry so diagnostics can compare the
             // current live sign vector against what was baked.
@@ -381,7 +400,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         return (ScalarNode)0f;
     }
 
-    private void BuildTreeContent(
+    private int[] BuildTreeContent(
         ContainerVisual tree,
         ObjGeometry geometry,
         ResolvedQuadMaterials bindings,
@@ -411,12 +430,69 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             sprite.IsVisible = visibility[q];
             sprites[q] = sprite;
         }
+        // Build the painter-order list of *visible* quads and parent them
+        // in that order. Return the index list so UpdateBindings can map
+        // children back to source quads later without re-deriving.
+        var visibleOrder = new System.Collections.Generic.List<int>(order.Length);
         for (int i = 0; i < order.Length; i++)
         {
             int qi = order[i];
             if (!visibility[qi]) continue;
             tree.Children.InsertAtTop(sprites[qi]);
+            visibleOrder.Add(qi);
         }
+        return visibleOrder.ToArray();
+    }
+
+    /// <summary>
+    /// Hot brush-swap path. When the host's <c>Materials</c> dependency
+    /// property changes but everything else (geometry, scale, host size,
+    /// sort algorithm, transform AST, axes) stays the same, the bake's
+    /// signature set + cell predicates + sprite tree topology are still
+    /// valid — only the per-quad <see cref="CompositionBrush"/> needs to
+    /// change. This walks each existing cell's child list in lock-step
+    /// with its cached visible-quad-index mapping and reassigns brushes
+    /// from <paramref name="newBindings"/> in place. Cost is O(cells ×
+    /// visible-faces) brush writes, no allocation, no compositor expression
+    /// reinstall.
+    ///
+    /// <para>Returns true if the swap was applied. Returns false when the
+    /// renderer has no current trees (caller should fall back to a full
+    /// bake) or when the new bindings' quad count differs from what the
+    /// trees were built against (caller should likewise full-rebake; this
+    /// only happens if the geometry changed, which already invalidates
+    /// the trees).</para>
+    /// </summary>
+    public bool UpdateBindings(ResolvedQuadMaterials newBindings)
+    {
+        if (_trees is null || _treeVisibleQuadIndices is null || _treesGeometry is null) return false;
+        var quads = _treesGeometry.Quads;
+        if (newBindings.Bindings.Length != quads.Length) return false;
+        for (int t = 0; t < _trees.Length; t++)
+        {
+            var tree = _trees[t];
+            var visibleQuads = _treeVisibleQuadIndices[t];
+            var children = tree.Children;
+            int childIdx = 0;
+            // VisualCollection enumerates in render (z) order, bottom-to-top.
+            // InsertAtTop adds to the top, so the FIRST inserted ends up at
+            // the bottom and is enumerated first. We added to visibleQuads
+            // in the same loop that called InsertAtTop, so child index k
+            // pairs directly with visibleQuads[k].
+            int n = visibleQuads.Length;
+            foreach (var child in children)
+            {
+                if (child is SpriteVisual sprite && childIdx < n)
+                {
+                    int qi = visibleQuads[childIdx];
+                    var newBrush = newBindings.Bindings[qi].Brush;
+                    if (!ReferenceEquals(sprite.Brush, newBrush))
+                        sprite.Brush = newBrush;
+                }
+                childIdx++;
+            }
+        }
+        return true;
     }
 
     /// <summary>
@@ -681,5 +757,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             t.Dispose();
         }
         _trees = null;
+        _treeVisibleQuadIndices = null;
+        _treesGeometry = null;
     }
 }

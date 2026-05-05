@@ -720,6 +720,14 @@ public sealed class Combobulate : Control
     private ObjGeometry? _bakedGeometry;
     private float _bakedScale, _bakedHostW, _bakedHostH;
     private global::Combobulate.Sorting.SortAlgorithm _bakedAlgorithm;
+    /// <summary>
+    /// Reference identity of the <see cref="ObjMaterialPack"/> the last bake's
+    /// sprite trees were built against. When the consumer assigns a new
+    /// <see cref="Materials"/> instance (e.g. cover image fades in after
+    /// async download) this token differs from the live one and we trigger
+    /// a fresh bake so the new brushes propagate to the materialised cells.
+    /// </summary>
+    private object? _bakedMaterialsToken;
     private CompositionPropertySet? _spinYawSourceProps;
     private string _spinYawScalarName = "SpinYaw";
     private string _yawValScalarName = "YawVal";
@@ -1428,6 +1436,27 @@ public sealed class Combobulate : Control
             || _bakedAlgorithm != SortAlgorithm
             || secondaryChanged;
         if (_baked != null && _baked.BakeInFlight) needRebake = false;
+
+        // Hot brush-swap fast-path: only Materials changed (geometry,
+        // scale, host size, sort algorithm, transform AST and axes are
+        // all unchanged). The bake's signature set + cell predicates +
+        // sprite tree topology are still valid; only the per-quad
+        // CompositionBrush needs to swap. No teardown / no compositor
+        // expression reinstall.
+        if (!needRebake && _baked != null && !_baked.BakeInFlight
+            && !ReferenceEquals(_bakedMaterialsToken, pack))
+        {
+            var hotBindings = MaterialResolver.Resolve(_compositor, geometry, pack);
+            if (_baked.UpdateBindings(hotBindings))
+            {
+                _bakedMaterialsToken = pack;
+                return;
+            }
+            // UpdateBindings refused (quad-count mismatch or no current
+            // trees); fall through to a full rebake.
+            needRebake = true;
+        }
+
         if (!needRebake) return;
 
         if (_baked == null)
@@ -1451,6 +1480,7 @@ public sealed class Combobulate : Control
         _bakedHostW = hostW;
         _bakedHostH = hostH;
         _bakedAlgorithm = SortAlgorithm;
+        _bakedMaterialsToken = pack;
         CaptureSecondaryProbe();
     }
 
