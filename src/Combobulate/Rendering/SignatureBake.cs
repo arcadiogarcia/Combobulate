@@ -56,8 +56,68 @@ internal static class SignatureBake
         public required string Key { get; init; }
     }
 
+    /// <summary>
+    /// Process-wide signature cache. Painter-sort signatures depend only
+    /// on the input geometry + sort algorithm + camera-distance + cull-margin
+    /// — not on the AST, axes' ScalarNode identities, or the consumer's
+    /// host control. So multiple Combobulate instances rendering the same
+    /// model (e.g. a grid of book thumbnails sharing one cached
+    /// <see cref="ObjGeometry"/>) can reuse a single bake's signature
+    /// table; only materialisation of the per-cell sprite trees is
+    /// per-instance work.
+    ///
+    /// <para>Keyed by reference-identity on the geometry, plus the
+    /// algorithm and float parameters. Geometry caching lives in
+    /// <see cref="ObjCache"/>; same parsed model always yields the same
+    /// <see cref="ObjGeometry"/> instance, so reference-equality is the
+    /// right invariant here.</para>
+    /// </summary>
+    private static readonly System.Collections.Generic.Dictionary<CacheKey, Signature[]> s_cache = new();
+    private static readonly object s_cacheLock = new();
+
+    private readonly record struct CacheKey(ObjGeometry Geom, SortAlgorithm Sort, int CameraDistanceBits, int CullMarginCosBits);
+
+    /// <summary>Number of distinct cached signature tables; for diagnostics.</summary>
+    public static int CacheCount { get { lock (s_cacheLock) return s_cache.Count; } }
+
+    /// <summary>Drop all cached signature tables. For tests and explicit
+    /// invalidation when a sorter implementation changes.</summary>
+    public static void ClearCache()
+    {
+        lock (s_cacheLock) s_cache.Clear();
+    }
+
     /// <summary>Run the bake.</summary>
     public static Signature[] Bake(
+        Matrix4x4Node transformNode,
+        TransformAnimationAxis[] axes,
+        ObjGeometry geometry,
+        SortAlgorithm sortAlgorithm,
+        float cameraDistance,
+        float cullMarginCos,
+        CancellationToken ct)
+    {
+        var key = new CacheKey(geometry, sortAlgorithm,
+            BitConverter.SingleToInt32Bits(cameraDistance),
+            BitConverter.SingleToInt32Bits(cullMarginCos));
+        lock (s_cacheLock)
+        {
+            if (s_cache.TryGetValue(key, out var cached)) return cached;
+        }
+
+        var fresh = BakeInternal(transformNode, axes, geometry, sortAlgorithm, cameraDistance, cullMarginCos, ct);
+
+        lock (s_cacheLock)
+        {
+            // Two threads may race a miss; the second writer's insert is
+            // a harmless overwrite (signatures are deterministic for a
+            // given geometry).
+            s_cache[key] = fresh;
+        }
+        return fresh;
+    }
+
+    private static Signature[] BakeInternal(
         Matrix4x4Node transformNode,
         TransformAnimationAxis[] axes,
         ObjGeometry geometry,
