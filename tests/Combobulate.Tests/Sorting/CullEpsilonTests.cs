@@ -82,8 +82,8 @@ public class CullEpsilonTests
     public void CullEpsilonIsPositiveAndAboveSinglePrecisionCosNoise()
     {
         // The whole point: must be > the noise floor of MathF.Cos(MathF.PI/2).
-        Assert.True(IFaceSorter.CullEpsilon > 1e-6f, "Epsilon too tight; fp noise will leak through");
-        Assert.True(IFaceSorter.CullEpsilon < 1e-2f, "Epsilon too loose; legitimate near-edge-on faces would be culled");
+        Assert.True(FaceSorterFactory.CullEpsilon > 1e-6f, "Epsilon too tight; fp noise will leak through");
+        Assert.True(FaceSorterFactory.CullEpsilon < 1e-2f, "Epsilon too loose; legitimate near-edge-on faces would be culled");
     }
 
     /// <summary>

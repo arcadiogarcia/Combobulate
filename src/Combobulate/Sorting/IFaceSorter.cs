@@ -27,17 +27,6 @@ namespace Combobulate.Sorting;
 public interface IFaceSorter
 {
     /// <summary>
-    /// Back-face cull threshold. Re-exports
-    /// <see cref="GeometryPredicates.CosineEpsilon"/> so existing call
-    /// sites and tests that reference <c>IFaceSorter.CullEpsilon</c>
-    /// continue to work; new code should prefer
-    /// <see cref="GeometryPredicates.IsFrontFacing"/> directly.
-    ///
-    /// <para>See <see cref="GeometryPredicates"/> for the full epsilon
-    /// hierarchy (cosine / distance / divisor / squared-length scales).</para>
-    /// </summary>
-    public const float CullEpsilon = GeometryPredicates.CosineEpsilon;
-    /// <summary>
     /// Number of source quads this sorter was built for. The caller's
     /// <paramref name="orderBuffer"/> and <paramref name="visibleBuffer"/>
     /// passed to <see cref="Sort"/> must be at least this large.
@@ -78,6 +67,20 @@ public interface IFaceSorter
 /// </summary>
 public static class FaceSorterFactory
 {
+    /// <summary>
+    /// Back-face cull threshold. Re-exports
+    /// <see cref="GeometryPredicates.CosineEpsilon"/> so existing call
+    /// sites and tests that reference <c>FaceSorterFactory.CullEpsilon</c>
+    /// keep working; new code should prefer
+    /// <see cref="GeometryPredicates.IsFrontFacing"/> directly.
+    ///
+    /// <para>Lives on this static class rather than <see cref="IFaceSorter"/>
+    /// because UWP's .NET Native runtime doesn't support the default-interface-
+    /// implementation feature (CS8701) needed for a const member on an
+    /// interface.</para>
+    /// </summary>
+    public const float CullEpsilon = GeometryPredicates.CosineEpsilon;
+
     public static IFaceSorter Create(SortAlgorithm algorithm, ObjGeometry geometry)
     {
         return algorithm switch

@@ -744,7 +744,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         {
             try
             {
-                if (_parent.Children.Contains(t)) _parent.Children.Remove(t);
+                if (t.Parent != null) _parent.Children.Remove(t);
                 t.Dispose();
             }
             catch { }
@@ -759,7 +759,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         {
             t.StopAnimation("Opacity");
             t.Children.RemoveAll();
-            if (_parent.Children.Contains(t)) _parent.Children.Remove(t);
+            if (t.Parent != null) _parent.Children.Remove(t);
             t.Dispose();
         }
         _trees = null;

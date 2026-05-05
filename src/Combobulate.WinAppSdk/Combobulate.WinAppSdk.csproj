@@ -22,14 +22,11 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.250401001" />
+    <PackageReference Include="arcadiog.CompositionExpressions" Version="0.1.3" />
     <PackageReference Include="PolySharp" Version="1.14.1">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\..\..\CompositionCollectionView\src\CompositionExpressions.WinAppSdk\CompositionExpressions.WinAppSdk.csproj" />
   </ItemGroup>
 
   <!-- Shared source files from the UWP library project -->
