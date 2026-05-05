@@ -3,7 +3,13 @@ using System.Collections.Generic;
 using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
+#if WINAPPSDK
 using Microsoft.UI.Composition;
+using DispatcherQueueNS = Microsoft.UI.Dispatching;
+#else
+using Windows.UI.Composition;
+using DispatcherQueueNS = Windows.System;
+#endif
 using Combobulate.Caching;
 using Combobulate.Sorting;
 using Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork;
@@ -156,7 +162,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         int myGeneration = ++_bakeGeneration;
 
         // Capture the UI dispatcher so we can hop back for materialisation.
-        var ui = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+        var ui = DispatcherQueueNS.DispatcherQueue.GetForCurrentThread();
 
         _ = Task.Run(() =>
         {
@@ -254,7 +260,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         ResolvedQuadMaterials bindings,
         float scale, float hostW, float hostH,
         TransformAnimationAxis[] axes,
-        Microsoft.UI.Dispatching.DispatcherQueue ui,
+        DispatcherQueueNS.DispatcherQueue ui,
         int generation)
     {
         try
@@ -301,7 +307,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode[] newOpacityExprs,
         int[][] newTreeIndices,
         int startIndex,
-        Microsoft.UI.Dispatching.DispatcherQueue ui,
+        DispatcherQueueNS.DispatcherQueue ui,
         int generation)
     {
         if (_disposed || generation != _bakeGeneration)
