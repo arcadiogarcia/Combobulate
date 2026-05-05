@@ -5,15 +5,17 @@ control turns an [`ObjModel`](../src/Combobulate/Parsing/ObjModel.cs) into a set
 WinUI / UWP **Composition `SpriteVisual`** quads on screen, including which
 algorithms run, when they run, and why.
 
-The pipeline has four stages:
+The pipeline has five stages:
 
 1. [Model load and parsing](#1-model-load-and-parsing)
 2. [Rebuild trigger and per-quad transform construction](#2-rebuild-trigger-and-per-quad-transform-construction)
 3. [Back-face culling](#3-back-face-culling)
-4. [Topology-aware painter's sort](#4-topology-aware-painters-sort)
+4. [Polygon ordering](#4-polygon-ordering)
+5. [Composition realisation](#5-composition-realisation) (sprite painter or baked aspect graph)
 
-A final section covers the [root-level perspective transform](#5-root-level-perspective-transform)
-that the per-quad sprites are drawn through.
+A final section covers the [root-level perspective transform](#6-root-level-perspective-transform)
+that the per-quad sprites are drawn through, and the
+[composition-thread animation](#composition-thread-animations) story.
 
 ---
 
@@ -55,8 +57,11 @@ change:
 | Host element `SizeChanged`           | Per-quad transforms include the host-centre origin.        |
 | `Loaded` / template applied          | Initial attachment of the visual tree.                     |
 
-> Changes to `EnablePerspective` only update the **root** transform, not the
-> per-quad ones — see [§5](#5-root-level-perspective-transform).
+> Changes to `EnablePerspective` or `PerspectiveDistance` only update the
+> **root** transform, not the per-quad ones — see
+> [§6](#6-root-level-perspective-transform). Changes to `SortAlgorithm`
+> or `RenderingMode` re-run the cull and sort but reuse the per-quad
+> transforms.
 
 For each quad, `Rebuild()`:
 
@@ -71,8 +76,10 @@ For each quad, `Rebuild()`:
    This is exact for parallelogram quads and approximates non-parallelograms
    by reconstructing `V2` as `V0 + (V1 − V0) + (V3 − V0)`.
 5. Creates a `SpriteVisual` of size `(1, 1)` with this transform and a brush
-   colored by [`ColorForIndex(i)`](../src/Combobulate/Combobulate.cs) (a
-   golden-angle hue spacing for visual distinction across many quads).
+   resolved from the active material pack — a `CompositionSurfaceBrush`
+   for textured materials, a solid colour brush for diffuse-only materials,
+   or a per-quad golden-angle palette colour as the final fallback (see
+   [Materials and textures](usage.md#materials-and-textures)).
 
 ## 3. Back-face culling
 
@@ -91,32 +98,56 @@ Why `Z > 0` means front-facing:
 
 This is a per-quad O(1) test; total cost is O(N) where N is the quad count.
 
-## 4. Topology-aware painter's sort
+## 4. Polygon ordering
 
-The Composition API has **no z-buffer for `SpriteVisual` siblings** — children
-are painted in their list order, and later siblings draw on top of earlier
-ones. To render a 3D model correctly we must explicitly sort the surviving
-quads so that the farthest is added first.
+The Composition API has **no z-buffer for `SpriteVisual` siblings** —
+children are painted in their list order, and later siblings draw on top of
+earlier ones. To render a 3D model correctly we must explicitly sort the
+surviving (front-facing) quads back to front.
 
 A naive painter's algorithm sorts by view-space centroid Z. **This is wrong**
 for adjacent perpendicular faces with very different centroids: e.g. a book
 whose covers sit at `z = ±0.1` but whose page-top edge has its centroid at
-`y = +0.7`. Under any non-trivial pitch, the page-top's view-Z is dominated by
-`0.7 · sin(pitch)`, making it appear "closer" than the front cover and
-incorrectly painting on top of it. The screenshot
-[`tap_preview_20260419_215003_143.png`](../docs/) (now obsolete) showed exactly
-this artefact.
+`y = +0.7`. Under any non-trivial pitch, the page-top's view-Z is dominated
+by `0.7 · sin(pitch)`, making it appear "closer" than the front cover and
+incorrectly painting on top of it. The control therefore offers three
+ordering strategies, exposed via the `SortAlgorithm` dependency property
+and the [`IFaceSorter`](../src/Combobulate/Sorting/IFaceSorter.cs) interface.
 
-`Combobulate` therefore uses a **Newell-style topological partial order**
-combined with a view-Z tiebreaker, implemented in
-[`TopologicalPainterSort`](../src/Combobulate/Combobulate.cs).
+### 4.1 `Bsp` — default
 
-### 4.1 Pairwise "behind" test
+[`BspSorter`](../src/Combobulate/Sorting/BspSorter.cs) builds a Binary Space
+Partitioning tree once per `ObjGeometry`, off the triangulated mesh. The
+build splits any polygon that straddles a chosen partition plane, so the
+resulting tree is **cycle-free for any view direction**. Per-frame work is a
+single front-to-back tree walk against the current rotation — O(n) where n
+is the visible-face count, with no per-frame allocations once the tree
+exists.
 
-For every pair `(a, b)` of surviving (front-facing) quads, we ask: *must `a`
-be drawn before `b`?* Yes, if every vertex of `a` lies on or behind the plane
-defined by `b`'s centroid and outward normal, **and at least one vertex is
-strictly behind**. In code, with `eps = 1e-4`:
+Because the tree is cached on `ObjGeometry`, every control sharing the
+same geometry shares the same BSP. This is the recommended algorithm for
+static rigid meshes.
+
+### 4.2 `Newell` — split-on-cycle
+
+[`NewellSorter`](../src/Combobulate/Sorting/NewellSorter.cs) implements the
+classic five-test Newell cascade: for each candidate pair, run cheap
+box-overlap and plane-side tests first, fall through to the more expensive
+edge tests, and only when every test still says "could overlap" do we split
+one polygon by the other's plane and re-sort the fragments. Splits are
+emitted lazily as cycles are exposed, so the typical cost stays close to
+O(n).
+
+Unlike `Bsp`, `Newell` does no precomputation against the geometry, so it
+handles deforming or animated meshes naturally. It is a good choice when
+you expect the per-frame topology to change.
+
+### 4.3 `Topological` — legacy
+
+The original algorithm. For every pair `(a, b)` of front-facing quads, it
+asks: *must `a` be drawn before `b`?* The answer is yes if every vertex of
+`a` lies on or behind the plane defined by `b`'s centroid and outward
+normal, with at least one vertex strictly behind. With `eps = 1e-4`:
 
 ```csharp
 var d0 = Vector3.Dot(qa.V0 - qb.Centroid, qb.Normal);
@@ -130,64 +161,96 @@ if (d0 <= eps && d1 <= eps && d2 <= eps && d3 <= eps &&
 }
 ```
 
-Two design choices are worth flagging:
+The pairwise tests build a directed graph that's then resolved with Kahn's
+algorithm; cycles fall back to plain view-Z order for the remaining quads.
+Cost is O(n²) for the edge build plus O(n²) for Kahn's selection. Like
+`Bsp`, the model-space edge graph is rotation-invariant and is cached on
+`ObjGeometry.Predecessors` (lazily, thread-safe), so per-frame cost is just
+the Kahn loop restricted to the visible subset.
 
-- **Why `<= +eps` instead of `< -eps` for the "all behind" half?** Adjacent
-  perpendicular faces share an edge, and the shared-edge vertices have signed
-  distance ≈ 0 with respect to *each other's* planes. A strict negative test
-  would reject these pairs, leaving them unordered and falling back to the
-  buggy view-Z tiebreaker. Allowing on-plane vertices keeps the constraint
-  while still requiring at least one strictly behind to break ties.
-- **Why use the model-space test, rotation-invariant?** Each quad that
-  reached this stage already passed back-face culling, so its outward model
-  normal points generally toward the camera in view space. The plane's
-  negative side is therefore the "far side from the camera" regardless of
-  rotation, and we can do the test once in model space rather than re-projecting
-  every vertex.
+This algorithm is kept for backward compatibility and as a debugging
+baseline; new code should prefer `Bsp` or `Newell`.
 
-### 4.2 Topological sort (Kahn's algorithm)
+### 4.4 The `IFaceSorter` contract
 
-The pairwise tests build a directed graph where an edge `a → b` means *a
-must precede b*. We then run **Kahn's algorithm** (BFS-style topological sort):
+All three sorters implement
+[`IFaceSorter`](../src/Combobulate/Sorting/IFaceSorter.cs):
 
-1. Compute `inDegree[b]` for each quad.
-2. Repeatedly:
-   a. Pick the unemitted quad with `inDegree == 0` and the **smallest
-      view-Z** ("farthest first" tiebreaker among unconstrained candidates).
-   b. Emit it, decrement the in-degree of every quad it points to.
-3. If at some step no quad has `inDegree == 0`, the graph contains a cycle —
-   typically caused by **interpenetrating geometry**. Fall back to plain
-   view-Z order for the remaining quads.
+```csharp
+int Sort(Matrix4x4 rotation, int[] orderBuf, bool[] visBuf,
+         float cameraDistance, float cullMarginCos);
+```
 
-Cost: O(N²) for the pairwise edge build plus O(N²) for Kahn's tiebreaker
-selection, where N is the number of front-facing quads. For the small models
-this control is designed for (cubes, books, simple prisms — typically <100
-quads after culling) this is negligible.
+They take ownership of back-face culling as well as ordering: `visBuf` is
+filled with the per-quad visibility mask (widened by `cullMarginCos` so
+faces inside the cull cone but within `CullMarginDegrees` of the boundary
+stay drawn), `orderBuf` is filled with the back-to-front list of visible
+indices, and the return value is its length. The buffers are pre-sized to
+the geometry's quad count and reused across frames, so steady-state
+ordering is allocation-free.
 
-> **The edge build runs once per geometry, not once per rebuild.** Because the
-> "behind" test uses model-space centroids and normals only, the partial order
-> is rotation-invariant and is cached on `ObjGeometry.Predecessors` (lazily,
-> thread-safe). Per-frame work in the hot path is just the Kahn loop restricted
-> to the visible subset.
+## 5. Composition realisation
 
-### 4.3 Painting
+The sort produces an order list and a visibility mask; the
+`RenderingMode` dependency property selects how that gets turned into
+compositor state. Both modes share the cull, sort, and material
+resolution above; they differ only in when sort decisions are made.
 
-The painter-order list is realised by walking it back-to-front and calling
-`_root.Children.InsertAtTop(sprite)` on each. Because the per-quad
-`SpriteVisual`s are **pooled per control instance** (created once when the
-geometry is first attached and reused across every rebuild), `InsertAtTop` on
-an already-attached child is a sibling reorder rather than a new attach, and
-the previous frame's order is compared against the new one — when they
-match, the reorder is skipped entirely. Back-face cull only flips
-`IsVisible` on the sprites whose state actually changed.
+### 5.1 `SpritePainter` — default
 
-Steady-state per `Rebuild` is therefore:
+One pooled `SpriteVisual` per quad, parented to a single `ContainerVisual`
+root. Each frame:
 
-- One transform-only pass for cull (no IPC unless visibility flipped).
-- One restricted Kahn over the cached predecessor lists.
-- A sibling reorder only on frames where the painter order actually changed.
+- Cull writes new `IsVisible` flags only on the quads whose visibility
+  actually changed.
+- The order list is compared against the previous frame's; if they
+  match, the sibling reorder is skipped entirely.
+- Otherwise we walk the new list back-to-front and call
+  `_root.Children.InsertAtTop(sprite)` to reorder.
 
-## 5. Root-level perspective transform
+Steady-state per `Rebuild` is therefore one transform-only cull pass plus a
+sibling reorder only on frames where the painter order actually changed.
+Sprite identities are pooled per geometry, so there are no per-frame
+composition allocations.
+
+### 5.2 `BakedAspectGraph`
+
+The ultimate refinement. Conceptually:
+
+1. Identify every scalar event whose sign determines the painter
+   signature — a per-face front-facing event `(M·n).z` and, for each
+   ordered front-facing pair, a depth event
+   `(M·cⱼ).z - (M·cᵢ).z`. The signs of these events together uniquely
+   determine the visible-face set and their order. See
+   [`EventFunctions.cs`](../src/Combobulate/Rendering/EventFunctions.cs)
+   and [`SignatureBake.cs`](../src/Combobulate/Rendering/SignatureBake.cs).
+2. Sweep the chosen animation axis (`TransformAnimationAxis`) over its
+   period. For a 1-D yaw axis, take 720 coarse samples (0.5°) to detect
+   sign flips, then bisect each flip to within `1e-3` to find the exact
+   breakpoint. The result is a list of cells, each a half-open interval
+   `[lo, hi)` over which the painter signature is constant.
+   See [`AspectGraphBake.cs`](../src/Combobulate/Rendering/AspectGraphBake.cs).
+3. For each cell, build a `ContainerVisual` containing only the
+   front-facing sprites at that signature, parented in the cell's painter
+   order. The cell's `Opacity` is driven by an `ExpressionAnimation`
+   that's `1` when the live yaw scalar lies inside `[lo, hi)` (with the
+   axis's `Periodic` flag wrapping the test) and `0` otherwise.
+4. Parent every cell under a single root container. Exactly one cell is
+   opaque at any moment, and the compositor swaps between them on the
+   GPU at the exact frame where the live scalar crosses a breakpoint.
+
+Per-frame CPU cost is **zero** — there is no `Rebuild`, no cull, no
+resort. The cost is paid up front in the bake (which runs on a background
+thread, with the previous tree remaining visible until the new one is
+ready) and in memory: O(cells × visible-faces) sprites, where the cell
+count for a typical model under yaw spin is in the low tens.
+
+[`BakedAspectGraphRenderer`](../src/Combobulate/Rendering/BakedAspectGraphRenderer.cs)
+also implements a hot brush-swap path: when only the `Materials` DP
+changes, the bake is reused and only the per-quad `CompositionBrush` is
+reassigned in place — no teardown, no expression reinstall.
+
+## 6. Root-level perspective transform
 
 The container visual that holds the per-quad sprites carries its own transform
 that combines (in this order, for column vectors):
@@ -201,10 +264,12 @@ toOrigin → rotation → perspective → fromOrigin
   in radians. This applies roll, then pitch, then yaw (R · P · Y for row
   vectors).
 - `perspective`, applied only when `EnablePerspective == true`, has
-  `M34 = -1/d` where `d = host width`. With the homogeneous w-divide this
-  produces the standard pinhole foreshortening: world-space points with
-  larger `Z` (closer to the viewer at +Z) get magnified, while points with
-  smaller `Z` shrink.
+  `M34 = -1/d` where `d` is `PerspectiveDistance` if positive, otherwise
+  the host width. With the homogeneous w-divide this produces the
+  standard pinhole foreshortening: world-space points with larger `Z`
+  (closer to the viewer at +Z) get magnified, while points with smaller
+  `Z` shrink. Setting `PerspectiveDistance` explicitly decouples the
+  projection's strength from the control's size.
 - `fromOrigin` translates back so the centre lands at the host centre again.
 
 The same `rotation` matrix is used for back-face culling and the view-Z
@@ -217,115 +282,89 @@ actually drawn.
 
 ## Limitations
 
-- **Convex, non-interpenetrating models give correct results.** For arbitrary
-  meshes, the topological partial order may admit cycles, in which case the
-  view-Z fallback is used and ordering is best-effort.
+- **`Topological` may admit cycles on arbitrary meshes.** `Bsp` (the
+  default) and `Newell` are exact for any rigid mesh; `Topological` is
+  retained for backward compatibility and falls back to view-Z order
+  when its graph contains a cycle.
 - **Quads only.** Triangulating before render would be straightforward but
   is not implemented.
-- **No texturing or per-vertex lighting.** Each quad gets a flat colour from
-  `ColorForIndex(i)`. Composition `SpriteVisual` can hold a brush of any
-  kind, so adding image brushes per quad is a small change.
+- **Per-vertex lighting is not applied.** Each quad is rendered with a
+  flat colour or texture from its material; vertex normals are parsed
+  from the OBJ but not used for shading.
 - **Per-quad transforms are affine.** Non-parallelogram quads are
-  approximated; for fully general planar quads a homography would be needed.
-- **Rotation must change on the UI thread.** See the next section.
+  approximated; for fully general planar quads a homography would be
+  needed.
+- **`SpritePainter` lags GPU rotation by one frame.** See
+  [Composition-thread animations](#composition-thread-animations) for the
+  three mitigation paths the library provides.
 
 ## Composition-thread animations
 
 Composition animations (`ExpressionAnimation`, `KeyFrameAnimation`,
 `InputAnimation`, etc.) run on the **compositor thread** and update visual
-properties between UI-thread frames. They are the standard way to get smooth,
-60+ fps animation without UI-thread jank.
+properties between UI-thread frames. They are the standard way to get
+smooth, 60+ fps animation without UI-thread jank.
 
-This control's design has a critical assumption that breaks under such
-animations: **back-face culling and the painter's sort both run inside
-`Rebuild()` using a snapshot of `RotationX/Y/Z` taken on the UI thread**. If
-rotation is being animated by the compositor (e.g. via an `ExpressionAnimation`
-driving `_root.RotationAngleInDegrees`), the UI thread is never told the value
-changed, `Rebuild()` is never re-invoked, and the displayed image will exhibit
-the same depth artefacts that the topological sort exists to prevent — visibly
-wrong occlusion for as long as the animation runs.
+The original `SpritePainter` design takes a UI-thread snapshot of
+`RotationX/Y/Z` inside `Rebuild()` and uses it for both back-face culling
+and the painter sort. If a compositor animation is driving the visual
+rotation, the UI thread is never told, the snapshot is never refreshed,
+and the displayed image will exhibit the very depth artefacts the sort
+exists to prevent. The library now offers three ways to address this,
+ordered from cheapest to most thorough:
 
-### The supported workaround: `SetExternalRotation`
+### A. `SetExternalRotation` + `EnableAutoRefresh`
 
-The control exposes a composition-native rotation API that addresses this
-directly:
+Bind an `ExpressionAnimation` to the visual rotation, and on every
+composition frame re-sample the same scalar source on the UI thread to
+refresh the cull and sort:
 
 ```csharp
-public void SetExternalRotation(ExpressionAnimation rotationDegrees);
-public void ClearExternalRotation();
-public void RebuildForExternalRotation(Vector3 rotationDegrees);
+combobulate.SetExternalRotation(rotationExpression);
+combobulate.EnableAutoRefresh((TimeSpan compositorTime) => SampleRotation(compositorTime));
 ```
 
-`SetExternalRotation` binds an `ExpressionAnimation` (whose result is a
-`Vector3` of degrees `(pitch, yaw, roll)`) to the composition root's
-`TransformMatrix` via the engine. The visible 3D rotation then updates on
-every composition frame without UI-thread involvement, exactly as the user
-expects.
+The `Func<TimeSpan, Vector3>` overload receives the same compositor clock
+that keyframe animations evaluate against, so the CPU-computed rotation
+and the GPU-drawn rotation stay in lock-step — even across compositor
+stalls. Steady-state cost is one cull pass plus a sibling reorder only
+on frames where the painter order changes. See
+[the usage guide](usage.md#auto-refresh) for the full pattern.
 
-The painter sort and back-face cull *still* use the rotation snapshot from
-the last UI-thread `Rebuild`. When the animated value drifts far enough that
-the cached order is wrong, snapshot the current value on the UI thread and
-call `RebuildForExternalRotation(currentDegrees)` to re-cull and re-sort
-against it. The control deliberately does not read the animated value
-itself — it cannot cross the thread boundary.
+For scenarios where the rotation changes faster than the UI thread can
+absorb (e.g. samples streamed in from another thread),
+`RequestRebuildForExternalRotation(Vector3)` records the latest value and
+coalesces multiple updates into a single rebuild on the UI thread.
 
-See [Composition-driven rotation](usage.md#composition-driven-rotation) for
-a fuller walkthrough including property-set and time-driven examples.
+### B. Widen the cull cone with `CullMarginDegrees`
 
-### Other mitigation strategies
+Even with auto-refresh, a CPU-supplied rotation can lag the GPU-drawn
+rotation by up to one compositor frame. At very high spin rates this
+shows up as a face that the cull dropped (because at the snapshot yaw it
+was just past the back-face boundary) but the compositor still draws
+(because the live yaw is one frame ahead).
 
-If `SetExternalRotation` doesn't fit your scenario:
+Setting `CullMarginDegrees` to a small positive value (the sample uses
+`18°` while spinning) widens the cull cone in both directions, so faces
+within that band of the boundary stay visible. The chosen sort algorithm
+gets the same widened set, so its boundary decisions are stable across
+the entire uncertainty window.
 
-### A. Tick the rebuild from `CompositionTarget.Rendering`
+### C. Switch to `RenderingMode.BakedAspectGraph`
 
-Subscribe to `CompositionTarget.Rendering` and re-run `Rebuild()` every
-frame while an animation is in flight. The UI-thread cost is one full
-re-creation of every `SpriteVisual` per frame — acceptable for the small
-quad counts this control targets (cubes, books, simple prisms) but a hard
-ceiling on model complexity. To make this affordable, `Rebuild()` would need
-to be split into:
+For continuous compositor-driven motion the most efficient mode is the
+fully baked aspect graph (§5.2). The bake enumerates every painter-order
+breakpoint along the animation axis up front, so per-frame CPU cost
+drops to zero and the swap between cells is GPU-atomic. This is the
+recommended choice for any "play-forever" animation where the animation
+axis is known up front.
 
-- A persistent quad cache keyed by `ObjQuad` index (sprite + brush + basis
-  transform are all rotation-invariant).
-- A per-frame "re-cull and re-sort" pass that toggles `IsVisible` and reorders
-  siblings without disposing anything.
-
-This is the smallest change and the most likely first step.
-
-### B. Make culling rotation-independent and tolerate sort lag
-
-If you can accept double-sided rendering, emit *both* faces of every quad at
-load time (or have the model do so explicitly, as `samples/book.obj` already
-does for its covers and spine). That removes the rotation dependency from
-culling. The painter's sort still depends on rotation, but you can either:
-
-- Run the sort on the UI thread at a low rate (e.g. 30 Hz via a
-  `DispatcherTimer`) and accept brief mis-orderings, or
-- Pick a **rotation-invariant ordering** that's correct for your specific
-  model topology — e.g. for a closed convex hull, any consistent CCW outward
-  ordering is correct because culling alone resolves visibility.
-
-This works well for animations that don't change the topological ordering
-mid-flight (small wobbles, hover effects, page-flip-style rotations confined
-to one axis) but degrades for free-tumbling.
-
-### C. Move to a true 3D pipeline
-
-For arbitrary continuous animation with correct depth at every frame, the
-right primitive is a real z-buffer. Options on Windows:
-
-- **`SceneVisual`** (Microsoft.UI.Composition.Scenes / Windows.UI.Composition.Scenes):
-  proper 3D meshes with depth testing, runs on the compositor thread, and
-  composition animations *do* drive it correctly without UI-thread involvement.
-  Closest semantic match but the API is a substantial step up from
-  `SpriteVisual`.
-- **Win2D / Direct2D on a `CanvasSwapChainPanel`** with manual depth handling.
-- **Direct3D via `SwapChainPanel`** for full control.
-
-Once a model is large enough to need composition-thread animation it is
-probably also large enough to justify one of these.
-
-> The current implementation is intentionally `SpriteVisual`-based because
-> that gives the cheapest path from "OBJ on disk" to "thing on screen" using
-> only the XAML composition surface, with no graphics interop. The
-> composition-animation limitation is the price of that simplicity.
+For scenarios that need a full 3D z-buffered pipeline (multi-axis
+animation, complex meshes, arbitrary occlusion), the right primitive is
+`SceneVisual` directly, or Win2D / Direct2D on a `CanvasSwapChainPanel`,
+or `SwapChainPanel` driving Direct3D. The current sprite-based
+implementation is intentionally `SpriteVisual`-based because that gives
+the cheapest path from "OBJ on disk" to "thing on screen" using only the
+XAML composition surface, with no graphics interop — and the three
+mitigation paths above cover almost every case before that step is
+needed.

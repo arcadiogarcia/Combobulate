@@ -290,10 +290,12 @@ public sealed class Combobulate : Control
     /// <summary>
     /// Selects the per-frame composition strategy. Default
     /// <see cref="global::Combobulate.Rendering.RenderingMode.SpritePainter"/>
-    /// preserves existing single-tree behaviour. Switch to
-    /// <see cref="global::Combobulate.Rendering.RenderingMode.DualTreeAtomicSwap"/>
-    /// to drive the order swap from the compositor (eliminating CPU/GPU
-    /// yaw drift) at the cost of 2× sprite count.
+    /// is the original single-tree path that runs cull and sort on the UI
+    /// thread each frame; switch to
+    /// <see cref="global::Combobulate.Rendering.RenderingMode.BakedAspectGraph"/>
+    /// for compositor-driven animations that need zero per-frame CPU work.
+    /// See <see cref="SetTransformAnimation"/> for the BakedAspectGraph
+    /// setup.
     /// </summary>
     public global::Combobulate.Rendering.RenderingMode RenderingMode
     {
@@ -338,8 +340,6 @@ public sealed class Combobulate : Control
     {
         DisableAutoRefresh();
         ClearSpritePool();
-        _dualTree?.Dispose();
-        _dualTree = null;
         if (_host != null)
             ElementCompositionPreview.SetElementChildVisual(_host, null);
         _root?.Dispose();
@@ -713,8 +713,6 @@ public sealed class Combobulate : Control
     private ObjGeometry? _spritePoolGeometry;
     private float _spritePoolScale;
     private float _spritePoolHostW;
-    // ---- DualTreeAtomicSwap state ----
-    private global::Combobulate.Rendering.DualTreeRenderer? _dualTree;
     // ---- BakedAspectGraph state ----
     private global::Combobulate.Rendering.BakedAspectGraphRenderer? _baked;
     private ObjGeometry? _bakedGeometry;
@@ -728,23 +726,6 @@ public sealed class Combobulate : Control
     /// a fresh bake so the new brushes propagate to the materialised cells.
     /// </summary>
     private object? _bakedMaterialsToken;
-    private CompositionPropertySet? _spinYawSourceProps;
-    private string _spinYawScalarName = "SpinYaw";
-    private string _yawValScalarName = "YawVal";
-    private string _spinActiveScalarName = "SpinActive";
-    private Func<float, Matrix4x4>? _composedYawToRotation;
-    // Set by RebuildForExternalRotation to the host's just-computed composed
-    // yaw (degrees). Used by the dual-tree renderer instead of TryGetScalar,
-    // because TryGetScalar on a GPU-animated scalar returns the stale CPU
-    // value and would peg the dual-tree windows at 0 forever.
-    private float _lastComposedYawDeg;
-    // Optional live composed-yaw (degrees) accessor, supplied by the host.
-    // When the host can sample the GPU spin clock cheaply on the UI thread
-    // (it does, via CompositionTarget.Rendering's RenderingTime + the spin
-    // KFA's known period), this returns slider.YawVal + spinActive*spinYaw
-    // every Update tick. If null, falls back to _lastComposedYawDeg (which
-    // contains only the slider value and pegs windows during spin).
-    private Func<float>? _composedYawDegLive;
 
     // ---- BakedAspectGraph: typed transform animation state ----
     // Set via SetTransformAnimation; consumed when RenderingMode == BakedAspectGraph.
@@ -819,43 +800,6 @@ public sealed class Combobulate : Control
     }
 
     /// <summary>
-    /// Wires up the rotation property set whose animated yaw scalar drives
-    /// the dual-tree atomic swap when <see cref="RenderingMode"/> is
-    /// <see cref="global::Combobulate.Rendering.RenderingMode.DualTreeAtomicSwap"/>.
-    /// The dual-tree opacity expressions are
-    /// <c>(yawValName + spinActiveName * spinYawName)</c> compared against
-    /// UI-thread-supplied window bounds, so each tree's swap fires at the
-    /// exact GPU yaw the compositor is about to paint with.
-    ///
-    /// <paramref name="composedYawToRotation"/> must, for any composed-yaw
-    /// value <c>y</c> the property set could produce, return the same rotation
-    /// matrix the compositor would compose for that yaw (typically built by
-    /// the host from its current pitch/roll plus the supplied yaw). Without
-    /// this, the dual-tree renderer cannot pre-sort the next tree.
-    /// </summary>
-    public void SetSpinYawSource(
-        CompositionPropertySet props,
-        Func<float, Matrix4x4> composedYawToRotation,
-        string spinYawScalarName = "SpinYaw",
-        string yawValScalarName = "YawVal",
-        string spinActiveScalarName = "SpinActive",
-        Func<float>? composedYawDegLive = null)
-    {
-        _spinYawSourceProps = props;
-        _composedYawToRotation = composedYawToRotation;
-        _spinYawScalarName = spinYawScalarName;
-        _yawValScalarName = yawValScalarName;
-        _spinActiveScalarName = spinActiveScalarName;
-        _composedYawDegLive = composedYawDegLive;
-        if (_dualTree != null)
-        {
-            _dualTree.Dispose();
-            _dualTree = null;
-            Rebuild();
-        }
-    }
-
-    /// <summary>
     /// Configures Combobulate with a typed transform expression tree and
     /// the periodic scalar input that the analytical aspect-graph bake
     /// should sweep over. When <see cref="RenderingMode"/> is
@@ -902,7 +846,7 @@ public sealed class Combobulate : Control
 
         if (_root != null && RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph)
         {
-            // Mode-switch hygiene: any SpritePainter / DualTree visuals
+            // Mode-switch hygiene: any SpritePainter visuals
             // that were parented to _root before BakedAspectGraph took
             // over MUST be cleared here, otherwise they sit under the
             // bake's per-cell ContainerVisuals at Opacity=1 and the
@@ -1022,11 +966,6 @@ public sealed class Combobulate : Control
 
     private void OnRenderingModeChanged()
     {
-        if (_dualTree != null)
-        {
-            _dualTree.Dispose();
-            _dualTree = null;
-        }
         if (_baked != null)
         {
             _baked.Dispose();
@@ -1080,12 +1019,6 @@ public sealed class Combobulate : Control
         // expression; the legacy CPU rotation matrix path does nothing.
         if (IsBakedAspectGraphActive()) return;
         const float deg2rad = MathF.PI / 180f;
-        // Capture the composed yaw (degrees) the host computed for THIS frame.
-        // The dual-tree renderer needs this exact value to choose which yaw
-        // window each tree should cover; sampling it from the property set via
-        // TryGetScalar returns the stale CPU value (always 0 while the GPU KFA
-        // animates SpinYaw), which would leave both trees invisible.
-        _lastComposedYawDeg = rotationDegrees.Y;
         var rotation = Matrix4x4.CreateFromYawPitchRoll(
             rotationDegrees.Y * deg2rad,
             rotationDegrees.X * deg2rad,
@@ -1490,9 +1423,9 @@ public sealed class Combobulate : Control
 
         // BakedAspectGraph short-circuit: when the typed transform owns
         // the visual tree, the legacy Rebuild path (SpritePainter pool,
-        // DualTree renderer, external-rotation TransformMatrix install,
-        // per-frame painter sort) does nothing. The bake schedules its
-        // own work via Combobulate.UpdateBakeIfNeeded.
+        // external-rotation TransformMatrix install, per-frame painter
+        // sort) does nothing. The bake schedules its own work via
+        // Combobulate.UpdateBakeIfNeeded.
         if (IsBakedAspectGraphActive())
         {
             UpdateBakeIfNeeded();
@@ -1549,40 +1482,7 @@ public sealed class Combobulate : Control
             return;
         }
 
-        // ---- DualTreeAtomicSwap path ----
-        // Active only when the host wired up SetSpinYawSource AND we have a
-        // valid host size to layout sprites into. Otherwise fall through to
-        // the SpritePainter path below (graceful degradation).
-        if (RenderingMode == global::Combobulate.Rendering.RenderingMode.DualTreeAtomicSwap
-            && _spinYawSourceProps != null
-            && _composedYawToRotation != null
-            && hostW > 0 && hostH > 0)
-        {
-            // Resolve material bindings so we can hand brushes to the dual-tree renderer.
-            var dtResolved = MaterialResolver.Resolve(_compositor, geometry, pack);
-            if (_dualTree == null)
-            {
-                _dualTree = new global::Combobulate.Rendering.DualTreeRenderer(_compositor, _root);
-            }
-            _dualTree.Update(
-                geometry: geometry,
-                bindings: dtResolved,
-                scale: scale,
-                hostW: hostW,
-                hostH: hostH,
-                cullMarginCos: ComputeCullMarginCos(),
-                cameraDistance: ComputeSortCameraDistance(scale),
-                sortAlgorithm: SortAlgorithm,
-                spinYawSourceProps: _spinYawSourceProps,
-                spinYawScalarName: _spinYawScalarName,
-                yawValScalarName: _yawValScalarName,
-                spinActiveScalarName: _spinActiveScalarName,
-                composedYawToRotation: _composedYawToRotation,
-                composedYawDegNow: _composedYawDegLive?.Invoke() ?? _lastComposedYawDeg);
-            return;
-        }
-
-        // ---- SpritePainter path (default, unchanged) ----
+        // ---- SpritePainter path ----
 
         var packKey = (object?)pack ?? NoPackSentinel;
         bool geometryChanged = !ReferenceEquals(_spritePoolGeometry, geometry);

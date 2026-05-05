@@ -27,6 +27,16 @@ using Windows.UI.Xaml.Hosting;
 namespace Combobulate;
 
 /// <summary>
+/// <b>Internal debugging / diagnostic control. Not part of the public
+/// Combobulate API.</b> Kept in the assembly only so the sample app can
+/// render the same model with a depth-buffered renderer side-by-side
+/// with the production sprite-based <see cref="Combobulate"/> control,
+/// to cross-check painter-sort ordering decisions while developing the
+/// library. Consumers should not rely on this type; it has positioning
+/// limitations (see below), no material/texture support, and may be
+/// removed or significantly reshaped in any release.
+///
+/// <para>
 /// Alternate renderer that draws an <see cref="ObjModel"/> using composition
 /// <c>SceneVisual</c> meshes instead of per-face <c>SpriteVisual</c> quads.
 ///

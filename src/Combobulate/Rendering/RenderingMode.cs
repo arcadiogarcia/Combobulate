@@ -18,25 +18,6 @@ public enum RenderingMode
     SpritePainter = 0,
 
     /// <summary>
-    /// Two parallel <c>ContainerVisual</c> trees, each holding a complete
-    /// per-face sprite set in a different painter order. An
-    /// <c>ExpressionAnimation</c> on each tree's <c>Opacity</c> reads the
-    /// same rotation property the GPU is animating from, so the swap from
-    /// "current order" to "next order" fires at the EXACT yaw the
-    /// compositor is about to paint with — no CPU/GPU yaw drift, and no
-    /// torn-mid-mutation paint between the two orderings. The UI thread's
-    /// job becomes "have the next-order tree ready before the next BSP
-    /// boundary yaw arrives", which is predictable in advance from the
-    /// spin schedule. Costs 2× the sprite count (brushes are shared).
-    ///
-    /// <para>Requires the host to wire up the spin yaw source via
-    /// <see cref="Combobulate.SetSpinYawSource"/>; without it, this mode
-    /// falls back to single-tree behaviour for static rotations and never
-    /// activates the dual-tree swap.</para>
-    /// </summary>
-    DualTreeAtomicSwap = 1,
-
-    /// <summary>
     /// Analytical, fully pre-baked path for compositor-driven yaw spins.
     /// At setup time Combobulate sweeps the configured face sorter across
     /// the yaw period, finds every breakpoint where the painter ordering
@@ -56,8 +37,8 @@ public enum RenderingMode
     /// book ~30×32≈960). Bake cost: K painter sorts plus a few thousand
     /// bisection probes; on the order of milliseconds for low-poly meshes.</para>
     ///
-    /// <para>Requires the host to wire up the spin yaw source via
-    /// <see cref="Combobulate.SetSpinYawSource"/>.</para>
+    /// <para>Requires the host to wire up the transform animation via
+    /// <see cref="Combobulate.SetTransformAnimation(Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node, TransformAnimationAxis[])"/>.</para>
     /// </summary>
     BakedAspectGraph = 2,
 }

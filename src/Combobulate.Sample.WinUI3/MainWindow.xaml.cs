@@ -624,23 +624,6 @@ public sealed partial class MainWindow : Window
         return (_externalRotationProps, _externalRotationExpr);
     }
 
-    /// <summary>
-    /// Builds the rotation matrix that the compositor would compose for a given
-    /// composed-yaw value (in degrees), using the CURRENT pitch/roll slider state.
-    /// Matches the convention Combobulate uses internally
-    /// (<see cref="System.Numerics.Matrix4x4.CreateFromYawPitchRoll"/>).
-    /// Used by the dual-tree renderer to pre-sort upcoming yaw windows.
-    /// </summary>
-    private Matrix4x4 ComposedYawToRotationMatrix(float composedYawDeg)
-    {
-        const float deg2rad = MathF.PI / 180f;
-        var pitchDeg = (float)PitchSlider.Value;
-        var rollDeg  = (float)RollSlider.Value;
-        return Matrix4x4.CreateFromYawPitchRoll(
-            composedYawDeg * deg2rad,
-            pitchDeg       * deg2rad,
-            rollDeg        * deg2rad);
-    }
 
     private void ApplyRotation()
     {
@@ -666,16 +649,14 @@ public sealed partial class MainWindow : Window
                 // BakedAspectGraph owns _root.TransformMatrix via
                 // SetTransformAnimation; do NOT call SetExternalRotation
                 // (which would reinstall a competing legacy animation
-                // and trigger a SpritePainter rebuild) or SetSpinYawSource
-                // (DualTree-only). The slider values flow into the bake
-                // via the property-set scalars referenced by the typed
-                // Matrix4x4Node AST.
+                // and trigger a SpritePainter rebuild). The slider values
+                // flow into the bake via the property-set scalars
+                // referenced by the typed Matrix4x4Node AST.
             }
             else
             {
                 combobulate.SetExternalRotation(expr);
                 combobulateSceneVisual.SetExternalRotation(expr);
-                combobulate.SetSpinYawSource(props, ComposedYawToRotationMatrix);
             }
         }
         else
@@ -778,16 +759,15 @@ public sealed partial class MainWindow : Window
         var label = (RenderingModeBox.SelectedItem as ComboBoxItem)?.Content as string;
         var newMode = label switch
         {
-            "DualTreeAtomicSwap" => global::Combobulate.Rendering.RenderingMode.DualTreeAtomicSwap,
-            "BakedAspectGraph"   => global::Combobulate.Rendering.RenderingMode.BakedAspectGraph,
-            _                    => global::Combobulate.Rendering.RenderingMode.SpritePainter,
+            "BakedAspectGraph" => global::Combobulate.Rendering.RenderingMode.BakedAspectGraph,
+            _                  => global::Combobulate.Rendering.RenderingMode.SpritePainter,
         };
 
         _suspendUiHandlers = true;
         try
         {
             // Setting RenderingMode triggers OnRenderingModeChanged inside
-            // Combobulate which disposes any active baked/dual-tree renderer
+            // Combobulate which disposes any active baked renderer
             // and clears _root.Children. We do this BEFORE touching the
             // property set so no legacy ApplyRotation can race with the
             // mode change.
