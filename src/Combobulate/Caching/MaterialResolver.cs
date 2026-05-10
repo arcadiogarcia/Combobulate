@@ -71,51 +71,129 @@ internal static class MaterialResolver
         var nested = _byGeometry.GetValue(geometry, _ => new ConditionalWeakTable<object, ResolvedQuadMaterials>());
         if (nested.TryGetValue(packKey, out var existing)) return existing;
 
+        var resolved = ResolveUnique(compositor, geometry, pack);
+        nested.Add(packKey, resolved);
+        return resolved;
+    }
+
+    public static ResolvedQuadMaterials ResolveUnique(Compositor compositor, ObjGeometry geometry, ObjMaterialPack? pack)
+    {
+        if (compositor == null) throw new ArgumentNullException(nameof(compositor));
+        if (geometry == null) throw new ArgumentNullException(nameof(geometry));
+
         var quads = geometry.Quads;
         var bindings = new QuadBrushBinding[quads.Length];
         for (int i = 0; i < quads.Length; i++)
         {
             var q = quads[i];
-            var fallback = q.FallbackColor;
-
-            ObjMaterial? material = null;
-            if (pack != null)
-            {
-                if (q.MaterialName != null)
-                    pack.Materials.TryGetValue(q.MaterialName, out material);
-                material ??= pack.Fallback;
-            }
-
-            CompositionBrush brush;
-            if (material?.DiffuseTexture != null)
-            {
-                var surfaceBrush = compositor.CreateSurfaceBrush();
-                surfaceBrush.Stretch = CompositionStretch.Fill;
-                surfaceBrush.HorizontalAlignmentRatio = 0;
-                surfaceBrush.VerticalAlignmentRatio = 0;
-                surfaceBrush.TransformMatrix = BuildBrushTransform(q, material);
-                GetOrLoadSurface(compositor, material.DiffuseTexture, surfaceBrush);
-                brush = surfaceBrush;
-
-                if (material.DiffuseColor is { } tint)
-                    fallback = tint;
-            }
-            else if (material?.DiffuseColor is { } solid)
-            {
-                brush = compositor.CreateColorBrush(solid);
-                fallback = solid;
-            }
-            else
-            {
-                brush = compositor.CreateColorBrush(fallback);
-            }
-
-            bindings[i] = new QuadBrushBinding(brush, fallback);
+            bindings[i] = CreateBinding(compositor, q, ResolveMaterial(q, pack));
         }
 
-        var resolved = new ResolvedQuadMaterials(bindings);
-        nested.Add(packKey, resolved);
-        return resolved;
+        return new ResolvedQuadMaterials(bindings);
+    }
+
+    public static int[] UpdateMaterialSlots(
+        Compositor compositor,
+        ObjGeometry geometry,
+        ResolvedQuadMaterials bindings,
+        IReadOnlyDictionary<string, ObjMaterial> materials)
+    {
+        if (compositor == null) throw new ArgumentNullException(nameof(compositor));
+        if (geometry == null) throw new ArgumentNullException(nameof(geometry));
+        if (bindings == null) throw new ArgumentNullException(nameof(bindings));
+        if (materials == null) throw new ArgumentNullException(nameof(materials));
+        if (bindings.Bindings.Length != geometry.Quads.Length)
+            throw new ArgumentException("Binding count must match geometry quad count.", nameof(bindings));
+
+        var changed = new List<int>();
+        var quads = geometry.Quads;
+        for (int i = 0; i < quads.Length; i++)
+        {
+            var materialName = quads[i].MaterialName;
+            if (materialName == null || !materials.TryGetValue(materialName, out var material))
+                continue;
+
+            var updated = UpdateBinding(compositor, quads[i], material, bindings.Bindings[i]);
+            bindings.Bindings[i] = updated;
+            changed.Add(i);
+        }
+
+        return changed.ToArray();
+    }
+
+    private static ObjMaterial? ResolveMaterial(CachedQuad quad, ObjMaterialPack? pack)
+    {
+        if (pack == null) return null;
+        ObjMaterial? material = null;
+        if (quad.MaterialName != null)
+            pack.Materials.TryGetValue(quad.MaterialName, out material);
+        return material ?? pack.Fallback;
+    }
+
+    private static QuadBrushBinding CreateBinding(Compositor compositor, CachedQuad quad, ObjMaterial? material)
+    {
+        var fallback = quad.FallbackColor;
+        CompositionBrush brush;
+        if (material?.DiffuseTexture != null)
+        {
+            var surfaceBrush = compositor.CreateSurfaceBrush();
+            ApplySurfaceBrush(compositor, surfaceBrush, quad, material);
+            brush = surfaceBrush;
+            if (material.DiffuseColor is { } tint)
+                fallback = tint;
+        }
+        else if (material?.DiffuseColor is { } solid)
+        {
+            brush = compositor.CreateColorBrush(solid);
+            fallback = solid;
+        }
+        else
+        {
+            brush = compositor.CreateColorBrush(fallback);
+        }
+
+        return new QuadBrushBinding(brush, fallback);
+    }
+
+    private static QuadBrushBinding UpdateBinding(
+        Compositor compositor,
+        CachedQuad quad,
+        ObjMaterial material,
+        QuadBrushBinding existing)
+    {
+        var fallback = material.DiffuseColor ?? quad.FallbackColor;
+        if (material.DiffuseTexture != null)
+        {
+            if (existing.Brush is CompositionSurfaceBrush surfaceBrush)
+            {
+                ApplySurfaceBrush(compositor, surfaceBrush, quad, material);
+                return new QuadBrushBinding(surfaceBrush, fallback);
+            }
+
+            return CreateBinding(compositor, quad, material);
+        }
+
+        if (existing.Brush is CompositionColorBrush colorBrush)
+        {
+            colorBrush.Color = fallback;
+            return new QuadBrushBinding(colorBrush, fallback);
+        }
+
+        return new QuadBrushBinding(compositor.CreateColorBrush(fallback), fallback);
+    }
+
+    private static void ApplySurfaceBrush(
+        Compositor compositor,
+        CompositionSurfaceBrush surfaceBrush,
+        CachedQuad quad,
+        ObjMaterial material)
+    {
+        surfaceBrush.Stretch = CompositionStretch.Fill;
+        surfaceBrush.HorizontalAlignmentRatio = 0;
+        surfaceBrush.VerticalAlignmentRatio = 0;
+        surfaceBrush.TransformMatrix = BuildBrushTransform(quad, material);
+        surfaceBrush.Surface = null;
+        GetOrLoadSurface(compositor, material.DiffuseTexture!, surfaceBrush);
     }
 
     private static void GetOrLoadSurface(Compositor compositor, ObjTextureSource source, CompositionSurfaceBrush brush)

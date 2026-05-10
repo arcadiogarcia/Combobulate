@@ -60,6 +60,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
     /// <see cref="ResolvedQuadMaterials"/> without touching the bake.
     /// </summary>
     private int[][]? _treeVisibleQuadIndices;
+    private List<SpriteVisual>[]? _spritesByQuad;
     /// <summary>
     /// Geometry the current trees were built against; needed by
     /// <see cref="UpdateBindings"/> when reusing existing trees so we
@@ -279,8 +280,9 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             var newTrees = new ContainerVisual[computed.Cells.Length];
             var newOpacityExprs = new Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode[computed.Cells.Length];
             var newTreeIndices = new int[computed.Cells.Length][];
+            var newSpritesByQuad = CreateSpriteIndex(geometry.Quads.Length);
             ChunkBuild(computed, geometry, bindings, scale, hostW, hostH, axes,
-                       newTrees, newOpacityExprs, newTreeIndices, startIndex: 0, ui, generation);
+                       newTrees, newOpacityExprs, newTreeIndices, newSpritesByQuad, startIndex: 0, ui, generation);
         }
         catch (Exception ex)
         {
@@ -306,6 +308,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         ContainerVisual[] newTrees,
         Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode[] newOpacityExprs,
         int[][] newTreeIndices,
+        List<SpriteVisual>[] newSpritesByQuad,
         int startIndex,
         DispatcherQueueNS.DispatcherQueue ui,
         int generation)
@@ -327,7 +330,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             var c = computed.Cells[i];
             var tree = _compositor.CreateContainerVisual();
             tree.Opacity = 0; // hidden until swap
-            newTreeIndices[i] = BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Sig.Order, c.Sig.Visibility);
+            newTreeIndices[i] = BuildTreeContent(tree, geometry, bindings, scale, hostW, hostH, c.Sig.Order, c.Sig.Visibility, newSpritesByQuad);
             // Build (but don't start) the opacity expression — we'll start
             // them all in the swap step so the new tree set lights up
             // atomically and the old one disappears in the same compositor
@@ -345,7 +348,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         {
             // More to do — schedule the next chunk.
             ui.TryEnqueue(() => ChunkBuild(computed, geometry, bindings, scale, hostW, hostH, axes,
-                                           newTrees, newOpacityExprs, newTreeIndices, end, ui, generation));
+                                           newTrees, newOpacityExprs, newTreeIndices, newSpritesByQuad, end, ui, generation));
         }
         else
         {
@@ -356,6 +359,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             DisposeTrees();
             _trees = newTrees;
             _treeVisibleQuadIndices = newTreeIndices;
+            _spritesByQuad = newSpritesByQuad;
             _treesGeometry = geometry;
             _stagingTrees = null;
             // Stash signatures + geometry so diagnostics can compare the
@@ -411,7 +415,8 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         ObjGeometry geometry,
         ResolvedQuadMaterials bindings,
         float scale, float hostW, float hostH,
-        int[] order, bool[] visibility)
+        int[] order, bool[] visibility,
+        List<SpriteVisual>[] spritesByQuad)
     {
         var origin = new Vector3(hostW / 2f, hostH / 2f, 0);
         var quads = geometry.Quads;
@@ -445,9 +450,18 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             int qi = order[i];
             if (!visibility[qi]) continue;
             tree.Children.InsertAtTop(sprites[qi]);
+            spritesByQuad[qi].Add(sprites[qi]);
             visibleOrder.Add(qi);
         }
         return visibleOrder.ToArray();
+    }
+
+    private static List<SpriteVisual>[] CreateSpriteIndex(int quadCount)
+    {
+        var index = new List<SpriteVisual>[quadCount];
+        for (int i = 0; i < index.Length; i++)
+            index[i] = new List<SpriteVisual>();
+        return index;
     }
 
     /// <summary>
@@ -498,6 +512,29 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
                 childIdx++;
             }
         }
+        return true;
+    }
+
+    public bool UpdateBindingsForQuads(ResolvedQuadMaterials newBindings, IReadOnlyList<int> quadIndices)
+    {
+        if (_trees is null || _spritesByQuad is null || _treesGeometry is null) return false;
+        var quads = _treesGeometry.Quads;
+        if (newBindings.Bindings.Length != quads.Length) return false;
+
+        for (int i = 0; i < quadIndices.Count; i++)
+        {
+            int qi = quadIndices[i];
+            if ((uint)qi >= (uint)_spritesByQuad.Length) continue;
+            var newBrush = newBindings.Bindings[qi].Brush;
+            var sprites = _spritesByQuad[qi];
+            for (int s = 0; s < sprites.Count; s++)
+            {
+                var sprite = sprites[s];
+                if (!ReferenceEquals(sprite.Brush, newBrush))
+                    sprite.Brush = newBrush;
+            }
+        }
+
         return true;
     }
 
@@ -764,6 +801,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         }
         _trees = null;
         _treeVisibleQuadIndices = null;
+        _spritesByQuad = null;
         _treesGeometry = null;
     }
 }

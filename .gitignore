@@ -40,3 +40,5 @@ publish-sc/
 artifacts/
 **/AppPackages/
 **/BundleArtifacts/
+obj-remote/
+bin-remote/

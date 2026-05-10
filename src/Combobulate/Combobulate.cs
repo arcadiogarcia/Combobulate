@@ -214,12 +214,20 @@ public sealed class Combobulate : Control
         set => SetValue(MaterialsProperty, value);
     }
 
+    private MaterialSlotController? _materialSlots;
+
+    /// <summary>
+    /// Hot-path API for updating named material slots without replacing the
+    /// entire <see cref="Materials"/> dependency property.
+    /// </summary>
+    public MaterialSlotController MaterialSlots => _materialSlots ??= new MaterialSlotController(this);
+
     public static readonly DependencyProperty MaterialsProperty =
         DependencyProperty.Register(
             nameof(Materials),
             typeof(ObjMaterialPack),
             typeof(Combobulate),
-            new PropertyMetadata(null, (d, _) => ((Combobulate)d).Rebuild()));
+            new PropertyMetadata(null, (d, _) => ((Combobulate)d).OnMaterialsChanged()));
 
     /// <summary>Controls how materials are resolved. Defaults to <see cref="MaterialMode.Auto"/>.</summary>
     public MaterialMode MaterialMode
@@ -630,6 +638,138 @@ public sealed class Combobulate : Control
         Rebuild();
     }
 
+    private void OnMaterialsChanged()
+    {
+        _materialSlotsActive = false;
+        _materialSlotMaterials.Clear();
+        _materialSlotBindings = null;
+        _materialSlotGeometry = null;
+        _materialSlotToken = new object();
+        Rebuild();
+    }
+
+    internal void ApplyMaterialSlotUpdates(IReadOnlyDictionary<string, ObjMaterial> updates)
+    {
+        if (updates == null) throw new ArgumentNullException(nameof(updates));
+        if (updates.Count == 0) return;
+
+        foreach (var pair in updates)
+            _materialSlotMaterials[pair.Key] = pair.Value;
+        _materialSlotsActive = true;
+        _materialSlotToken = new object();
+
+        if (_compositor == null || _root == null)
+        {
+            Rebuild();
+            return;
+        }
+
+        var model = Model;
+        if (model == null || model.Quads.Count == 0)
+        {
+            Rebuild();
+            return;
+        }
+
+        var geometry = ObjCache.ForModel(model);
+        _geometry = geometry;
+        var pack = ResolveMaterialPack(model);
+        var changedQuads = FindMaterialSlotQuads(geometry, updates.Keys);
+        if (changedQuads.Length == 0)
+            return;
+
+        if (_materialSlotBindings == null || !ReferenceEquals(_materialSlotGeometry, geometry))
+        {
+            _materialSlotBindings = MaterialResolver.ResolveUnique(_compositor, geometry, BuildEffectiveMaterialPack(pack));
+            _materialSlotGeometry = geometry;
+        }
+        else
+        {
+            MaterialResolver.UpdateMaterialSlots(_compositor, geometry, _materialSlotBindings, updates);
+        }
+
+        if (IsBakedAspectGraphActive()
+            && _baked != null
+            && !_baked.BakeInFlight
+            && ReferenceEquals(_bakedGeometry, geometry)
+            && _baked.UpdateBindingsForQuads(_materialSlotBindings, changedQuads))
+        {
+            _bakedMaterialsToken = _materialSlotToken;
+            return;
+        }
+
+        if (_spritePool != null && ReferenceEquals(_spritePoolGeometry, geometry))
+        {
+            foreach (var quadIndex in changedQuads)
+            {
+                if ((uint)quadIndex < (uint)_spritePool.Length && _spritePool[quadIndex] is { } sprite)
+                    sprite.Brush = _materialSlotBindings.Bindings[quadIndex].Brush;
+            }
+            _spritePoolBindings = _materialSlotBindings;
+            _spritePoolPackKey = _materialSlotToken;
+            return;
+        }
+
+        Rebuild();
+    }
+
+    private ObjMaterialPack? ResolveMaterialPack(ObjModel model)
+    {
+        ObjMaterialPack? pack = null;
+        if (MaterialMode != MaterialMode.UseFallback)
+        {
+            pack = Materials
+                ?? (_sourceKey != null ? ObjCache.TryGetMaterials(_sourceKey) : null);
+            if (pack == null && model.MaterialLibraries.Count > 0)
+            {
+                try { pack = ObjCache.GetOrLoadMtlForModel(model, _sourceDirectory); }
+                catch { pack = null; }
+            }
+            if (pack != null && MaterialMode == MaterialMode.UseDiffuse)
+                pack = StripTextures(pack);
+        }
+        return pack;
+    }
+
+    private ResolvedQuadMaterials ResolveCurrentMaterials(ObjGeometry geometry, ObjMaterialPack? pack)
+    {
+        if (!_materialSlotsActive)
+            return MaterialResolver.Resolve(_compositor!, geometry, pack);
+
+        if (_materialSlotBindings == null || !ReferenceEquals(_materialSlotGeometry, geometry))
+        {
+            _materialSlotBindings = MaterialResolver.ResolveUnique(_compositor!, geometry, BuildEffectiveMaterialPack(pack));
+            _materialSlotGeometry = geometry;
+        }
+        return _materialSlotBindings;
+    }
+
+    private object? CurrentMaterialToken(ObjMaterialPack? pack) => _materialSlotsActive ? _materialSlotToken : pack;
+
+    private ObjMaterialPack BuildEffectiveMaterialPack(ObjMaterialPack? pack)
+    {
+        var materials = pack?.Materials is null
+            ? new Dictionary<string, ObjMaterial>(StringComparer.Ordinal)
+            : new Dictionary<string, ObjMaterial>(pack.Materials, StringComparer.Ordinal);
+        foreach (var pair in _materialSlotMaterials)
+            materials[pair.Key] = pair.Value;
+        return new ObjMaterialPack(materials, pack?.Fallback);
+    }
+
+    private static int[] FindMaterialSlotQuads(ObjGeometry geometry, IEnumerable<string> names)
+    {
+        var set = new HashSet<string>(names, StringComparer.Ordinal);
+        var changed = new List<int>();
+        var quads = geometry.Quads;
+        for (int i = 0; i < quads.Length; i++)
+        {
+            var materialName = quads[i].MaterialName;
+            if (materialName != null && set.Contains(materialName))
+                changed.Add(i);
+        }
+        return changed.ToArray();
+    }
+
     private void OnModelChanged()
     {
         // Drop any stale per-instance geometry reference; it will be re-fetched on Rebuild.
@@ -699,6 +839,12 @@ public sealed class Combobulate : Control
     private string? _sourceKey;
     private string? _sourceDirectory;
     private string? _pendingSource;
+
+    private readonly Dictionary<string, ObjMaterial> _materialSlotMaterials = new(StringComparer.Ordinal);
+    private bool _materialSlotsActive;
+    private ObjGeometry? _materialSlotGeometry;
+    private ResolvedQuadMaterials? _materialSlotBindings;
+    private object _materialSlotToken = new();
 
     // --- Per-instance render-state cache, keyed off the active geometry. -----
     // Sprites are created once per quad and reused across rebuilds; rotation only
@@ -1331,19 +1477,8 @@ public sealed class Combobulate : Control
         ApplyBakedTransformAnimation();
 
         var geometry = ObjCache.ForModel(model);
-        ObjMaterialPack? pack = null;
-        if (MaterialMode != MaterialMode.UseFallback)
-        {
-            pack = Materials
-                ?? (_sourceKey != null ? ObjCache.TryGetMaterials(_sourceKey) : null);
-            if (pack == null && model.MaterialLibraries.Count > 0)
-            {
-                try { pack = ObjCache.GetOrLoadMtlForModel(model, _sourceDirectory); }
-                catch { pack = null; }
-            }
-            if (pack != null && MaterialMode == MaterialMode.UseDiffuse)
-                pack = StripTextures(pack);
-        }
+        var pack = ResolveMaterialPack(model);
+        var materialToken = CurrentMaterialToken(pack);
         var scale = (float)ModelScale;
 
         // Detect when secondary inputs (anything in the AST other than the
@@ -1377,12 +1512,12 @@ public sealed class Combobulate : Control
         // CompositionBrush needs to swap. No teardown / no compositor
         // expression reinstall.
         if (!needRebake && _baked != null && !_baked.BakeInFlight
-            && !ReferenceEquals(_bakedMaterialsToken, pack))
+            && !ReferenceEquals(_bakedMaterialsToken, materialToken))
         {
-            var hotBindings = MaterialResolver.Resolve(_compositor, geometry, pack);
+            var hotBindings = ResolveCurrentMaterials(geometry, pack);
             if (_baked.UpdateBindings(hotBindings))
             {
-                _bakedMaterialsToken = pack;
+                _bakedMaterialsToken = materialToken;
                 return;
             }
             // UpdateBindings refused (quad-count mismatch or no current
@@ -1396,7 +1531,7 @@ public sealed class Combobulate : Control
         {
             _baked = new global::Combobulate.Rendering.BakedAspectGraphRenderer(_compositor, _root);
         }
-        var bakedResolved = MaterialResolver.Resolve(_compositor, geometry, pack);
+        var bakedResolved = ResolveCurrentMaterials(geometry, pack);
         _baked.RequestBake(
             transformNode: _transformNode!,
             axes: _transformAxes!,
@@ -1413,7 +1548,7 @@ public sealed class Combobulate : Control
         _bakedHostW = hostW;
         _bakedHostH = hostH;
         _bakedAlgorithm = SortAlgorithm;
-        _bakedMaterialsToken = pack;
+        _bakedMaterialsToken = materialToken;
         CaptureSecondaryProbe();
     }
 
@@ -1449,20 +1584,7 @@ public sealed class Combobulate : Control
             _geometry = geometry;
         }
 
-        // Resolve material pack: explicit Materials DP > registered key > auto mtllib > none.
-        ObjMaterialPack? pack = null;
-        if (MaterialMode != MaterialMode.UseFallback)
-        {
-            pack = Materials
-                ?? (_sourceKey != null ? ObjCache.TryGetMaterials(_sourceKey) : null);
-            if (pack == null && model.MaterialLibraries.Count > 0)
-            {
-                try { pack = ObjCache.GetOrLoadMtlForModel(model, _sourceDirectory); }
-                catch { pack = null; }
-            }
-            if (pack != null && MaterialMode == MaterialMode.UseDiffuse)
-                pack = StripTextures(pack);
-        }
+        var pack = ResolveMaterialPack(model);
 
         // (Re)materialise the per-instance sprite pool keyed off geometry + scale + host
         // size + material pack. Anything in here is rotation-invariant; the rotation
@@ -1484,7 +1606,7 @@ public sealed class Combobulate : Control
 
         // ---- SpritePainter path ----
 
-        var packKey = (object?)pack ?? NoPackSentinel;
+        var packKey = CurrentMaterialToken(pack) ?? NoPackSentinel;
         bool geometryChanged = !ReferenceEquals(_spritePoolGeometry, geometry);
         bool transformChanged = geometryChanged
             || scale != _spritePoolScale
@@ -1504,7 +1626,7 @@ public sealed class Combobulate : Control
         }
 
         ResolvedQuadMaterials? resolved = packChanged
-            ? MaterialResolver.Resolve(_compositor, geometry, pack)
+            ? ResolveCurrentMaterials(geometry, pack)
             : _spritePoolBindings;
         _spritePoolBindings = resolved;
         _spritePoolPackKey = packKey;
