@@ -129,6 +129,7 @@
     <Compile Include="CombobulateSceneVisual.cs" />
     <Compile Include="GlobalUsings.cs" />
     <Compile Include="MaterialMode.cs" />
+    <Compile Include="MaterialSlotController.cs" />
     <Compile Include="Caching\MaterialResolver.cs" />
     <Compile Include="Caching\ObjCache.cs" />
     <Compile Include="Caching\ObjGeometry.cs" />
