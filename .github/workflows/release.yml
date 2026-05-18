@@ -63,6 +63,19 @@ jobs:
           Write-Host "PRI DLL exists: $(Test-Path "$appxPath\Microsoft.Build.Packaging.Pri.Tasks.dll")"
           "APPX_PATH=$appxPath" >> $env:GITHUB_OUTPUT
 
+      - name: Restore & Build WinAppSdk library (AnyCPU - for lib/ compile ref)
+        shell: pwsh
+        run: |
+          # AnyCPU produces an MSIL (Machine=Intel-386, IL-only) binary that
+          # the nuspec uses as the compile-time reference under lib/net10.0,
+          # so consumers building for x64/ARM64 don't see MSB3270/CS8012.
+          dotnet restore src/Combobulate.WinAppSdk/Combobulate.WinAppSdk.csproj -p:Platform=AnyCPU
+          dotnet build src/Combobulate.WinAppSdk/Combobulate.WinAppSdk.csproj `
+            -c Release `
+            --no-restore `
+            -p:Platform=AnyCPU `
+            "-p:AppxMSBuildToolsPath=${{ steps.appx.outputs.APPX_PATH }}\"
+
       - name: Restore & Build WinAppSdk library (x64)
         shell: pwsh
         run: |

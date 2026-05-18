@@ -11,7 +11,11 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWinUI>true</UseWinUI>
-    <Platforms>x86;x64;ARM64</Platforms>
+    <!-- AnyCPU is added so the nuspec's lib\net10.0 compile-time reference can
+         be sourced from an AnyCPU (MSIL) build, avoiding MSB3270/CS8012
+         warnings in consumers that target a different architecture. The
+         per-arch runtimes\win-* payloads remain platform-specific. -->
+    <Platforms>AnyCPU;x86;x64;ARM64</Platforms>
     <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
     <DefineConstants>$(DefineConstants);WINAPPSDK</DefineConstants>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>

@@ -12,11 +12,11 @@
     <readme>docs\README.md</readme>
     <dependencies>
       <group targetFramework="UAP10.0.19041">
-        <dependency id="arcadiog.CompositionExpressions" version="0.1.3" />
+        <dependency id="arcadiog.CompositionExpressions" version="0.1.5" />
       </group>
       <group targetFramework="net10.0-windows10.0.19041.0">
         <dependency id="Microsoft.WindowsAppSDK" version="1.8.260317003" exclude="Build,Analyzers" />
-        <dependency id="arcadiog.CompositionExpressions" version="0.1.3" />
+        <dependency id="arcadiog.CompositionExpressions" version="0.1.5" />
       </group>
     </dependencies>
   </metadata>
@@ -29,11 +29,15 @@
     <file src="src\Combobulate\bin\Release\Combobulate.pri" target="lib\uap10.0.19041" />
     <file src="src\Combobulate\bin\Release\Combobulate\**" target="lib\uap10.0.19041\Combobulate" />
 
-    <!-- WinUI 3 / Windows App SDK – compile reference + resources (net10.0-windows10.0.19041.0) -->
-    <file src="src\Combobulate.WinAppSdk\bin\x64\Release\net10.0-windows10.0.19041.0\Combobulate.dll" target="lib\net10.0-windows10.0.19041.0" />
-    <file src="src\Combobulate.WinAppSdk\bin\x64\Release\net10.0-windows10.0.19041.0\Combobulate.xml" target="lib\net10.0-windows10.0.19041.0" />
-    <file src="src\Combobulate.WinAppSdk\bin\x64\Release\net10.0-windows10.0.19041.0\Combobulate.pri" target="lib\net10.0-windows10.0.19041.0" />
-    <file src="src\Combobulate.WinAppSdk\bin\x64\Release\net10.0-windows10.0.19041.0\Combobulate\**" target="lib\net10.0-windows10.0.19041.0\Combobulate" />
+    <!-- WinUI 3 / Windows App SDK – compile reference + resources (net10.0-windows10.0.19041.0)
+         Sourced from the AnyCPU (MSIL) build so consumers targeting any
+         processor architecture don't get MSB3270/CS8012 warnings. AnyCPU
+         builds collapse `bin\AnyCPU\` to plain `bin\` by SDK convention.
+         The per-arch runtime payloads below are still architecture-specific. -->
+    <file src="src\Combobulate.WinAppSdk\bin\Release\net10.0-windows10.0.19041.0\Combobulate.dll" target="lib\net10.0-windows10.0.19041.0" />
+    <file src="src\Combobulate.WinAppSdk\bin\Release\net10.0-windows10.0.19041.0\Combobulate.xml" target="lib\net10.0-windows10.0.19041.0" />
+    <file src="src\Combobulate.WinAppSdk\bin\Release\net10.0-windows10.0.19041.0\Combobulate.pri" target="lib\net10.0-windows10.0.19041.0" />
+    <file src="src\Combobulate.WinAppSdk\bin\Release\net10.0-windows10.0.19041.0\Combobulate\**" target="lib\net10.0-windows10.0.19041.0\Combobulate" />
 
     <!-- WinUI 3 / Windows App SDK – x64 runtime -->
     <file src="src\Combobulate.WinAppSdk\bin\x64\Release\net10.0-windows10.0.19041.0\Combobulate.dll" target="runtimes\win-x64\lib\net10.0-windows10.0.19041.0" />
