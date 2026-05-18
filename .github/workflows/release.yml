@@ -126,11 +126,14 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)) {
             throw "NUGET_API_KEY repository secret is not set."
           }
+          # NOTE: --skip-duplicate intentionally NOT used. Silent skip on a
+          # duplicate version masks "already pushed broken artifact from an
+          # earlier run" scenarios (see CompositionCollectionView 0.1.5).
+          # Bump the tag if a push conflicts.
           Get-ChildItem artifacts\*.nupkg | ForEach-Object {
             Write-Host "Pushing $($_.Name)..."
             dotnet nuget push $_.FullName `
               --api-key $env:NUGET_API_KEY `
-              --source https://api.nuget.org/v3/index.json `
-              --skip-duplicate
+              --source https://api.nuget.org/v3/index.json
             if ($LASTEXITCODE -ne 0) { throw "Push failed for $($_.Name)" }
           }
