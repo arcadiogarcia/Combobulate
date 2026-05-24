@@ -24,8 +24,8 @@ public static class LightingDefaults
     public static CompositionPropertySet? PropertySet => _props;
 
     // Defaults
-    public const float DefaultAmbient  = 0.75f;
-    public const float DefaultDiffuse  = 0.25f;
+    public const float DefaultAmbient  = 0.25f;
+    public const float DefaultDiffuse  = 1.0f;
     public const float DefaultSpecular = 0.2f;
     public const float DefaultShine    = 16f;
 
