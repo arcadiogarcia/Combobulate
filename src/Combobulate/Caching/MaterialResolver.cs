@@ -4,13 +4,16 @@ using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
+using Microsoft.Graphics.Canvas.Effects;
 
 #if WINAPPSDK
 using Windows.UI;
 using Microsoft.UI.Composition;
+using Microsoft.UI.Composition.Effects;
 #else
 using Windows.UI;
 using Windows.UI.Composition;
+using Windows.UI.Composition.Effects;
 #endif
 
 namespace Combobulate.Caching;
@@ -54,6 +57,13 @@ internal static class MaterialResolver
 
     private static readonly ConcurrentDictionary<string, TextureEntry> _textures =
         new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Cached <see cref="CompositionEffectFactory"/> for the lit-material effect graph.
+    /// One per process lifetime — every lit face shares the same factory and creates
+    /// its own <see cref="CompositionEffectBrush"/> from it (cheap: ~0.05ms).
+    /// </summary>
+    private static CompositionEffectFactory? _litEffectFactory;
 
     // Per-geometry → per-pack (or per-"no pack" sentinel) → bindings. ConditionalWeakTable
     // ensures entries die with their geometry; nested table does the same for pack.
@@ -134,7 +144,15 @@ internal static class MaterialResolver
     {
         var fallback = quad.FallbackColor;
         CompositionBrush brush;
-        if (material?.DiffuseTexture != null)
+
+        // Lit path: material has a NormalMap → wrap in SceneLightingEffect
+        if (material?.NormalMap != null)
+        {
+            brush = BuildLitBrush(compositor, quad, material);
+            if (material.DiffuseColor is { } tint)
+                fallback = tint;
+        }
+        else if (material?.DiffuseTexture != null)
         {
             var surfaceBrush = compositor.CreateSurfaceBrush();
             ApplySurfaceBrush(compositor, surfaceBrush, quad, material);
@@ -162,6 +180,14 @@ internal static class MaterialResolver
         QuadBrushBinding existing)
     {
         var fallback = material.DiffuseColor ?? quad.FallbackColor;
+
+        // Lit path: if material now has a NormalMap, always rebuild as a lit brush.
+        // The effect brush structure differs from plain surface/color brushes,
+        // so we can't just repoint — rebuild from scratch.
+        if (material.NormalMap != null)
+            return CreateBinding(compositor, quad, material);
+
+        // Unlit paths (unchanged logic)
         if (material.DiffuseTexture != null)
         {
             if (existing.Brush is CompositionSurfaceBrush surfaceBrush)
@@ -291,5 +317,105 @@ internal static class MaterialResolver
         var vMin = MathF.Min(MathF.Min(u0.Y, u1.Y), MathF.Min(u2.Y, u3.Y));
         var vMax = MathF.Max(MathF.Max(u0.Y, u1.Y), MathF.Max(u2.Y, u3.Y));
         return (uMin, vMin, uMax, vMax);
+    }
+
+    // ── Lit material support ─────────────────────────────────────────────────
+
+    private static CompositionEffectFactory GetOrCreateLitFactory(Compositor compositor)
+    {
+        if (_litEffectFactory is not null) return _litEffectFactory;
+
+        var effect = new BlendEffect
+        {
+            Mode = BlendEffectMode.Multiply,
+            Background = new CompositionEffectSourceParameter("Diffuse"),
+            Foreground = new SceneLightingEffect
+            {
+                Name = "Lighting",
+                AmbientAmount  = LightingDefaults.DefaultAmbient,
+                DiffuseAmount  = LightingDefaults.DefaultDiffuse,
+                SpecularAmount = LightingDefaults.DefaultSpecular,
+                SpecularShine  = LightingDefaults.DefaultShine,
+                NormalMapSource = new CompositionEffectSourceParameter("NormalMap"),
+            },
+        };
+
+        _litEffectFactory = compositor.CreateEffectFactory(effect, new[]
+        {
+            "Lighting.AmbientAmount",
+            "Lighting.DiffuseAmount",
+            "Lighting.SpecularAmount",
+            "Lighting.SpecularShine",
+        });
+
+        return _litEffectFactory;
+    }
+
+    private static CompositionBrush BuildLitBrush(
+        Compositor compositor, CachedQuad quad, ObjMaterial material)
+    {
+        var factory = GetOrCreateLitFactory(compositor);
+        var effectBrush = factory.CreateBrush();
+
+        // Diffuse source
+        if (material.DiffuseTexture != null)
+        {
+            var texBrush = compositor.CreateSurfaceBrush();
+            ApplySurfaceBrush(compositor, texBrush, quad, material);
+            effectBrush.SetSourceParameter("Diffuse", texBrush);
+        }
+        else
+        {
+            effectBrush.SetSourceParameter("Diffuse",
+                compositor.CreateColorBrush(material.DiffuseColor ?? quad.FallbackColor));
+        }
+
+        // Normal map source
+        var normalBrush = compositor.CreateSurfaceBrush();
+        normalBrush.Surface = material.NormalMap;
+        normalBrush.Stretch = CompositionStretch.Fill;
+        normalBrush.HorizontalAlignmentRatio = 0;
+        normalBrush.VerticalAlignmentRatio = 0;
+        normalBrush.TransformMatrix = BuildBrushTransform(quad, material);
+        effectBrush.SetSourceParameter("NormalMap", normalBrush);
+
+        // Bind animatable lighting scalars to the shared LightingDefaults
+        // property set so live slider changes propagate to every face without
+        // rebuilding the effect graph.
+        var globals = LightingDefaults.GetOrCreate(compositor);
+
+        // Apply per-material overrides or bind to global defaults
+        var lp = material.Lighting;
+        if (lp?.AmbientAmount is { } a)
+            effectBrush.Properties.InsertScalar("Lighting.AmbientAmount", a);
+        else
+            BindScalar(effectBrush, "Lighting.AmbientAmount", globals, "AmbientAmount");
+
+        if (lp?.DiffuseAmount is { } d)
+            effectBrush.Properties.InsertScalar("Lighting.DiffuseAmount", d);
+        else
+            BindScalar(effectBrush, "Lighting.DiffuseAmount", globals, "DiffuseAmount");
+
+        if (lp?.SpecularAmount is { } sp)
+            effectBrush.Properties.InsertScalar("Lighting.SpecularAmount", sp);
+        else
+            BindScalar(effectBrush, "Lighting.SpecularAmount", globals, "SpecularAmount");
+
+        if (lp?.SpecularShine is { } sh)
+            effectBrush.Properties.InsertScalar("Lighting.SpecularShine", sh);
+        else
+            BindScalar(effectBrush, "Lighting.SpecularShine", globals, "SpecularShine");
+
+        return effectBrush;
+    }
+
+    private static void BindScalar(
+        CompositionEffectBrush effectBrush, string effectProperty,
+        CompositionPropertySet source, string sourceProperty)
+    {
+        var expr = effectBrush.Compositor.CreateExpressionAnimation(
+            $"globals.{sourceProperty}");
+        expr.SetReferenceParameter("globals", source);
+        effectBrush.StartAnimation(effectProperty, expr);
     }
 }

@@ -136,6 +136,8 @@
     <Compile Include="Caching\ObjMaterial.cs" />
     <Compile Include="Caching\ObjMaterialPack.cs" />
     <Compile Include="Caching\ObjTextureSource.cs" />
+    <Compile Include="Caching\LightingParams.cs" />
+    <Compile Include="Caching\LightingDefaults.cs" />
     <Compile Include="Diagnostics\SpinDiagnostics.cs" />
     <Compile Include="Parsing\MtlMaterial.cs" />
     <Compile Include="Parsing\MtlParser.cs" />
