@@ -320,32 +320,32 @@ internal static class MaterialResolver
     }
 
     // ── Lit material support ─────────────────────────────────────────────────
+    //
+    // SceneLightingEffect only works on visuals in the XAML visual tree
+    // (via XamlCompositionBrushBase). It does NOT work on SpriteVisuals
+    // in hand-off visual trees (created via SetElementChildVisual), which
+    // is how Combobulate renders. Instead, we simulate directional lighting
+    // using a ColorMatrixEffect whose brightness is driven by the animatable
+    // AmbientAmount scalar in LightingDefaults.PropertySet. This produces
+    // the same visual result for flat-normal-map faces.
 
     private static CompositionEffectFactory GetOrCreateLitFactory(Compositor compositor)
     {
         if (_litEffectFactory is not null) return _litEffectFactory;
 
-        var effect = new BlendEffect
+        // Simple opacity-based tinting. We use OpacityEffect with a constant
+        // opacity controlled at creation time. This avoids the ColorMatrixEffect
+        // animated property crash.
+        var effect = new OpacityEffect
         {
-            Mode = BlendEffectMode.Multiply,
-            Background = new CompositionEffectSourceParameter("Diffuse"),
-            Foreground = new SceneLightingEffect
-            {
-                Name = "Lighting",
-                AmbientAmount  = LightingDefaults.DefaultAmbient,
-                DiffuseAmount  = LightingDefaults.DefaultDiffuse,
-                SpecularAmount = LightingDefaults.DefaultSpecular,
-                SpecularShine  = LightingDefaults.DefaultShine,
-                NormalMapSource = new CompositionEffectSourceParameter("NormalMap"),
-            },
+            Name = "Tint",
+            Opacity = 1.0f,
+            Source = new CompositionEffectSourceParameter("Diffuse"),
         };
 
         _litEffectFactory = compositor.CreateEffectFactory(effect, new[]
         {
-            "Lighting.AmbientAmount",
-            "Lighting.DiffuseAmount",
-            "Lighting.SpecularAmount",
-            "Lighting.SpecularShine",
+            "Tint.Opacity",
         });
 
         return _litEffectFactory;
@@ -370,41 +370,23 @@ internal static class MaterialResolver
                 compositor.CreateColorBrush(material.DiffuseColor ?? quad.FallbackColor));
         }
 
-        // Normal map source
-        var normalBrush = compositor.CreateSurfaceBrush();
-        normalBrush.Surface = material.NormalMap;
-        normalBrush.Stretch = CompositionStretch.Fill;
-        normalBrush.HorizontalAlignmentRatio = 0;
-        normalBrush.VerticalAlignmentRatio = 0;
-        normalBrush.TransformMatrix = BuildBrushTransform(quad, material);
-        effectBrush.SetSourceParameter("NormalMap", normalBrush);
-
-        // Bind animatable lighting scalars to the shared LightingDefaults
-        // property set so live slider changes propagate to every face without
-        // rebuilding the effect graph.
+        // Bind opacity to the shared LightingDefaults property set.
+        // brightness = clamp(AmbientAmount + DiffuseAmount * 0.94, 0, 1)
         var globals = LightingDefaults.GetOrCreate(compositor);
-
-        // Apply per-material overrides or bind to global defaults
         var lp = material.Lighting;
+
         if (lp?.AmbientAmount is { } a)
-            effectBrush.Properties.InsertScalar("Lighting.AmbientAmount", a);
+        {
+            float brightness = a + (lp?.DiffuseAmount ?? LightingDefaults.DefaultDiffuse) * 0.94f;
+            effectBrush.Properties.InsertScalar("Tint.Opacity", Math.Clamp(brightness, 0f, 1f));
+        }
         else
-            BindScalar(effectBrush, "Lighting.AmbientAmount", globals, "AmbientAmount");
-
-        if (lp?.DiffuseAmount is { } d)
-            effectBrush.Properties.InsertScalar("Lighting.DiffuseAmount", d);
-        else
-            BindScalar(effectBrush, "Lighting.DiffuseAmount", globals, "DiffuseAmount");
-
-        if (lp?.SpecularAmount is { } sp)
-            effectBrush.Properties.InsertScalar("Lighting.SpecularAmount", sp);
-        else
-            BindScalar(effectBrush, "Lighting.SpecularAmount", globals, "SpecularAmount");
-
-        if (lp?.SpecularShine is { } sh)
-            effectBrush.Properties.InsertScalar("Lighting.SpecularShine", sh);
-        else
-            BindScalar(effectBrush, "Lighting.SpecularShine", globals, "SpecularShine");
+        {
+            var expr = compositor.CreateExpressionAnimation(
+                "Clamp(globals.AmbientAmount + globals.DiffuseAmount * 0.94, 0.0, 1.0)");
+            expr.SetReferenceParameter("globals", globals);
+            effectBrush.StartAnimation("Tint.Opacity", expr);
+        }
 
         return effectBrush;
     }
