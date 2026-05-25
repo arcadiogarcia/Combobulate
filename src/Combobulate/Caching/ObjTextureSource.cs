@@ -64,6 +64,32 @@ public abstract class ObjTextureSource
     /// </summary>
     public void Release() => MaterialResolver.ReleaseTexture(this);
 
+    /// <summary>
+    /// When non-null, all <see cref="FromUri(Uri, Size)"/> /
+    /// <see cref="FromFile(string, Size)"/> sources call this delegate at decode
+    /// time instead of using <c>LoadedImageSurface.StartLoadFromUri</c> directly.
+    /// The delegate receives the URI plus the requested <c>desiredMaxSize</c> cap
+    /// (zero/zero = unclamped) and returns a fully-decoded
+    /// <see cref="SoftwareBitmap"/> that will be encoded to PNG and handed to
+    /// <c>LoadedImageSurface.StartLoadFromStream</c>. Intended for diagnostic
+    /// overlays in DEBUG builds — e.g. baking the decoded resolution into the
+    /// corner of every cover so the rendered LOD is visible at a glance.
+    /// </summary>
+    /// <remarks>
+    /// Setting this slows every URI texture load (extra decode + Win2D draw +
+    /// PNG re-encode). Production builds must leave it null.
+    /// Returning null from the delegate falls back to the standard fast path.
+    /// </remarks>
+    public static Func<Uri, Size, Task<SoftwareBitmap?>>? UriDecodeInterceptor { get; set; }
+
+    /// <summary>
+    /// Drops every cached texture so the next bind re-decodes from source. Host
+    /// apps use this after flipping a diagnostic toggle (e.g.
+    /// <see cref="UriDecodeInterceptor"/>) so visible covers go through the new
+    /// decode path immediately. Idempotent; safe to call from any thread.
+    /// </summary>
+    public static void ClearAllTextures() => MaterialResolver.ClearTextures();
+
     public static ObjTextureSource FromUri(Uri uri) => new UriSource(uri, default);
 
     /// <summary>
@@ -130,12 +156,31 @@ public abstract class ObjTextureSource
             _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
                 ? $"uri:{_uri.AbsoluteUri}@{_desiredMaxSize.Width}x{_desiredMaxSize.Height}"
                 : "uri:" + _uri.AbsoluteUri;
-        internal override Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
+        internal override async Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
         {
-            var surface = _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
+            // Diagnostic path: a host app (typically a #if DEBUG hook) can take
+            // over the decode to bake an overlay into the bitmap. We round-trip
+            // through PNG → StartLoadFromStream because LoadedImageSurface has
+            // no public "load from SoftwareBitmap" constructor.
+            var interceptor = UriDecodeInterceptor;
+            if (interceptor != null)
+            {
+                SoftwareBitmap? baked = null;
+                try { baked = await interceptor(_uri, _desiredMaxSize).ConfigureAwait(true); }
+                catch { /* fall through to the fast path on interceptor failure */ }
+                if (baked != null)
+                {
+                    var bytes = await EncodePngBytesAsync(baked).ConfigureAwait(true);
+                    baked.Dispose();
+                    var stream = BytesToStream(bytes);
+                    return LoadedImageSurface.StartLoadFromStream(stream);
+                }
+            }
+
+            ICompositionSurface surface = _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
                 ? LoadedImageSurface.StartLoadFromUri(_uri, _desiredMaxSize)
                 : LoadedImageSurface.StartLoadFromUri(_uri);
-            return Task.FromResult<ICompositionSurface>(surface);
+            return surface;
         }
     }
 
