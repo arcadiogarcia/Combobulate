@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Threading.Tasks;
+using Windows.Foundation;
 using Windows.Graphics.Imaging;
 using Windows.Storage.Streams;
 
@@ -39,14 +40,37 @@ public abstract class ObjTextureSource
         throw new NotSupportedException(
             "This ObjTextureSource is read-only. Use FromBitmap or FromStream for updateable sources.");
 
-    public static ObjTextureSource FromUri(Uri uri) => new UriSource(uri);
+    public static ObjTextureSource FromUri(Uri uri) => new UriSource(uri, default);
+
+    /// <summary>
+    /// Loads the texture from <paramref name="uri"/> and clamps the decoded image to
+    /// <paramref name="desiredMaxSize"/> (in pixels) while preserving aspect ratio. Use
+    /// this when the texture will be rendered onto a much smaller surface than its
+    /// natural resolution — composition surfaces sample bilinearly without mipmaps, so
+    /// downsample ratios &gt; 2× alias badly. The Windows imaging pipeline performs
+    /// proper high-quality downsampling at decode time, after which bilinear sampling
+    /// looks clean.
+    /// </summary>
+    public static ObjTextureSource FromUri(Uri uri, Size desiredMaxSize) => new UriSource(uri, desiredMaxSize);
 
     public static ObjTextureSource FromFile(string absolutePath)
     {
         if (string.IsNullOrWhiteSpace(absolutePath))
             throw new ArgumentException("Path is required.", nameof(absolutePath));
         var full = Path.GetFullPath(absolutePath);
-        return new UriSource(new Uri(full));
+        return new UriSource(new Uri(full), default);
+    }
+
+    /// <summary>
+    /// File-path overload of <see cref="FromUri(Uri, Size)"/>. See that method for
+    /// when to clamp the decode size.
+    /// </summary>
+    public static ObjTextureSource FromFile(string absolutePath, Size desiredMaxSize)
+    {
+        if (string.IsNullOrWhiteSpace(absolutePath))
+            throw new ArgumentException("Path is required.", nameof(absolutePath));
+        var full = Path.GetFullPath(absolutePath);
+        return new UriSource(new Uri(full), desiredMaxSize);
     }
 
     public static ObjTextureSource FromStream(Func<IRandomAccessStream> factory, string cacheKey)
@@ -72,11 +96,21 @@ public abstract class ObjTextureSource
     private sealed class UriSource : ObjTextureSource
     {
         private readonly Uri _uri;
-        public UriSource(Uri uri) { _uri = uri; }
-        public override string CacheKey => "uri:" + _uri.AbsoluteUri;
+        private readonly Size _desiredMaxSize;
+        public UriSource(Uri uri, Size desiredMaxSize)
+        {
+            _uri = uri;
+            _desiredMaxSize = desiredMaxSize;
+        }
+        public override string CacheKey =>
+            _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
+                ? $"uri:{_uri.AbsoluteUri}@{_desiredMaxSize.Width}x{_desiredMaxSize.Height}"
+                : "uri:" + _uri.AbsoluteUri;
         internal override Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
         {
-            var surface = LoadedImageSurface.StartLoadFromUri(_uri);
+            var surface = _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
+                ? LoadedImageSurface.StartLoadFromUri(_uri, _desiredMaxSize)
+                : LoadedImageSurface.StartLoadFromUri(_uri);
             return Task.FromResult<ICompositionSurface>(surface);
         }
     }
