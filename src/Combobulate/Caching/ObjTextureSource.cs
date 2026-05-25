@@ -40,6 +40,30 @@ public abstract class ObjTextureSource
         throw new NotSupportedException(
             "This ObjTextureSource is read-only. Use FromBitmap or FromStream for updateable sources.");
 
+    /// <summary>
+    /// Ensures this texture's pixels are decoded and held by the shared texture
+    /// cache, even if no <c>CompositionSurfaceBrush</c> is currently bound to it.
+    /// Use before swapping a material to this texture to avoid a one-frame flash
+    /// to blank while decoding is still in flight. The returned task completes
+    /// when the underlying surface is ready to render.
+    ///
+    /// <para>
+    /// Every call must be paired with a matching <see cref="Release"/>; the
+    /// texture stays resident until pin count reaches zero AND no live
+    /// composition brushes still reference its surface.
+    /// </para>
+    /// </summary>
+    public Task<ICompositionSurface> AcquireAsync(Compositor compositor) =>
+        MaterialResolver.AcquireAsync(compositor, this);
+
+    /// <summary>
+    /// Counterpart to <see cref="AcquireAsync"/>. Drops a pin; when no pins and
+    /// no live brushes remain the cache entry is evicted and the underlying
+    /// <c>LoadedImageSurface</c> is disposed (if it implements
+    /// <see cref="IDisposable"/>).
+    /// </summary>
+    public void Release() => MaterialResolver.ReleaseTexture(this);
+
     public static ObjTextureSource FromUri(Uri uri) => new UriSource(uri, default);
 
     /// <summary>

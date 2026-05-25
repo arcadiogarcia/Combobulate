@@ -53,10 +53,30 @@ internal static class MaterialResolver
         public ICompositionSurface? Surface;
         public readonly List<WeakReference<CompositionSurfaceBrush>> Brushes = new();
         public readonly object Gate = new();
+        /// <summary>
+        /// Explicit pin count. Bumped by <see cref="AcquireAsync"/>, decremented by
+        /// <see cref="ReleaseTexture"/>. When > 0 the entry will not be evicted from
+        /// the cache even if no surface brushes remain bound to it. Used by callers
+        /// that want LOD-specific decoded copies (e.g. a high-res focused-cover
+        /// variant) with deterministic memory lifetime.
+        /// </summary>
+        public int PinCount;
+        /// <summary>
+        /// Completion signal for the in-flight (or completed) decode. Allows
+        /// <see cref="AcquireAsync"/> to await the surface even when the entry was
+        /// created by a previous brush bind. Set exactly once when Surface lands.
+        /// </summary>
+        public readonly TaskCompletionSource<ICompositionSurface> Ready =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     private static readonly ConcurrentDictionary<string, TextureEntry> _textures =
         new(StringComparer.Ordinal);
+
+    // Maps ObjTextureSource instance → cache key currently pinned by it. Used by
+    // ReleaseTexture so callers pass the same source they acquired with (which may
+    // be a different instance than the one originally cached under that key).
+    private static readonly ConditionalWeakTable<ObjTextureSource, string> _pinnedKeysBySource = new();
 
     /// <summary>
     /// Cached <see cref="CompositionEffectFactory"/> for the lit-material effect graph.
@@ -70,7 +90,120 @@ internal static class MaterialResolver
     private static readonly ConditionalWeakTable<ObjGeometry, ConditionalWeakTable<object, ResolvedQuadMaterials>> _byGeometry = new();
     private static readonly object _noPackSentinel = new();
 
-    public static void ClearTextures() => _textures.Clear();
+    public static void ClearTextures()
+    {
+        // Snapshot + clear so disposal happens without holding the dictionary lock.
+        var snapshot = _textures.ToArray();
+        _textures.Clear();
+        foreach (var kv in snapshot)
+        {
+            lock (kv.Value.Gate)
+            {
+                DisposeIfDisposable(kv.Value.Surface);
+                kv.Value.Surface = null;
+                kv.Value.PinCount = 0;
+                kv.Value.Brushes.Clear();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Ensures a decoded surface exists for <paramref name="source"/> and pins the
+    /// cache entry so it survives even when no brushes are bound. Returns the
+    /// loaded <see cref="ICompositionSurface"/>; the returned task only completes
+    /// once the underlying <c>LoadedImageSurface</c> has finished decoding (so the
+    /// caller can swap brushes to it without flicker). Always pair with a matching
+    /// <see cref="ReleaseTexture"/> call.
+    /// </summary>
+    public static Task<ICompositionSurface> AcquireAsync(Compositor compositor, ObjTextureSource source)
+    {
+        if (compositor == null) throw new ArgumentNullException(nameof(compositor));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+
+        var key = source.CacheKey;
+        var entry = _textures.GetOrAdd(key, _key =>
+        {
+            var e = new TextureEntry();
+            source.Invalidated -= OnSourceInvalidated;
+            source.Invalidated += OnSourceInvalidated;
+            _ = LoadAsync(compositor, source, e);
+            return e;
+        });
+
+        Task<ICompositionSurface> readyTask;
+        lock (entry.Gate)
+        {
+            entry.PinCount++;
+            // Remember the key associated with THIS source instance — callers may
+            // construct a fresh ObjTextureSource (same URI/size) for release, but
+            // most use the same instance they passed in. We re-resolve via key in
+            // ReleaseTexture anyway, so this table is purely an integrity check.
+            _pinnedKeysBySource.Remove(source);
+            _pinnedKeysBySource.Add(source, key);
+            // If the load already completed before we acquired, the Ready task is
+            // already set; otherwise it will complete in LoadAsync.
+            readyTask = entry.Ready.Task;
+        }
+        return readyTask;
+    }
+
+    /// <summary>
+    /// Releases a pin acquired via <see cref="AcquireAsync"/>. If the pin count
+    /// reaches zero AND no live composition brushes still reference the entry's
+    /// surface, the entry is evicted from the cache and the underlying
+    /// <c>LoadedImageSurface</c> is disposed. Safe to call from any thread.
+    /// Callers must repoint any of their own brushes off this surface before
+    /// releasing the last pin to avoid the brush going blank.
+    /// </summary>
+    public static void ReleaseTexture(ObjTextureSource source)
+    {
+        if (source == null) throw new ArgumentNullException(nameof(source));
+
+        // Prefer the key stamped when we acquired (covers sources whose CacheKey
+        // depends on internal state that might have changed). Falls back to a
+        // fresh CacheKey read.
+        if (!_pinnedKeysBySource.TryGetValue(source, out var key))
+            key = source.CacheKey;
+
+        if (!_textures.TryGetValue(key, out var entry)) return;
+
+        bool evict;
+        ICompositionSurface? toDispose = null;
+        lock (entry.Gate)
+        {
+            if (entry.PinCount > 0) entry.PinCount--;
+            // Prune dead brush refs first so the live-count check is accurate.
+            for (int i = entry.Brushes.Count - 1; i >= 0; i--)
+            {
+                if (!entry.Brushes[i].TryGetTarget(out _))
+                    entry.Brushes.RemoveAt(i);
+            }
+            evict = entry.PinCount == 0 && entry.Brushes.Count == 0;
+            if (evict)
+            {
+                toDispose = entry.Surface;
+                entry.Surface = null;
+            }
+        }
+
+        if (evict)
+        {
+            // Only remove if the cached entry is still ours (a parallel Acquire
+            // could have replaced it; defensive).
+            _textures.TryRemove(new KeyValuePair<string, TextureEntry>(key, entry));
+            _pinnedKeysBySource.Remove(source);
+            DisposeIfDisposable(toDispose);
+        }
+    }
+
+    private static void DisposeIfDisposable(ICompositionSurface? surface)
+    {
+        if (surface is IDisposable d)
+        {
+            try { d.Dispose(); }
+            catch { /* surface already cleaned up by composition shutdown */ }
+        }
+    }
 
     public static ResolvedQuadMaterials Resolve(Compositor compositor, ObjGeometry geometry, ObjMaterialPack? pack)
     {
@@ -218,8 +351,15 @@ internal static class MaterialResolver
         surfaceBrush.HorizontalAlignmentRatio = 0;
         surfaceBrush.VerticalAlignmentRatio = 0;
         surfaceBrush.TransformMatrix = BuildBrushTransform(quad, material);
-        surfaceBrush.Surface = null;
-        GetOrLoadSurface(compositor, material.DiffuseTexture!, surfaceBrush);
+        // Avoid a one-frame flash: only null the existing surface when the new
+        // target hasn't finished decoding. If it's already in the cache loaded,
+        // GetOrLoadSurface will swap atomically and we never go through blank.
+        var source = material.DiffuseTexture!;
+        if (!_textures.TryGetValue(source.CacheKey, out var entry) || entry.Surface == null)
+        {
+            surfaceBrush.Surface = null;
+        }
+        GetOrLoadSurface(compositor, source, surfaceBrush);
     }
 
     private static void GetOrLoadSurface(Compositor compositor, ObjTextureSource source, CompositionSurfaceBrush brush)
@@ -244,11 +384,21 @@ internal static class MaterialResolver
 
     private static async Task LoadAsync(Compositor compositor, ObjTextureSource source, TextureEntry entry)
     {
-        var surface = await source.CreateSurfaceAsync(compositor).ConfigureAwait(true);
+        ICompositionSurface? surface = null;
+        try
+        {
+            surface = await source.CreateSurfaceAsync(compositor).ConfigureAwait(true);
+        }
+        catch (Exception ex)
+        {
+            lock (entry.Gate) entry.Ready.TrySetException(ex);
+            return;
+        }
         lock (entry.Gate)
         {
             entry.Surface = surface;
             PointBrushesAt(entry, surface);
+            entry.Ready.TrySetResult(surface);
         }
     }
 
@@ -274,12 +424,28 @@ internal static class MaterialResolver
         }
         if (compositor == null) return;
 
-        var surface = await source.CreateSurfaceAsync(compositor).ConfigureAwait(true);
+        ICompositionSurface surface;
+        try
+        {
+            surface = await source.CreateSurfaceAsync(compositor).ConfigureAwait(true);
+        }
+        catch
+        {
+            // Old surface is still valid; leave it in place.
+            return;
+        }
+
+        ICompositionSurface? oldSurface;
         lock (entry.Gate)
         {
+            oldSurface = entry.Surface;
             entry.Surface = surface;
             PointBrushesAt(entry, surface);
         }
+        // Dispose the previous surface AFTER brushes have been repointed to the
+        // new one — otherwise composition would briefly see freed memory.
+        if (!ReferenceEquals(oldSurface, surface))
+            DisposeIfDisposable(oldSurface);
     }
 
     private static void PointBrushesAt(TextureEntry entry, ICompositionSurface surface)
