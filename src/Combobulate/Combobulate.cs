@@ -49,6 +49,17 @@ public sealed class Combobulate : Control
     private Compositor? _compositor;
     private ContainerVisual? _root;
 
+    /// <summary>
+    /// The root <see cref="ContainerVisual"/> that hosts all rendered
+    /// SpriteVisuals (the hand-off visual set via
+    /// <c>ElementCompositionPreview.SetElementChildVisual</c>).
+    /// <para>Apps that use <c>SceneLightingEffect</c> must add this visual
+    /// to a <c>CompositionLight.Targets</c> directly — XAML
+    /// <c>AddTargetElement</c> targets only the UIElement's backing visual
+    /// which doesn't cascade to the hand-off visual tree.</para>
+    /// </summary>
+    public Visual? RootVisual => _root;
+
     public Combobulate()
     {
         this.DefaultStyleKey = typeof(Combobulate);
