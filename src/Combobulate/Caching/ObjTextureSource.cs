@@ -69,18 +69,21 @@ public abstract class ObjTextureSource
     /// <see cref="FromFile(string, Size)"/> sources call this delegate at decode
     /// time instead of using <c>LoadedImageSurface.StartLoadFromUri</c> directly.
     /// The delegate receives the URI plus the requested <c>desiredMaxSize</c> cap
-    /// (zero/zero = unclamped) and returns a fully-decoded
-    /// <see cref="SoftwareBitmap"/> that will be encoded to PNG and handed to
-    /// <c>LoadedImageSurface.StartLoadFromStream</c>. Intended for diagnostic
-    /// overlays in DEBUG builds — e.g. baking the decoded resolution into the
-    /// corner of every cover so the rendered LOD is visible at a glance.
+    /// (zero/zero = unclamped) and returns the fully-encoded PNG bytes that will
+    /// be handed to <c>LoadedImageSurface.StartLoadFromStream</c>. Intended for
+    /// diagnostic overlays in DEBUG builds — e.g. baking the decoded resolution
+    /// into the corner of every cover so the rendered LOD is visible at a glance.
     /// </summary>
     /// <remarks>
     /// Setting this slows every URI texture load (extra decode + Win2D draw +
-    /// PNG re-encode). Production builds must leave it null.
-    /// Returning null from the delegate falls back to the standard fast path.
+    /// PNG encode). Production builds must leave it null.
+    /// Returning null or an empty array from the delegate falls back to the
+    /// standard fast path.
+    /// PNG bytes (not SoftwareBitmap) so host apps can use whichever GPU
+    /// pipeline they prefer (Win2D etc.) without forcing a stride-fragile
+    /// SoftwareBitmap copy out of the GPU.
     /// </remarks>
-    public static Func<Uri, Size, Task<SoftwareBitmap?>>? UriDecodeInterceptor { get; set; }
+    public static Func<Uri, Size, Task<byte[]?>>? UriDecodeInterceptor { get; set; }
 
     /// <summary>
     /// Drops every cached texture so the next bind re-decodes from source. Host
@@ -165,14 +168,12 @@ public abstract class ObjTextureSource
             var interceptor = UriDecodeInterceptor;
             if (interceptor != null)
             {
-                SoftwareBitmap? baked = null;
+                byte[]? baked = null;
                 try { baked = await interceptor(_uri, _desiredMaxSize).ConfigureAwait(true); }
                 catch { /* fall through to the fast path on interceptor failure */ }
-                if (baked != null)
+                if (baked != null && baked.Length > 0)
                 {
-                    var bytes = await EncodePngBytesAsync(baked).ConfigureAwait(true);
-                    baked.Dispose();
-                    var stream = BytesToStream(bytes);
+                    var stream = BytesToStream(baked);
                     return LoadedImageSurface.StartLoadFromStream(stream);
                 }
             }
