@@ -68,22 +68,33 @@ public abstract class ObjTextureSource
     /// When non-null, all <see cref="FromUri(Uri, Size)"/> /
     /// <see cref="FromFile(string, Size)"/> sources call this delegate at decode
     /// time instead of using <c>LoadedImageSurface.StartLoadFromUri</c> directly.
-    /// The delegate receives the URI plus the requested <c>desiredMaxSize</c> cap
-    /// (zero/zero = unclamped) and returns the fully-encoded PNG bytes that will
-    /// be handed to <c>LoadedImageSurface.StartLoadFromStream</c>. Intended for
-    /// diagnostic overlays in DEBUG builds — e.g. baking the decoded resolution
-    /// into the corner of every cover so the rendered LOD is visible at a glance.
+    /// The delegate receives the source URI plus the requested
+    /// <c>desiredMaxSize</c> cap (zero/zero = unclamped) and returns the URI of a
+    /// file (typically a baked PNG under the app's local state) that will be
+    /// handed to <c>LoadedImageSurface.StartLoadFromUri</c> in place of the
+    /// original. Intended for diagnostic overlays in DEBUG builds — e.g. baking
+    /// the decoded resolution into the corner of every cover so the rendered
+    /// LOD is visible at a glance.
     /// </summary>
     /// <remarks>
-    /// Setting this slows every URI texture load (extra decode + Win2D draw +
-    /// PNG encode). Production builds must leave it null.
-    /// Returning null or an empty array from the delegate falls back to the
-    /// standard fast path.
-    /// PNG bytes (not SoftwareBitmap) so host apps can use whichever GPU
-    /// pipeline they prefer (Win2D etc.) without forcing a stride-fragile
-    /// SoftwareBitmap copy out of the GPU.
+    /// Why a URI and not raw bytes: <c>LoadedImageSurface.StartLoadFromStream</c>
+    /// fed by an <c>InMemoryRandomAccessStream</c> corrupts large textures
+    /// (rows past ~25% of the height get replaced with garbage for non-stride-
+    /// aligned widths). <c>StartLoadFromUri</c> with a file path goes through a
+    /// different decode path and renders reliably at any size, so the host
+    /// app is expected to persist the baked bytes to a temp file before
+    /// returning. Setting this slows every URI texture load (extra decode +
+    /// Win2D draw + PNG encode + disk write). Production builds must leave
+    /// it null. Returning null falls back to the standard fast path.
     /// </remarks>
-    public static Func<Uri, Size, Task<byte[]?>>? UriDecodeInterceptor { get; set; }
+    public static Func<Uri, Size, Task<Uri?>>? UriDecodeInterceptor { get; set; }
+
+    /// <summary>
+    /// Optional sink for diagnostic strings emitted by texture loads — surface
+    /// load completion status, interceptor results, etc. Host apps hook this to
+    /// their perf log in DEBUG builds. Null in production = no logging.
+    /// </summary>
+    public static Action<string>? DiagnosticLog { get; set; }
 
     /// <summary>
     /// Drops every cached texture so the next bind re-decodes from source. Host
@@ -162,26 +173,61 @@ public abstract class ObjTextureSource
         internal override async Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
         {
             // Diagnostic path: a host app (typically a #if DEBUG hook) can take
-            // over the decode to bake an overlay into the bitmap. We round-trip
-            // through PNG → StartLoadFromStream because LoadedImageSurface has
-            // no public "load from SoftwareBitmap" constructor.
+            // over the decode to bake an overlay into the bitmap. The host
+            // returns a URI pointing at a temp file containing the baked PNG;
+            // we go through StartLoadFromUri so the loader's reliable file
+            // decode path is used. (StartLoadFromStream + InMemoryRandomAccess-
+            // Stream corrupts large textures — see UriDecodeInterceptor docs.)
             var interceptor = UriDecodeInterceptor;
+            var log = DiagnosticLog;
             if (interceptor != null)
             {
-                byte[]? baked = null;
-                try { baked = await interceptor(_uri, _desiredMaxSize).ConfigureAwait(true); }
-                catch { /* fall through to the fast path on interceptor failure */ }
-                if (baked != null && baked.Length > 0)
+                Uri? bakedUri = null;
+                Exception? interceptorEx = null;
+                try { bakedUri = await interceptor(_uri, _desiredMaxSize).ConfigureAwait(true); }
+                catch (Exception ex) { interceptorEx = ex; }
+                if (interceptorEx != null)
+                    log?.Invoke($"[ObjTextureSource] interceptor threw for {_uri}: {interceptorEx.GetType().Name}: {interceptorEx.Message}");
+                else
+                    log?.Invoke($"[ObjTextureSource] interceptor returned baked={(bakedUri?.ToString() ?? "<null>")} for {_uri} cap={_desiredMaxSize.Width}x{_desiredMaxSize.Height}");
+                if (bakedUri != null)
                 {
-                    var stream = BytesToStream(baked);
-                    return LoadedImageSurface.StartLoadFromStream(stream);
+                    var loaded = _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
+                        ? LoadedImageSurface.StartLoadFromUri(bakedUri, _desiredMaxSize)
+                        : LoadedImageSurface.StartLoadFromUri(bakedUri);
+                    await AwaitLoadAsync(loaded, bakedUri, log).ConfigureAwait(true);
+                    return loaded;
                 }
             }
 
-            ICompositionSurface surface = _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
+            LoadedImageSurface lis = _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
                 ? LoadedImageSurface.StartLoadFromUri(_uri, _desiredMaxSize)
                 : LoadedImageSurface.StartLoadFromUri(_uri);
-            return surface;
+            await AwaitLoadAsync(lis, _uri, log).ConfigureAwait(true);
+            return lis;
+        }
+
+        /// <summary>
+        /// Awaits the <see cref="LoadedImageSurface.LoadCompleted"/> event so
+        /// callers (cache <c>AcquireAsync</c>, etc.) only see the surface once
+        /// pixels have actually decoded. Without this, the surface object is
+        /// returned synchronously and bound to brushes while decode is still
+        /// in flight — some effect graphs (notably BlendEffect Multiply with a
+        /// SceneLightingEffect foreground) snapshot the effective sampler at
+        /// bind time and never repaint when the surface's pixels arrive,
+        /// leaving the rendered face as the lighting gradient only (no diffuse).
+        /// </summary>
+        private static Task AwaitLoadAsync(LoadedImageSurface lis, Uri uri, Action<string>? log)
+        {
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            void Handler(LoadedImageSurface s, LoadedImageSourceLoadCompletedEventArgs e)
+            {
+                log?.Invoke($"[ObjTextureSource] LoadCompleted source={uri} status={e.Status}");
+                lis.LoadCompleted -= Handler;
+                tcs.TrySetResult(e.Status == LoadedImageSourceLoadStatus.Success);
+            }
+            lis.LoadCompleted += Handler;
+            return tcs.Task;
         }
     }
 

@@ -90,6 +90,21 @@ internal static class MaterialResolver
     private static readonly ConditionalWeakTable<ObjGeometry, ConditionalWeakTable<object, ResolvedQuadMaterials>> _byGeometry = new();
     private static readonly object _noPackSentinel = new();
 
+    /// <summary>
+    /// Keeps the inner Diffuse + NormalMap surface brushes used by a lit
+    /// <see cref="CompositionEffectBrush"/> managed-alive as long as the effect
+    /// brush wrapper itself is alive. Without this, the inner texBrush created
+    /// inside <see cref="BuildLitBrush"/> goes out of scope after
+    /// <c>SetSourceParameter</c> returns — its COM object stays alive (held by
+    /// the effect's native graph) but the managed RCW is collectible. The
+    /// texture cache only holds a <see cref="WeakReference{T}"/> to the brush,
+    /// so once the RCW is GC'd the cache can no longer repoint the brush when
+    /// the async surface load finishes, and the cover renders without diffuse.
+    /// Tying the lifetime here keeps the WeakReference resolvable for the life
+    /// of the rendered effect brush.
+    /// </summary>
+    private static readonly ConditionalWeakTable<CompositionEffectBrush, object> _litInnerBrushes = new();
+
     public static void ClearTextures()
     {
         // Snapshot + clear so disposal happens without holding the dictionary lock.
@@ -523,12 +538,31 @@ internal static class MaterialResolver
         var factory = GetOrCreateLitFactory(compositor);
         var effectBrush = factory.CreateBrush();
 
+        // Inner brushes are passed to the effect via SetSourceParameter, which
+        // hands ownership to the native effect graph. The managed wrappers
+        // would then be collectible — but the texture cache only WeakReferences
+        // them, so a GC before the async surface load completes would leave
+        // the cover unrendered. We hold strong refs here, keyed by effectBrush,
+        // so the wrappers live as long as the rendered effect brush does.
+        CompositionSurfaceBrush? texBrush = null;
+        CompositionSurfaceBrush? normalBrush = null;
+
         // Diffuse source
         if (material.DiffuseTexture != null)
         {
-            var texBrush = compositor.CreateSurfaceBrush();
-            ApplySurfaceBrush(compositor, texBrush, quad, material);
+            texBrush = compositor.CreateSurfaceBrush();
+            // IMPORTANT: wire the brush into the effect graph BEFORE assigning
+            // its surface. With the opposite order (set surface, then
+            // SetSourceParameter), the effect graph appears to snapshot the
+            // surface's GPU resource state at parameter-bind time — and when
+            // the LIS pixels haven't yet been materialised into a sampled
+            // texture (which only happens once a consumer is in the visual
+            // tree), the effect graph never picks them up later. Assigning the
+            // surface AFTER SetSourceParameter mirrors the shelf "PointBrushesAt"
+            // path (where the brush is on a sprite by the time Surface is set)
+            // and is what makes the focus-mode 2048 LOD swap actually render.
             effectBrush.SetSourceParameter("Diffuse", texBrush);
+            ApplySurfaceBrush(compositor, texBrush, quad, material);
         }
         else
         {
@@ -537,13 +571,21 @@ internal static class MaterialResolver
         }
 
         // Normal map source
-        var normalBrush = compositor.CreateSurfaceBrush();
+        normalBrush = compositor.CreateSurfaceBrush();
         normalBrush.Surface = material.NormalMap;
         normalBrush.Stretch = CompositionStretch.Fill;
         normalBrush.HorizontalAlignmentRatio = 0;
         normalBrush.VerticalAlignmentRatio = 0;
         normalBrush.TransformMatrix = BuildBrushTransform(quad, material);
         effectBrush.SetSourceParameter("NormalMap", normalBrush);
+
+        // Pin the inner brushes' managed wrappers to the effect brush's
+        // lifetime (see _litInnerBrushes XML doc).
+        _litInnerBrushes.Add(
+            effectBrush,
+            texBrush != null
+                ? new CompositionSurfaceBrush[] { texBrush, normalBrush }
+                : new CompositionSurfaceBrush[] { normalBrush });
 
         // Bind animatable lighting scalars to the shared LightingDefaults
         // property set so live slider changes propagate to every face without

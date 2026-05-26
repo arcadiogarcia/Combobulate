@@ -714,7 +714,10 @@ public sealed class Combobulate : Control
             foreach (var quadIndex in changedQuads)
             {
                 if ((uint)quadIndex < (uint)_spritePool.Length && _spritePool[quadIndex] is { } sprite)
-                    sprite.Brush = _materialSlotBindings.Bindings[quadIndex].Brush;
+                {
+                    var newBrush = _materialSlotBindings.Bindings[quadIndex].Brush;
+                    sprite.Brush = newBrush;
+                }
             }
             _spritePoolBindings = _materialSlotBindings;
             _spritePoolPackKey = _materialSlotToken;
