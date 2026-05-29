@@ -6,6 +6,9 @@ using Windows.Graphics.Imaging;
 using Windows.Storage.Streams;
 
 #if WINAPPSDK
+using Microsoft.Graphics.Canvas;
+using Microsoft.Graphics.Canvas.UI.Composition;
+using Microsoft.Graphics.DirectX;
 using Microsoft.UI.Composition;
 using Microsoft.UI.Xaml.Media;
 #else
@@ -170,16 +173,28 @@ public abstract class ObjTextureSource
             _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
                 ? $"uri:{_uri.AbsoluteUri}@{_desiredMaxSize.Width}x{_desiredMaxSize.Height}"
                 : "uri:" + _uri.AbsoluteUri;
+
+        /// <summary>
+        /// Gates concurrent texture decodes. Even with the Win2D-based decode
+        /// path used on WinAppSdk (which avoids LoadedImageSurface's hard
+        /// internal limits — see <see cref="LoadAsCompositionSurfaceAsync"/>),
+        /// allowing dozens of parallel <c>CanvasBitmap.LoadAsync</c> calls
+        /// spikes CPU and disk I/O; 4 in flight keeps decode latency low while
+        /// still parallelising disk and decode work. On UWP the gate also
+        /// protects against <see cref="LoadedImageSurface"/>'s internal
+        /// concurrency limits.
+        /// </summary>
+        private static readonly System.Threading.SemaphoreSlim _decodeGate = new(4, 4);
+
         internal override async Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
         {
             // Diagnostic path: a host app (typically a #if DEBUG hook) can take
             // over the decode to bake an overlay into the bitmap. The host
             // returns a URI pointing at a temp file containing the baked PNG;
-            // we go through StartLoadFromUri so the loader's reliable file
-            // decode path is used. (StartLoadFromStream + InMemoryRandomAccess-
-            // Stream corrupts large textures — see UriDecodeInterceptor docs.)
+            // we treat it like any other file:// URI from here on.
             var interceptor = UriDecodeInterceptor;
             var log = DiagnosticLog;
+            Uri targetUri = _uri;
             if (interceptor != null)
             {
                 Uri? bakedUri = null;
@@ -191,21 +206,170 @@ public abstract class ObjTextureSource
                 else
                     log?.Invoke($"[ObjTextureSource] interceptor returned baked={(bakedUri?.ToString() ?? "<null>")} for {_uri} cap={_desiredMaxSize.Width}x{_desiredMaxSize.Height}");
                 if (bakedUri != null)
-                {
-                    var loaded = _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
-                        ? LoadedImageSurface.StartLoadFromUri(bakedUri, _desiredMaxSize)
-                        : LoadedImageSurface.StartLoadFromUri(bakedUri);
-                    await AwaitLoadAsync(loaded, bakedUri, log).ConfigureAwait(true);
-                    return loaded;
-                }
+                    targetUri = bakedUri;
             }
 
-            LoadedImageSurface lis = _desiredMaxSize.Width > 0 && _desiredMaxSize.Height > 0
-                ? LoadedImageSurface.StartLoadFromUri(_uri, _desiredMaxSize)
-                : LoadedImageSurface.StartLoadFromUri(_uri);
-            await AwaitLoadAsync(lis, _uri, log).ConfigureAwait(true);
-            return lis;
+#if WINAPPSDK
+            // Prefer the Win2D-backed decode for file:// URIs (which covers
+            // every real cover path). <see cref="LoadAsCompositionSurfaceAsync"/>
+            // explains why we can't keep using LoadedImageSurface here. Non-file
+            // URIs (ms-appx://, http(s)://, etc.) still go through
+            // LoadedImageSurface because Win2D can't load those directly.
+            if (targetUri.IsFile)
+                return await LoadAsCompositionSurfaceAsync(compositor, targetUri, _desiredMaxSize, log).ConfigureAwait(true);
+#endif
+
+            return await LoadFromLoadedImageSurfaceAsync(targetUri, _desiredMaxSize, log).ConfigureAwait(true);
         }
+
+        /// <summary>
+        /// Throttled wrapper around <see cref="LoadedImageSurface.StartLoadFromUri(Uri)"/>
+        /// + <see cref="AwaitLoadAsync"/>. Used for non-file URIs and on the UWP
+        /// target. Always releases the gate, including on decode failure or
+        /// exception, so a single bad image can't permanently hold a slot.
+        /// </summary>
+        private static async Task<ICompositionSurface> LoadFromLoadedImageSurfaceAsync(Uri uri, Size desiredMaxSize, Action<string>? log)
+        {
+            await _decodeGate.WaitAsync().ConfigureAwait(true);
+            try
+            {
+                LoadedImageSurface lis = desiredMaxSize.Width > 0 && desiredMaxSize.Height > 0
+                    ? LoadedImageSurface.StartLoadFromUri(uri, desiredMaxSize)
+                    : LoadedImageSurface.StartLoadFromUri(uri);
+                await AwaitLoadAsync(lis, uri, log).ConfigureAwait(true);
+                return lis;
+            }
+            finally
+            {
+                _decodeGate.Release();
+            }
+        }
+
+#if WINAPPSDK
+        /// <summary>
+        /// One <see cref="CompositionGraphicsDevice"/> per Compositor. Created
+        /// lazily on first use; held weakly so it dies with the compositor.
+        /// </summary>
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Compositor, CompositionGraphicsDevice> _graphicsDevices = new();
+
+        private static CompositionGraphicsDevice GetGraphicsDevice(Compositor compositor) =>
+            _graphicsDevices.GetValue(
+                compositor,
+                c => CanvasComposition.CreateCompositionGraphicsDevice(c, CanvasDevice.GetSharedDevice()));
+
+        /// <summary>
+        /// Decodes <paramref name="uri"/> via Win2D and blits the pixels into a
+        /// <see cref="CompositionDrawingSurface"/> that we own outright.
+        /// </summary>
+        /// <remarks>
+        /// The Composition-XAML <see cref="LoadedImageSurface"/> looks like
+        /// the obvious choice for "decode a file into an ICompositionSurface",
+        /// but in practice it has two hard limits that bite at scale:
+        /// <list type="bullet">
+        ///   <item>After a process has created roughly 30-40 surfaces,
+        ///   <c>LoadCompleted</c> silently stops firing for any new ones —
+        ///   they never error out and never invoke the handler, so the
+        ///   awaiting load never returns and the bound brush stays blank.
+        ///   Throttling concurrency reduces but does not eliminate this.</item>
+        ///   <item>Even when it works, it allocates GPU-backed XAML-internal
+        ///   resources that we can't release independently of the
+        ///   <c>LoadedImageSurface</c> object's lifetime.</item>
+        /// </list>
+        /// Going through <see cref="CanvasBitmap.LoadAsync(ICanvasResourceCreator, string)"/>
+        /// + a <see cref="CompositionDrawingSurface"/> we created ourselves
+        /// gives us a surface that's fully owned by this cache: it's an
+        /// <see cref="IDisposable"/> we can release the moment the cache
+        /// evicts the entry, with no shared pool to exhaust. The
+        /// <see cref="CanvasBitmap"/> is transient — we just blit it into the
+        /// drawing surface (with downsample baked in if a cap was requested)
+        /// then dispose it via <c>using</c>.
+        /// </remarks>
+        private static async Task<ICompositionSurface> LoadAsCompositionSurfaceAsync(
+            Compositor compositor, Uri uri, Size desiredMaxSize, Action<string>? log)
+        {
+            await _decodeGate.WaitAsync().ConfigureAwait(true);
+            try
+            {
+                var device = CanvasDevice.GetSharedDevice();
+                using var bmp = await CanvasBitmap.LoadAsync(device, uri.LocalPath);
+                var srcSize = bmp.SizeInPixels;
+                uint sourceW = srcSize.Width;
+                uint sourceH = srcSize.Height;
+
+                uint targetW = sourceW;
+                uint targetH = sourceH;
+                if (desiredMaxSize.Width > 0 && desiredMaxSize.Height > 0)
+                {
+                    double sx = desiredMaxSize.Width / (double)sourceW;
+                    double sy = desiredMaxSize.Height / (double)sourceH;
+                    double s = Math.Min(Math.Min(sx, sy), 1.0);
+                    targetW = (uint)Math.Max(1, Math.Round(sourceW * s));
+                    targetH = (uint)Math.Max(1, Math.Round(sourceH * s));
+                }
+
+                // Composition + Win2D drawing-session APIs have thread affinity to
+                // the compositor's dispatcher. The decode above may resume on a
+                // worker thread; explicitly marshal the surface allocation and
+                // draw to the dispatcher to avoid a native XAML
+                // STATUS_FATAL_USER_CALLBACK_EXCEPTION (E_UNEXPECTED) when the
+                // composition graphics device is touched off-thread.
+                var dispatcher = compositor.DispatcherQueue;
+                CompositionDrawingSurface drawingSurface;
+                if (dispatcher == null || dispatcher.HasThreadAccess)
+                {
+                    drawingSurface = CreateAndDrawSurface(compositor, bmp, sourceW, sourceH, targetW, targetH);
+                }
+                else
+                {
+                    var tcs = new TaskCompletionSource<CompositionDrawingSurface>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var bmpCaptured = bmp;
+                    var sw = sourceW; var sh = sourceH; var tw = targetW; var th = targetH;
+                    bool enqueued = dispatcher.TryEnqueue(() =>
+                    {
+                        try { tcs.SetResult(CreateAndDrawSurface(compositor, bmpCaptured, sw, sh, tw, th)); }
+                        catch (Exception ex) { tcs.SetException(ex); }
+                    });
+                    if (!enqueued)
+                        throw new InvalidOperationException("Compositor dispatcher refused enqueue (shutting down?).");
+                    drawingSurface = await tcs.Task.ConfigureAwait(true);
+                }
+
+                log?.Invoke($"[ObjTextureSource] Win2D decode src={sourceW}x{sourceH} target={targetW}x{targetH} uri={uri}");
+                return drawingSurface;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"[ObjTextureSource] Win2D decode failed uri={uri}: {ex.GetType().Name}: {ex.Message}");
+                // Fall back to the legacy path so a Win2D-specific failure
+                // (e.g. unsupported image format) doesn't leave the cover blank.
+                return await LoadFromLoadedImageSurfaceAsync(uri, desiredMaxSize, log).ConfigureAwait(true);
+            }
+            finally
+            {
+                _decodeGate.Release();
+            }
+        }
+
+        private static CompositionDrawingSurface CreateAndDrawSurface(
+            Compositor compositor, CanvasBitmap bmp, uint sourceW, uint sourceH, uint targetW, uint targetH)
+        {
+            var graphicsDevice = GetGraphicsDevice(compositor);
+            var drawingSurface = graphicsDevice.CreateDrawingSurface(
+                new Size(targetW, targetH),
+                DirectXPixelFormat.B8G8R8A8UIntNormalized,
+                DirectXAlphaMode.Premultiplied);
+
+            using (var ds = CanvasComposition.CreateDrawingSession(drawingSurface))
+            {
+                ds.Clear(Windows.UI.Color.FromArgb(0, 0, 0, 0));
+                ds.DrawImage(
+                    bmp,
+                    new Rect(0, 0, targetW, targetH),
+                    new Rect(0, 0, sourceW, sourceH));
+            }
+            return drawingSurface;
+        }
+#endif
 
         /// <summary>
         /// Awaits the <see cref="LoadedImageSurface.LoadCompleted"/> event so
