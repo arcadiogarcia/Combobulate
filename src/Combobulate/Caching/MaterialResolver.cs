@@ -73,9 +73,6 @@ internal static class MaterialResolver
     private static readonly ConcurrentDictionary<string, TextureEntry> _textures =
         new(StringComparer.Ordinal);
 
-    // Maps ObjTextureSource instance → cache key currently pinned by it. Used by
-    // ReleaseTexture so callers pass the same source they acquired with (which may
-    // be a different instance than the one originally cached under that key).
     private static readonly ConditionalWeakTable<ObjTextureSource, string> _pinnedKeysBySource = new();
 
     /// <summary>
@@ -550,32 +547,12 @@ internal static class MaterialResolver
         // Diffuse source
         if (material.DiffuseTexture != null)
         {
-            // Wire the brush to its surface from the start when one is already
-            // warm in the texture cache. The effect graph snapshots the inner
-            // brush's surface sampler at SetSourceParameter time — if the brush
-            // has no surface at that moment, some effect-graph compositions
-            // can render with no diffuse and never re-sample even after
-            // Surface is later assigned.
-            //
-            // NOTE: this is defense-in-depth, NOT the load-bearing fix for the
-            // focus-mode grey-cover bug. Disambiguation (see plan.md) proved
-            // the 900 px CompositionDrawingSurface cap in ObjTextureSource
-            // is necessary AND sufficient — covers render correctly even when
-            // this lookup is omitted, and conversely fail when the cap is
-            // raised regardless of this lookup. We keep the warm-surface
-            // binding because it's the architecturally correct thing to do
-            // (bind sources before SetSourceParameter) and costs nothing.
-            ICompositionSurface? warmSurface = null;
-            if (_textures.TryGetValue(material.DiffuseTexture.CacheKey, out var existingEntry))
-            {
-                lock (existingEntry.Gate)
-                {
-                    warmSurface = existingEntry.Surface;
-                }
-            }
-            texBrush = warmSurface != null
-                ? compositor.CreateSurfaceBrush(warmSurface)
-                : compositor.CreateSurfaceBrush();
+            // ApplySurfaceBrush registers this brush with the texture cache and
+            // assigns Surface synchronously if the cache entry is already warm,
+            // or repoints it later via PointBrushesAt when LoadAsync completes.
+            // Either way the effect graph's SetSourceParameter snapshot sees a
+            // valid sampler for the produced sprites.
+            texBrush = compositor.CreateSurfaceBrush();
             ApplySurfaceBrush(compositor, texBrush, quad, material);
             effectBrush.SetSourceParameter("Diffuse", texBrush);
         }

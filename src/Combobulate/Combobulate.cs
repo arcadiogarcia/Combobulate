@@ -702,11 +702,14 @@ public sealed class Combobulate : Control
         if (IsBakedAspectGraphActive()
             && _baked != null
             && !_baked.BakeInFlight
-            && ReferenceEquals(_bakedGeometry, geometry)
-            && _baked.UpdateBindingsForQuads(_materialSlotBindings, changedQuads))
+            && ReferenceEquals(_bakedGeometry, geometry))
         {
-            _bakedMaterialsToken = _materialSlotToken;
-            return;
+            bool ok = _baked.UpdateBindingsForQuads(_materialSlotBindings, changedQuads);
+            if (ok)
+            {
+                _bakedMaterialsToken = _materialSlotToken;
+                return;
+            }
         }
 
         if (_spritePool != null && ReferenceEquals(_spritePoolGeometry, geometry))
@@ -1665,7 +1668,6 @@ public sealed class Combobulate : Control
             if (isNew)
             {
                 sprite = _compositor.CreateSpriteVisual();
-                sprite.Size = new Vector2(1f, 1f);
                 sprite.IsVisible = false;
                 pool[i] = sprite;
                 // New sprites need transform + brush regardless of cached flags.
@@ -1680,12 +1682,23 @@ public sealed class Combobulate : Control
                 var v3 = cq.V3 * scale + origin;
                 var xAxis = v1 - v0;
                 var yAxis = v3 - v0;
+                // See BakedAspectGraphRenderer.BuildTreeContent for the root-cause
+                // explanation: SpriteVisuals with Size=(1,1) and a TransformMatrix
+                // that scales by N× sample their brush at native ~1×1 resolution
+                // and lose all detail once the source surface exceeds ~768 px
+                // on either axis. Set Size to the actual cell dimensions and
+                // keep only rotation+translate in the matrix.
+                var lenX = xAxis.Length();
+                var lenY = yAxis.Length();
+                sprite!.Size = new Vector2(lenX > 0f ? lenX : 1f, lenY > 0f ? lenY : 1f);
+                var nx = lenX > 0f ? xAxis / lenX : Vector3.UnitX;
+                var ny = lenY > 0f ? yAxis / lenY : Vector3.UnitY;
                 var zAxis = Vector3.Normalize(Vector3.Cross(xAxis, yAxis));
-                sprite!.TransformMatrix = new Matrix4x4(
-                    xAxis.X, xAxis.Y, xAxis.Z, 0,
-                    yAxis.X, yAxis.Y, yAxis.Z, 0,
+                sprite.TransformMatrix = new Matrix4x4(
+                    nx.X, nx.Y, nx.Z, 0,
+                    ny.X, ny.Y, ny.Z, 0,
                     zAxis.X, zAxis.Y, zAxis.Z, 0,
-                    v0.X,    v0.Y,    v0.Z,    1);
+                    v0.X, v0.Y, v0.Z, 1);
             }
 
             if ((isNew || packChanged) && resolved != null)

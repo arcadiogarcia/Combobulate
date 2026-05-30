@@ -369,25 +369,18 @@ public abstract class ObjTextureSource
                 targetW = (uint)Math.Max(1, Math.Round(sourceW * s));
                 targetH = (uint)Math.Max(1, Math.Round(sourceH * s));
             }
-            // Empirically, CompositionDrawingSurface allocations larger than
-            // ~900 px along any axis produce an all-white/empty surface when
-            // sampled by Win2D effects: DrawingSession.DrawImage calls
-            // succeed, but the brush bound to the surface reads transparent
-            // pixels. MaximumBitmapSizeInPixels is 16384, so this is not a
-            // D3D11 hardware texture limit — it's a composition-atlas tile
-            // constraint observed on Win11 23H2 + WinAppSDK 1.5+ at 200% DPI.
-            // Below ~900 px works reliably; >=1024 px fails. Cap both axes
-            // after the source-side fit so aspect ratio is preserved.
-            //
-            // ROOT CAUSE: this 900 px cap is the single load-bearing fix for
-            // the focus-mode grey-cover bug. A 4-cell disambiguation matrix
-            // confirmed: with the cap at 4096, focused covers with high-res
-            // sources (e.g. Eat-Pray-Love) render grey regardless of any
-            // upstream brush-binding hygiene; with the cap at 900, they
-            // render crisply regardless of brush-binding code state. Until
-            // we have a definitive explanation of the underlying composition
-            // limit, this cap must remain.
-            const uint MaxAxis = 900;
+            // Cap the decoded texture size to keep GPU working set and JPEG
+            // decode time bounded. 2048 matches the focus-mode LOD target
+            // (a focused cover at 2× DPI fills ~1.4k DIPs ≈ 2.8k pixels of
+            // surface area but 2048 along the longest axis is visually
+            // indistinguishable from full resolution at typical viewing
+            // distances). Shelf entries downscale further via desiredMaxSize
+            // before reaching this cap. NOTE: a previous diagnosis blamed a
+            // ~900-axis CompositionDrawingSurface "atlas cap" — that turned
+            // out to be wrong; the real bug was elsewhere (SpriteVisual size
+            // sampling, fixed in BakedAspectGraphRenderer.BuildTreeContent).
+            // This cap is purely a memory/decode-cost budget.
+            const uint MaxAxis = 2048;
             if (targetW > MaxAxis || targetH > MaxAxis)
             {
                 double cap = Math.Min((double)MaxAxis / targetW, (double)MaxAxis / targetH);
@@ -403,7 +396,7 @@ public abstract class ObjTextureSource
         {
             // Resize the placeholder to the decode target. CompositionDrawingSurface
             // supports Resize on the compositor's dispatcher thread. targetW/H have
-            // already been capped by ComputeTargetSize() to the safe axis limit.
+            // already been capped by ComputeTargetSize() to the budget axis limit.
             CanvasComposition.Resize(surface, new Size(targetW, targetH));
             using var ds = CanvasComposition.CreateDrawingSession(surface);
             ds.DrawImage(
@@ -529,7 +522,7 @@ public abstract class ObjTextureSource
             Compositor compositor, CanvasBitmap bmp, uint sourceW, uint sourceH, uint targetW, uint targetH)
         {
             // targetW/H have already been capped by ComputeTargetSize() to the
-            // safe CompositionDrawingSurface axis limit.
+            // memory/decode-cost budget axis limit.
             var graphicsDevice = GetGraphicsDevice(compositor);
             var drawingSurface = graphicsDevice.CreateDrawingSurface(
                 new Size(targetW, targetH),

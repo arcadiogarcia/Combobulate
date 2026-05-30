@@ -424,19 +424,35 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         for (int q = 0; q < quads.Length; q++)
         {
             var sprite = _compositor.CreateSpriteVisual();
-            sprite.Size = new Vector2(1f, 1f);
             var cq = quads[q];
             var v0 = cq.V0 * scale + origin;
             var v1 = cq.V1 * scale + origin;
             var v3 = cq.V3 * scale + origin;
             var xAxis = v1 - v0;
             var yAxis = v3 - v0;
+            // ROOT CAUSE (root-caused 2026-05-30 on zaca / WinAppSDK 1.8 /
+            // Win11 26100 via SurfaceCapProbe tinySprite mode): SpriteVisuals
+            // with Size=(1,1) and a TransformMatrix that scales the content
+            // up by N× sample their brush at ~1×1 native resolution, then
+            // magnify to N×N. When the brush's source surface is larger than
+            // ~768 px on either axis the composition sampler returns blank
+            // pixels (covers render as flat grey + only the lit highlight).
+            // Fix: set the sprite Size to the actual cell dimensions in
+            // pixels and keep TransformMatrix as a pure rotation + translate
+            // using the cell's unit basis vectors. This preserves the on-
+            // screen geometry while letting the compositor allocate the
+            // correct number of sampling tiles for the brush.
+            var lenX = xAxis.Length();
+            var lenY = yAxis.Length();
+            sprite.Size = new Vector2(lenX > 0f ? lenX : 1f, lenY > 0f ? lenY : 1f);
+            var nx = lenX > 0f ? xAxis / lenX : Vector3.UnitX;
+            var ny = lenY > 0f ? yAxis / lenY : Vector3.UnitY;
             var zAxis = Vector3.Normalize(Vector3.Cross(xAxis, yAxis));
             sprite.TransformMatrix = new Matrix4x4(
-                xAxis.X, xAxis.Y, xAxis.Z, 0,
-                yAxis.X, yAxis.Y, yAxis.Z, 0,
+                nx.X, nx.Y, nx.Z, 0,
+                ny.X, ny.Y, ny.Z, 0,
                 zAxis.X, zAxis.Y, zAxis.Z, 0,
-                v0.X,    v0.Y,    v0.Z,    1);
+                v0.X, v0.Y, v0.Z, 1);
             sprite.Brush = bindings.Bindings[q].Brush;
             sprite.IsVisible = visibility[q];
             sprites[q] = sprite;
