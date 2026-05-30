@@ -45,6 +45,14 @@
     <Page Include="..\Combobulate\Themes\Generic.xaml" Link="Themes\Generic.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
+      <!-- Compile-only: the .xbf is what ships at runtime. Including the
+           source .xaml in the MSIX payload makes MakeAppx fail with
+           0x8007007b because the resolved relative source path contains
+           '..\' which becomes 'Combobulate\..\Combobulate\Themes\Generic.xaml'
+           in the package map, and MakeAppx rejects '..' segments in
+           destination paths. -->
+      <Pack>false</Pack>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
     </Page>
   </ItemGroup>
 
