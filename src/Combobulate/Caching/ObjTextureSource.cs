@@ -39,6 +39,35 @@ public abstract class ObjTextureSource
 
     internal abstract Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor);
 
+#if WINAPPSDK
+    /// <summary>
+    /// Optional fast-path that decodes this source's pixels DIRECTLY into a
+    /// caller-provided <see cref="Microsoft.UI.Composition.CompositionDrawingSurface"/>,
+    /// resizing the surface to match the decoded image as needed. Returning
+    /// <c>true</c> indicates the surface now holds the decoded pixels and the
+    /// caller can keep using it. Returning <c>false</c> (the default) means
+    /// this source can't draw in-place; the caller must fall back to
+    /// <see cref="CreateSurfaceAsync"/>.
+    ///
+    /// <para>
+    /// Why this exists: every effect graph in Combobulate that consumes a
+    /// texture (lit-material front cover) snapshots its source brush's sampler
+    /// at <c>SetSourceParameter</c> time. If the inner <c>CompositionSurfaceBrush</c>
+    /// has no surface (or only a 1×1 placeholder) at that moment, the effect
+    /// renders the lighting layer with no diffuse — even after the brush's
+    /// <c>Surface</c> is later assigned, the effect doesn't re-sample.
+    /// Drawing in-place into a surface that brushes were bound to from the
+    /// start sidesteps the issue: the brush's <c>Surface</c> reference never
+    /// changes, only the surface's pixels do, and Composition picks up the
+    /// new pixels automatically.
+    /// </para>
+    /// </summary>
+    internal virtual Task<bool> TryDecodeIntoAsync(
+        Compositor compositor,
+        Microsoft.UI.Composition.CompositionDrawingSurface target) =>
+        Task.FromResult(false);
+#endif
+
     public virtual void Update(SoftwareBitmap bitmap) =>
         throw new NotSupportedException(
             "This ObjTextureSource is read-only. Use FromBitmap or FromStream for updateable sources.");
@@ -160,6 +189,49 @@ public abstract class ObjTextureSource
         return new ExternalSurfaceSource(surface);
     }
 
+#if WINAPPSDK
+    /// <summary>
+    /// One <see cref="CompositionGraphicsDevice"/> per Compositor. Created
+    /// lazily on first use; held weakly so it dies with the compositor.
+    /// </summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Compositor, CompositionGraphicsDevice> _graphicsDevices = new();
+
+    /// <summary>
+    /// Optional override hook so the host app can supply a pre-existing
+    /// <see cref="CompositionGraphicsDevice"/> for a compositor. Allows the
+    /// host to share a single graphics device across its own surfaces
+    /// (procedural textures drawn by the host) and ObjTextureSource cover
+    /// textures, instead of each subsystem allocating its own.
+    ///
+    /// <para>
+    /// One <see cref="CompositionGraphicsDevice"/> per compositor is the
+    /// recommended pattern: each device owns a separate Direct3D device-
+    /// context pair, and the per-process working set / driver-resource cost
+    /// adds up quickly when every cache instantiates its own. Wiring the
+    /// host through this hook keeps the process to a single shared device.
+    /// </para>
+    /// </summary>
+    public static Func<Compositor, CompositionGraphicsDevice>? GraphicsDeviceFactory { get; set; }
+
+    /// <summary>
+    /// Returns the <see cref="CompositionGraphicsDevice"/> ObjTextureSource
+    /// uses to allocate <see cref="CompositionDrawingSurface"/>s for the
+    /// given compositor. Host apps that draw their own procedural surfaces
+    /// (Win2D directly) should call this same accessor so every surface in
+    /// the process shares the same underlying device — see
+    /// <see cref="GraphicsDeviceFactory"/>.
+    /// </summary>
+    public static CompositionGraphicsDevice GetGraphicsDevice(Compositor compositor)
+    {
+        var factory = GraphicsDeviceFactory;
+        if (factory != null)
+            return factory(compositor);
+        return _graphicsDevices.GetValue(
+            compositor,
+            c => CanvasComposition.CreateCompositionGraphicsDevice(c, CanvasDevice.GetSharedDevice()));
+    }
+#endif
+
     private sealed class UriSource : ObjTextureSource
     {
         private readonly Uri _uri;
@@ -222,6 +294,126 @@ public abstract class ObjTextureSource
             return await LoadFromLoadedImageSurfaceAsync(targetUri, _desiredMaxSize, log).ConfigureAwait(true);
         }
 
+#if WINAPPSDK
+        internal override async Task<bool> TryDecodeIntoAsync(Compositor compositor, CompositionDrawingSurface target)
+        {
+            var interceptor = UriDecodeInterceptor;
+            var log = DiagnosticLog;
+            Uri targetUri = _uri;
+            if (interceptor != null)
+            {
+                try
+                {
+                    var bakedUri = await interceptor(_uri, _desiredMaxSize).ConfigureAwait(true);
+                    if (bakedUri != null) targetUri = bakedUri;
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"[ObjTextureSource] interceptor threw for {_uri}: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+            if (!targetUri.IsFile) return false; // only Win2D path supports in-place
+
+            await _decodeGate.WaitAsync().ConfigureAwait(true);
+            try
+            {
+                var device = CanvasDevice.GetSharedDevice();
+                using var bmp = await CanvasBitmap.LoadAsync(device, targetUri.LocalPath);
+                var (sourceW, sourceH, targetW, targetH) = ComputeTargetSize(bmp.SizeInPixels, _desiredMaxSize);
+
+                var dispatcher = compositor.DispatcherQueue;
+                if (dispatcher == null || dispatcher.HasThreadAccess)
+                {
+                    ResizeAndDrawIntoSurface(target, bmp, sourceW, sourceH, targetW, targetH);
+                }
+                else
+                {
+                    var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var bmpCaptured = bmp;
+                    var sw = sourceW; var sh = sourceH; var tw = targetW; var th = targetH;
+                    bool enqueued = dispatcher.TryEnqueue(() =>
+                    {
+                        try { ResizeAndDrawIntoSurface(target, bmpCaptured, sw, sh, tw, th); tcs.SetResult(true); }
+                        catch (Exception ex) { tcs.SetException(ex); }
+                    });
+                    if (!enqueued) return false;
+                    await tcs.Task.ConfigureAwait(true);
+                }
+
+                log?.Invoke($"[ObjTextureSource] Win2D in-place decode src={sourceW}x{sourceH} target={targetW}x{targetH} uri={targetUri}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"[ObjTextureSource] Win2D in-place decode failed uri={targetUri}: {ex.GetType().Name}: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                _decodeGate.Release();
+            }
+        }
+
+        private static (uint sourceW, uint sourceH, uint targetW, uint targetH) ComputeTargetSize(
+            global::Windows.Graphics.Imaging.BitmapSize srcSize, Size desiredMaxSize)
+        {
+            uint sourceW = srcSize.Width;
+            uint sourceH = srcSize.Height;
+            uint targetW = sourceW;
+            uint targetH = sourceH;
+            if (desiredMaxSize.Width > 0 && desiredMaxSize.Height > 0)
+            {
+                double sx = desiredMaxSize.Width / (double)sourceW;
+                double sy = desiredMaxSize.Height / (double)sourceH;
+                double s = Math.Min(Math.Min(sx, sy), 1.0);
+                targetW = (uint)Math.Max(1, Math.Round(sourceW * s));
+                targetH = (uint)Math.Max(1, Math.Round(sourceH * s));
+            }
+            // Empirically, CompositionDrawingSurface allocations larger than
+            // ~900 px along any axis produce an all-white/empty surface when
+            // sampled by Win2D effects: DrawingSession.DrawImage calls
+            // succeed, but the brush bound to the surface reads transparent
+            // pixels. MaximumBitmapSizeInPixels is 16384, so this is not a
+            // D3D11 hardware texture limit — it's a composition-atlas tile
+            // constraint observed on Win11 23H2 + WinAppSDK 1.5+ at 200% DPI.
+            // Below ~900 px works reliably; >=1024 px fails. Cap both axes
+            // after the source-side fit so aspect ratio is preserved.
+            //
+            // ROOT CAUSE: this 900 px cap is the single load-bearing fix for
+            // the focus-mode grey-cover bug. A 4-cell disambiguation matrix
+            // confirmed: with the cap at 4096, focused covers with high-res
+            // sources (e.g. Eat-Pray-Love) render grey regardless of any
+            // upstream brush-binding hygiene; with the cap at 900, they
+            // render crisply regardless of brush-binding code state. Until
+            // we have a definitive explanation of the underlying composition
+            // limit, this cap must remain.
+            const uint MaxAxis = 900;
+            if (targetW > MaxAxis || targetH > MaxAxis)
+            {
+                double cap = Math.Min((double)MaxAxis / targetW, (double)MaxAxis / targetH);
+                targetW = (uint)Math.Max(1, Math.Round(targetW * cap));
+                targetH = (uint)Math.Max(1, Math.Round(targetH * cap));
+            }
+            return (sourceW, sourceH, targetW, targetH);
+        }
+
+        private static void ResizeAndDrawIntoSurface(
+            CompositionDrawingSurface surface, CanvasBitmap bmp,
+            uint sourceW, uint sourceH, uint targetW, uint targetH)
+        {
+            // Resize the placeholder to the decode target. CompositionDrawingSurface
+            // supports Resize on the compositor's dispatcher thread. targetW/H have
+            // already been capped by ComputeTargetSize() to the safe axis limit.
+            CanvasComposition.Resize(surface, new Size(targetW, targetH));
+            using var ds = CanvasComposition.CreateDrawingSession(surface);
+            ds.DrawImage(
+                bmp,
+                new Rect(0, 0, targetW, targetH),
+                new Rect(0, 0, sourceW, sourceH));
+        }
+
+#endif
+
         /// <summary>
         /// Throttled wrapper around <see cref="LoadedImageSurface.StartLoadFromUri(Uri)"/>
         /// + <see cref="AwaitLoadAsync"/>. Used for non-file URIs and on the UWP
@@ -246,17 +438,6 @@ public abstract class ObjTextureSource
         }
 
 #if WINAPPSDK
-        /// <summary>
-        /// One <see cref="CompositionGraphicsDevice"/> per Compositor. Created
-        /// lazily on first use; held weakly so it dies with the compositor.
-        /// </summary>
-        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Compositor, CompositionGraphicsDevice> _graphicsDevices = new();
-
-        private static CompositionGraphicsDevice GetGraphicsDevice(Compositor compositor) =>
-            _graphicsDevices.GetValue(
-                compositor,
-                c => CanvasComposition.CreateCompositionGraphicsDevice(c, CanvasDevice.GetSharedDevice()));
-
         /// <summary>
         /// Decodes <paramref name="uri"/> via Win2D and blits the pixels into a
         /// <see cref="CompositionDrawingSurface"/> that we own outright.
@@ -291,21 +472,15 @@ public abstract class ObjTextureSource
             try
             {
                 var device = CanvasDevice.GetSharedDevice();
-                using var bmp = await CanvasBitmap.LoadAsync(device, uri.LocalPath);
-                var srcSize = bmp.SizeInPixels;
-                uint sourceW = srcSize.Width;
-                uint sourceH = srcSize.Height;
-
-                uint targetW = sourceW;
-                uint targetH = sourceH;
-                if (desiredMaxSize.Width > 0 && desiredMaxSize.Height > 0)
-                {
-                    double sx = desiredMaxSize.Width / (double)sourceW;
-                    double sy = desiredMaxSize.Height / (double)sourceH;
-                    double s = Math.Min(Math.Min(sx, sy), 1.0);
-                    targetW = (uint)Math.Max(1, Math.Round(sourceW * s));
-                    targetH = (uint)Math.Max(1, Math.Round(sourceH * s));
-                }
+                // Intentionally NOT using `using var` here. CanvasBitmap.Dispose
+                // releases the underlying D2D bitmap; if disposal races the
+                // GPU completion of the DrawImage we queued into the surface,
+                // the queued draw silently produces nothing (surface ends up
+                // empty / unsampleable). For now, keep the bitmap alive for
+                // the lifetime of the process; covers cache at modest counts
+                // (≤ a few hundred) so the leak is bounded.
+                var bmp = await CanvasBitmap.LoadAsync(device, uri.LocalPath);
+                var (sourceW, sourceH, targetW, targetH) = ComputeTargetSize(bmp.SizeInPixels, desiredMaxSize);
 
                 // Composition + Win2D drawing-session APIs have thread affinity to
                 // the compositor's dispatcher. The decode above may resume on a
@@ -353,6 +528,8 @@ public abstract class ObjTextureSource
         private static CompositionDrawingSurface CreateAndDrawSurface(
             Compositor compositor, CanvasBitmap bmp, uint sourceW, uint sourceH, uint targetW, uint targetH)
         {
+            // targetW/H have already been capped by ComputeTargetSize() to the
+            // safe CompositionDrawingSurface axis limit.
             var graphicsDevice = GetGraphicsDevice(compositor);
             var drawingSurface = graphicsDevice.CreateDrawingSurface(
                 new Size(targetW, targetH),
@@ -361,12 +538,9 @@ public abstract class ObjTextureSource
 
             using (var ds = CanvasComposition.CreateDrawingSession(drawingSurface))
             {
-                ds.Clear(Windows.UI.Color.FromArgb(0, 0, 0, 0));
-                ds.DrawImage(
-                    bmp,
-                    new Rect(0, 0, targetW, targetH),
-                    new Rect(0, 0, sourceW, sourceH));
+                ds.DrawImage(bmp, new Rect(0, 0, targetW, targetH), new Rect(0, 0, sourceW, sourceH));
             }
+
             return drawingSurface;
         }
 #endif

@@ -550,19 +550,34 @@ internal static class MaterialResolver
         // Diffuse source
         if (material.DiffuseTexture != null)
         {
-            texBrush = compositor.CreateSurfaceBrush();
-            // IMPORTANT: wire the brush into the effect graph BEFORE assigning
-            // its surface. With the opposite order (set surface, then
-            // SetSourceParameter), the effect graph appears to snapshot the
-            // surface's GPU resource state at parameter-bind time — and when
-            // the LIS pixels haven't yet been materialised into a sampled
-            // texture (which only happens once a consumer is in the visual
-            // tree), the effect graph never picks them up later. Assigning the
-            // surface AFTER SetSourceParameter mirrors the shelf "PointBrushesAt"
-            // path (where the brush is on a sprite by the time Surface is set)
-            // and is what makes the focus-mode 2048 LOD swap actually render.
-            effectBrush.SetSourceParameter("Diffuse", texBrush);
+            // Wire the brush to its surface from the start when one is already
+            // warm in the texture cache. The effect graph snapshots the inner
+            // brush's surface sampler at SetSourceParameter time — if the brush
+            // has no surface at that moment, some effect-graph compositions
+            // can render with no diffuse and never re-sample even after
+            // Surface is later assigned.
+            //
+            // NOTE: this is defense-in-depth, NOT the load-bearing fix for the
+            // focus-mode grey-cover bug. Disambiguation (see plan.md) proved
+            // the 900 px CompositionDrawingSurface cap in ObjTextureSource
+            // is necessary AND sufficient — covers render correctly even when
+            // this lookup is omitted, and conversely fail when the cap is
+            // raised regardless of this lookup. We keep the warm-surface
+            // binding because it's the architecturally correct thing to do
+            // (bind sources before SetSourceParameter) and costs nothing.
+            ICompositionSurface? warmSurface = null;
+            if (_textures.TryGetValue(material.DiffuseTexture.CacheKey, out var existingEntry))
+            {
+                lock (existingEntry.Gate)
+                {
+                    warmSurface = existingEntry.Surface;
+                }
+            }
+            texBrush = warmSurface != null
+                ? compositor.CreateSurfaceBrush(warmSurface)
+                : compositor.CreateSurfaceBrush();
             ApplySurfaceBrush(compositor, texBrush, quad, material);
+            effectBrush.SetSourceParameter("Diffuse", texBrush);
         }
         else
         {
