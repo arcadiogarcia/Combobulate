@@ -503,11 +503,36 @@ internal static class MaterialResolver
     {
         if (_litEffectFactory is not null) return _litEffectFactory;
 
-        var effect = new BlendEffect
+        // We use ArithmeticCompositeEffect (componentwise premultiplied math)
+        // instead of BlendEffect(Multiply) to avoid a sub-pixel rim artifact at
+        // sprite silhouette edges. D2D's BlendEffect implements blends as
+        // source-over-with-blend:
+        //     result.rgb = (1-dest.a)*src.rgb + (1-src.a)*dest.rgb
+        //                + dest.a*src.a * blend(src/src.a, dest/dest.a)
+        // When the cover (src) is opaque AND the lighting (dest) is fully
+        // opaque, the formula collapses to blend(src,dest) as expected — but
+        // any sub-pixel coverage variation (anti-aliased sprite edges, or
+        // bilinear filter taps near the brush bounds where the cover surface
+        // alpha falls off) makes src.a < 1, which lets the bright lighting
+        // term (1-src.a)*dest.rgb leak through. The visible result is a thin,
+        // flicker-aliased bright cream/white rim around every lit face.
+        //
+        // ArithmeticCompositeEffect operates directly on premultiplied colors
+        // with no source-over coupling:
+        //     result = Saturate(s1*Source1Amount + s2*Source2Amount
+        //                       + s1*s2*MultiplyAmount + Offset)
+        // With Source1=Source2=Offset=0 and Multiply=1, that's a pure
+        // componentwise multiply (including alpha), which is what a Phong
+        // "diffuse-times-lighting" composite actually wants. No rim leak.
+        var effect = new ArithmeticCompositeEffect
         {
-            Mode = BlendEffectMode.Multiply,
-            Background = new CompositionEffectSourceParameter("Diffuse"),
-            Foreground = new SceneLightingEffect
+            Source1Amount  = 0f,
+            Source2Amount  = 0f,
+            MultiplyAmount = 1f,
+            Offset         = 0f,
+            ClampOutput    = true,
+            Source1 = new CompositionEffectSourceParameter("Diffuse"),
+            Source2 = new SceneLightingEffect
             {
                 Name = "Lighting",
                 AmbientAmount  = LightingDefaults.DefaultAmbient,
