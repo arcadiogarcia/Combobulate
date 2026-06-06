@@ -337,7 +337,7 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             // commit. The predicate is the conjunction of signed
             // event-function inequalities baked from this cell's
             // signature; cells are mutually exclusive by construction.
-            var predicate = PredicateCompiler.BuildPredicate(GetBakedMatrixReference(), geometry, c.Sig);
+            var predicate = PredicateCompiler.BuildPredicate(GetBakedMatrixReference(), geometry, c.Sig, _bakedCullMarginCos);
             newOpacityExprs[i] = ExpressionFunctions.Conditional(predicate, (ScalarNode)1f, (ScalarNode)0f);
             _parent.Children.InsertAtTop(tree);
             newTrees[i] = tree;

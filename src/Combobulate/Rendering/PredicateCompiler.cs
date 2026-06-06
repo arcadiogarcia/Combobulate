@@ -49,23 +49,42 @@ internal static class PredicateCompiler
     /// are encoded statically in <see cref="SignatureBake.Signature.Order"/>
     /// and don't need a runtime test.
     /// </summary>
+    /// <param name="cullMarginCos">
+    /// Must match the value passed to <see cref="SignatureBake.Bake"/>. Widens the
+    /// face-front tolerance so the runtime predicate's notion of "visible" matches
+    /// the bake-time sampler's notion. Without this match, signatures generated for
+    /// near-edge faces never satisfy their predicate at runtime and the cell never
+    /// "lights up" — every tree opacity stays 0 and the model renders as a dark blob.
+    /// Pass 0 to preserve the original strict behaviour.
+    /// </param>
     public static BooleanNode BuildPredicate(
         Matrix4x4Node bakedMatrix,
         ObjGeometry geometry,
-        SignatureBake.Signature sig)
+        SignatureBake.Signature sig,
+        float cullMarginCos = 0f)
     {
         var quads = geometry.Quads;
         int n = quads.Length;
         BooleanNode? acc = null;
 
         // Face-front tests for every face (visible or hidden).
-        // Tolerant convention: + sign → normalZ > -eps; - sign → normalZ < +eps.
+        //
+        // Bake-time classification uses GeometryPredicates.IsFrontFacing(normalZ, cullMarginCos)
+        // which is `normalZ + cullMarginCos > CosineEpsilon`, i.e. front-facing iff
+        // `normalZ > CosineEpsilon - cullMarginCos` (≈ `normalZ > -cullMarginCos` for tiny
+        // CosineEpsilon). The runtime predicate must agree with that threshold, otherwise
+        // signatures generated for faces in the widened cone never match and their cell
+        // tree never becomes opaque. We additionally apply PredicateEpsilon on both sides
+        // to absorb CPU/GPU sign disagreement at the boundary (see the PredicateEpsilon
+        // comment above), preserving the original tolerance behaviour when cullMarginCos = 0.
+        float posThreshold = -(cullMarginCos + PredicateEpsilon);   // visible: normalZ > posThreshold
+        float negThreshold = -cullMarginCos + PredicateEpsilon;     // hidden:  normalZ < negThreshold
         for (int q = 0; q < n; q++)
         {
             var normalZ = EventFunctions.TransformedDirectionZ(bakedMatrix, quads[q].Normal);
             BooleanNode test = sig.FaceSigns[q] > 0
-                ? normalZ > (ScalarNode)(-PredicateEpsilon)
-                : normalZ < (ScalarNode)(+PredicateEpsilon);
+                ? normalZ > (ScalarNode)posThreshold
+                : normalZ < (ScalarNode)negThreshold;
             acc = acc is null ? test : ExpressionFunctions.And(acc, test);
         }
 

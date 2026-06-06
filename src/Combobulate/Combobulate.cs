@@ -882,6 +882,15 @@ public sealed class Combobulate : Control
     private float _bakedScale, _bakedHostW, _bakedHostH;
     private global::Combobulate.Sorting.SortAlgorithm _bakedAlgorithm;
     /// <summary>
+    /// Snapshot of <see cref="ComputeCullMarginCos"/> at the time of the last
+    /// bake. Lets <see cref="UpdateBakeIfNeeded"/> trigger a fresh bake when
+    /// the <see cref="CullMarginDegrees"/> DP changes — without this, the DP
+    /// only widens the runtime predicate but the signature set still reflects
+    /// the old, narrower cull, so the renderer would expect signatures that
+    /// don't exist for newly-visible faces.
+    /// </summary>
+    private float _bakedCullMarginCosCache = -1f;
+    /// <summary>
     /// Reference identity of the <see cref="ObjMaterialPack"/> the last bake's
     /// sprite trees were built against. When the consumer assigns a new
     /// <see cref="Materials"/> instance (e.g. cover image fades in after
@@ -1519,6 +1528,7 @@ public sealed class Combobulate : Control
             || _bakedHostW != hostW
             || _bakedHostH != hostH
             || _bakedAlgorithm != SortAlgorithm
+            || _bakedCullMarginCosCache != ComputeCullMarginCos()
             || secondaryChanged;
         if (_baked != null && _baked.BakeInFlight) needRebake = false;
 
@@ -1549,6 +1559,7 @@ public sealed class Combobulate : Control
             _baked = new global::Combobulate.Rendering.BakedAspectGraphRenderer(_compositor, _root);
         }
         var bakedResolved = ResolveCurrentMaterials(geometry, pack);
+        var cullMarginCosNow = ComputeCullMarginCos();
         _baked.RequestBake(
             transformNode: _transformNode!,
             axes: _transformAxes!,
@@ -1557,7 +1568,7 @@ public sealed class Combobulate : Control
             scale: scale,
             hostW: hostW,
             hostH: hostH,
-            cullMarginCos: ComputeCullMarginCos(),
+            cullMarginCos: cullMarginCosNow,
             cameraDistance: ComputeSortCameraDistance(scale),
             sortAlgorithm: SortAlgorithm);
         _bakedGeometry = geometry;
@@ -1565,6 +1576,7 @@ public sealed class Combobulate : Control
         _bakedHostW = hostW;
         _bakedHostH = hostH;
         _bakedAlgorithm = SortAlgorithm;
+        _bakedCullMarginCosCache = cullMarginCosNow;
         _bakedMaterialsToken = materialToken;
         CaptureSecondaryProbe();
     }
