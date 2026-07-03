@@ -107,7 +107,7 @@ public class ObjParserLenienceTests
             v 1 0 0
             v 1 1 0
             v 0 1 0
-            f 1 2 3
+            f 1 2 3 4 5
             v not a number
             f 1 2 3 4
             """;
@@ -115,6 +115,7 @@ public class ObjParserLenienceTests
 
         Assert.Equal(2, r.Errors.Count);
         Assert.Single(r.Model.Quads); // The valid quad after both errors still parsed.
+        Assert.Empty(r.Model.Triangles); // No triangles emitted by either error path.
     }
 
     [Fact]

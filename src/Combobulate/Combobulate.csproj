@@ -130,6 +130,7 @@
     <Compile Include="GlobalUsings.cs" />
     <Compile Include="MaterialMode.cs" />
     <Compile Include="MaterialSlotController.cs" />
+    <Compile Include="Caching\BrushTransformMath.cs" />
     <Compile Include="Caching\MaterialResolver.cs" />
     <Compile Include="Caching\ObjCache.cs" />
     <Compile Include="Caching\ObjGeometry.cs" />
@@ -147,6 +148,7 @@
     <Compile Include="Parsing\ObjParser.cs" />
     <Compile Include="Parsing\ObjParseResult.cs" />
     <Compile Include="Parsing\ObjQuad.cs" />
+    <Compile Include="Parsing\ObjTriangle.cs" />
     <Compile Include="Parsing\ObjVertex.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Rendering\AspectGraphBake.cs" />
@@ -156,6 +158,8 @@
     <Compile Include="Rendering\RenderingMode.cs" />
     <Compile Include="Rendering\SignatureBake.cs" />
     <Compile Include="Rendering\TransformAnimationAxis.cs" />
+    <Compile Include="Rendering\TriangleClipFactory.cs" />
+    <Compile Include="Caching\QuadRecovery.cs" />
     <Compile Include="Sorting\BspSorter.cs" />
     <Compile Include="Sorting\GeometryPredicates.cs" />
     <Compile Include="Sorting\IFaceSorter.cs" />

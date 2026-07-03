@@ -25,22 +25,63 @@ that the per-quad sprites are drawn through, and the
 populated by [`ObjParser`](../src/Combobulate/Parsing/ObjParser.cs). The parser
 accepts standard Wavefront `.obj` syntax with the following constraints:
 
-- **Faces must be quads.** Each `f` line is parsed into an
-  [`ObjQuad`](../src/Combobulate/Parsing/ObjQuad.cs) with four
-  [`ObjVertex`](../src/Combobulate/Parsing/ObjVertex.cs) entries (`V0`..`V3`).
-  Triangles and n-gons are rejected at parse time — see
-  [`ObjParserFaceTests`](../tests/Combobulate.Tests/ObjParserFaceTests.cs).
-- **Winding order is meaningful.** A quad's outward normal is taken to be
-  `normalize((V1 − V0) × (V3 − V0))`. Faces must be wound counter-clockwise as
-  viewed from the outside of the surface; otherwise back-face culling will hide
-  them.
+- **Faces may be triangles or quads.** A 3-vertex `f` line becomes an
+  [`ObjTriangle`](../src/Combobulate/Parsing/ObjTriangle.cs); a 4-vertex `f` line
+  becomes an [`ObjQuad`](../src/Combobulate/Parsing/ObjQuad.cs). Faces with fewer
+  than 3 or more than 4 vertices are reported as parse errors and skipped — see
+  [`ObjParserFaceTests`](../tests/Combobulate.Tests/ObjParserFaceTests.cs) and
+  [`ObjParserTriangleTests`](../tests/Combobulate.Tests/ObjParserTriangleTests.cs).
+- **Winding order is meaningful.** A face's outward normal is taken to be
+  `normalize((V1 − V0) × (V_last − V0))` where `V_last` is `V2` for triangles
+  and `V3` for quads. Faces must be wound counter-clockwise as viewed from
+  the outside of the surface; otherwise back-face culling will hide them.
 - **Doubled faces are allowed.** A real-world surface that should be visible
   from both sides (e.g. a sheet, an open book cover) can be expressed as two
   faces sharing the same vertices but with opposite winding.
 
-The parser populates `model.Positions` (a list of `Vector3`) and `model.Quads`
-(a list of `ObjQuad`). Each `ObjVertex.PositionIndex` is a 0-based index into
-`Positions`.
+The parser populates `model.Positions` (a list of `Vector3`), `model.Quads`
+(a list of `ObjQuad`), and `model.Triangles` (a list of `ObjTriangle`). Each
+`ObjVertex.PositionIndex` is a 0-based index into `Positions`.
+
+[`ObjGeometry.Build`](../src/Combobulate/Caching/ObjGeometry.cs) consumes both
+face lists and produces a uniform `CachedQuad[]`. Quad faces become
+`CachedQuad` with `IsTriangle == false`; triangle faces become `CachedQuad`
+with `IsTriangle == true`, `V3 == V2`, `Uv3 == Uv2`, and a 3-corner
+centroid. Before the final array is emitted, the build runs the
+[**quad-recovery preprocess**](#11-quad-recovery-from-triangulated-meshes)
+that fuses coplanar adjacent triangle pairs back into single quads.
+
+### 1.1 Quad recovery from triangulated meshes
+
+Many OBJ exporters triangulate authored quads. The
+[`QuadRecovery`](../src/Combobulate/Caching/QuadRecovery.cs) preprocess
+runs once per `ObjGeometry.Build` and fuses pairs of triangle
+`CachedQuad`s that satisfy:
+
+1. **Shared edge** — exactly two of the three positions match.
+2. **Coplanar** — both unit normals within `CoplanarCosineEpsilon` of each other.
+3. **Same material** — `MaterialName` ordinal-equal.
+4. **UV continuity** — at the shared vertices, both triangles' UVs match
+   (within `UvEpsilon`). Skipped when at least one triangle lacked
+   explicit `vt` references, since the parser's per-triangle UV defaults
+   are arbitrary in that case.
+5. **Opposite shared-edge orientation** — the triangles run the shared
+   edge in opposite directions (consistent CCW winding for the combined
+   quad).
+6. **Convex result** — every interior cross product of the recovered
+   quad's edges points in the same direction as the face normal.
+
+Pairing is greedy and deterministic (lowest source index first, lowest
+valid partner first). The recovered quad's vertex order is chosen so
+re-triangulating along the V0→V2 diagonal reproduces the exact two input
+triangles. Unmatched triangles remain as triangle `CachedQuad`s and
+render via the triangle path described in
+[§5.3](#53-triangle-faces-clip--3-point-affine-brush).
+
+For "triangulated quad mesh" inputs (common in DCC re-exports), recovery
+restores the 1-sprite-per-quad fast path with no overdraw cost. For
+genuinely triangular meshes (terrain, subdivided spheres), no fusion
+happens and every triangle takes the per-face clip path.
 
 ## 2. Rebuild trigger and per-quad transform construction
 
@@ -198,10 +239,10 @@ resolution above; they differ only in when sort decisions are made.
 
 ### 5.1 `SpritePainter` — default
 
-One pooled `SpriteVisual` per quad, parented to a single `ContainerVisual`
-root. Each frame:
+One pooled `SpriteVisual` per face (quad or triangle), parented to a single
+`ContainerVisual` root. Each frame:
 
-- Cull writes new `IsVisible` flags only on the quads whose visibility
+- Cull writes new `IsVisible` flags only on the faces whose visibility
   actually changed.
 - The order list is compared against the previous frame's; if they
   match, the sibling reorder is skipped entirely.
@@ -212,6 +253,11 @@ Steady-state per `Rebuild` is therefore one transform-only cull pass plus a
 sibling reorder only on frames where the painter order actually changed.
 Sprite identities are pooled per geometry, so there are no per-frame
 composition allocations.
+
+Quad faces get a sprite with the full parallelogram footprint. Triangle
+faces additionally get a `CompositionGeometricClip` (see
+[§5.3](#53-triangle-faces-clip--3-point-affine-brush)) so the bottom-right
+half of the sprite's parallelogram footprint is not drawn.
 
 ### 5.2 `BakedAspectGraph`
 
@@ -250,6 +296,52 @@ also implements a hot brush-swap path: when only the `Materials` DP
 changes, the bake is reused and only the per-quad `CompositionBrush` is
 reassigned in place — no teardown, no expression reinstall.
 
+### 5.3 Triangle faces: clip + 3-point affine brush
+
+Triangle `CachedQuad`s (those with `IsTriangle == true`) materialise as
+`SpriteVisual`s the same way quads do — same `xAxis = V1−V0`, same
+`yAxis = V3−V0` (which equals `V2−V0` for triangles since `V3 == V2`),
+same `Size = (lenX, lenY)`, same `TransformMatrix` carrying the unit
+basis plus translation. Two additional steps tame the parallelogram
+footprint that a SpriteVisual implies, so what actually appears on screen
+is the triangle `(V0, V1, V2)` and nothing more:
+
+1. **`CompositionGeometricClip` on a shared unit-triangle path.**
+   [`TriangleClipFactory`](../src/Combobulate/Rendering/TriangleClipFactory.cs)
+   lazy-builds **one** `CompositionPathGeometry` per compositor — the
+   path `(0,0) → (1,0) → (0,1) → (0,0)`. Each triangle sprite gets its
+   own `CompositionGeometricClip` referring to that shared geometry,
+   with `clip.TransformMatrix = Matrix3x2.CreateScale(lenX, lenY)` so the
+   unit triangle covers exactly the `(V0, V1, V2)` half of the sprite's
+   parallelogram footprint. The bottom-right `(V1+V2−V0)` half is
+   clipped away.
+
+2. **3-point affine brush transform.** Material brushes set
+   `CompositionSurfaceBrush.TransformMatrix` to a `Matrix3x2` constructed
+   by
+   [`BrushTransformMath.BuildTriangleAffine`](../src/Combobulate/Caching/BrushTransformMath.cs).
+   It maps the brush's normalised corners `(0,0)`, `(1,0)`, `(0,1)`
+   directly to the V-flipped UVs `Uv0`, `Uv1`, `Uv2`. Three points fully
+   determine a 2D affine — this is the **exact** transform GPUs use for
+   triangle UV interpolation, with no approximation. For the quad path,
+   `BuildQuadAxisAlignedCrop` produces the legacy axis-aligned crop
+   matrix that has shipped since Combobulate's first release.
+
+Cost: per triangle, one extra `CompositionGeometricClip` instance (the
+clip geometry itself is shared), one `Matrix3x2` assignment on the brush
+transform. The clipped half of the sprite still rasterises during
+composition but the alpha is killed by the clip, so the on-screen pixel
+cost is comparable to a quad mesh of equivalent surface area. Sprite,
+sort, and cull counts double when a triangulated mesh isn't recovered to
+quads, which is why the
+[quad-recovery preprocess](#11-quad-recovery-from-triangulated-meshes)
+matters for triangulated-quad inputs.
+
+The `BakedAspectGraphRenderer` follows the same per-face rules when
+materialising cells — quad sprites in a cell are unclipped, triangle
+sprites in a cell carry the same shared unit-triangle clip with a
+per-sprite TransformMatrix.
+
 ## 6. Root-level perspective transform
 
 The container visual that holds the per-quad sprites carries its own transform
@@ -285,15 +377,16 @@ actually drawn.
 - **`Topological` may admit cycles on arbitrary meshes.** `Bsp` (the
   default) and `Newell` are exact for any rigid mesh; `Topological` is
   retained for backward compatibility and falls back to view-Z order
-  when its graph contains a cycle.
-- **Quads only.** Triangulating before render would be straightforward but
-  is not implemented.
-- **Per-vertex lighting is not applied.** Each quad is rendered with a
+  when its graph contains a cycle. Triangle-only meshes roughly double
+  face count vs the equivalent quad mesh, which can be slow for
+  `Topological`'s O(n²) construction at high face counts.
+- **Per-vertex lighting is not applied.** Each face is rendered with a
   flat colour or texture from its material; vertex normals are parsed
   from the OBJ but not used for shading.
 - **Per-quad transforms are affine.** Non-parallelogram quads are
   approximated; for fully general planar quads a homography would be
-  needed.
+  needed. Triangle faces are unaffected — the 3-point affine they use
+  is exact.
 - **`SpritePainter` lags GPU rotation by one frame.** See
   [Composition-thread animations](#composition-thread-animations) for the
   three mitigation paths the library provides.

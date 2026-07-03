@@ -29,13 +29,32 @@ public sealed partial class MainWindow : Window
         ObjCache.GetOrAdd(CubeKey, () => ObjParser.Parse(CubeObj).Model);
 
         LoadCube();
+
+        // Promote the demo to its best-default rendering pipeline:
+        // BakedAspectGraph. The library default is SpritePainter (the simpler
+        // path for plain consumers), but for the demo we want first-time
+        // visitors to see the analytical zero-CPU-per-frame mode. We do this
+        // after LoadCube so combobulate.Model is non-null when the BAG bake
+        // kicks off via RenderingModeBox_SelectionChanged → SetTransformAnimation.
+        // Defer to the dispatcher so the combobulate control's Loaded handler
+        // (which initialises its compositor) has a chance to run first.
+        this.DispatcherQueue.TryEnqueue(() =>
+        {
+            if (RenderingModeBox != null && RenderingModeBox.SelectedIndex != 1)
+                RenderingModeBox.SelectedIndex = 1;
+        });
     }
 
     private void LoadCube()
     {
-        // Resolve from the keyed cache. The first call built the geometry; this just
-        // hands the same ObjModel back to the control.
-        combobulate.Model = ObjCache.TryGet(CubeKey)!.Model;
+        // Resolve via the Source DP (not direct Model assignment) so that subsequent
+        // toggles between this cube and any other Source-driven model always trigger
+        // a fresh OnSourceChanged. Setting Model directly here would leave the Source
+        // DP pointing at whatever was last loaded, and re-assigning that same path
+        // later would be a no-op due to DP value coalescing, silently leaving the
+        // wrong geometry on screen (see Combobulate.OnModelChanged for the library
+        // defensive guard that also protects mixed Source+Model callers).
+        combobulate.Source = CubeKey;
         StatusText.Text = $"Loaded: built-in cube (cache key '{CubeKey}')";
     }
 
@@ -89,6 +108,31 @@ public sealed partial class MainWindow : Window
             SceneVisualLabel.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
         if (SceneVisualColumn != null)
             SceneVisualColumn.Width = on ? new GridLength(1, GridUnitType.Star) : new GridLength(0);
+    }
+
+    private void EnablePerspectiveToggle_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_suspendUiHandlers) return;
+        if (combobulate == null || EnablePerspectiveToggle == null) return;
+        combobulate.EnablePerspective = EnablePerspectiveToggle.IsOn;
+        if (combobulateSceneVisual != null)
+            combobulateSceneVisual.EnablePerspective = EnablePerspectiveToggle.IsOn;
+    }
+
+    private void SubdivideForPainterToggle_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_suspendUiHandlers) return;
+        if (combobulate == null || SubdivideForPainterToggle == null) return;
+        combobulate.SubdivideForPainter = SubdivideForPainterToggle.IsOn;
+    }
+
+    private void PerspectiveSlider_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+    {
+        if (PerspectiveValueText == null) return;
+        double v = e.NewValue;
+        PerspectiveValueText.Text = v <= 0.0
+            ? "(follows host width)"
+            : $"{v:F0} px";
     }
 
     // ===== Diagnostics pane =====
@@ -689,16 +733,16 @@ public sealed partial class MainWindow : Window
             // of the same path return the cached geometry, transparently re-parsing only
             // if LastWriteTimeUtc or length has changed on disk.
             var geometry = ObjCache.GetOrLoadFile(file.Path);
-            if (geometry.Model.Quads.Count == 0)
+            if (geometry.Model.IsEmpty)
             {
-                StatusText.Text = $"{file.Name}: no quads found";
+                StatusText.Text = $"{file.Name}: no faces found";
                 return;
             }
 
             // Drive via Source so the control records the source directory and
             // any sibling mtllib files load automatically.
             combobulate.Source = file.Path;
-            StatusText.Text = $"Loaded: {file.Name} ({geometry.Quads.Length} quads, cached)";
+            StatusText.Text = $"Loaded: {file.Name} ({geometry.Quads.Length} faces, cached)";
         }
         catch (Exception ex)
         {
@@ -726,6 +770,31 @@ public sealed partial class MainWindow : Window
         catch (Exception ex)
         {
             StatusText.Text = $"Failed to load book: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Loads <c>samples\tetrahedron.obj</c> — a 4-triangle regular tetrahedron.
+    /// No two faces are coplanar, so quad recovery cannot fuse any pair; all
+    /// 4 faces render through the triangle clip + 3-point affine brush path.
+    /// Provides an immediate visual smoke test for triangle rendering.
+    /// </summary>
+    private void LoadTetrahedron_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var path = ResolveSamplePath("tetrahedron.obj");
+            if (path == null)
+            {
+                StatusText.Text = "Could not locate samples/tetrahedron.obj.";
+                return;
+            }
+            combobulate.Source = path;
+            StatusText.Text = "Loaded tetrahedron.obj — 4 triangle faces via triangle clip path.";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Failed to load tetrahedron: {ex.Message}";
         }
     }
 

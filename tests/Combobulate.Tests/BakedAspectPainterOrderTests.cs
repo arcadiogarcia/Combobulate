@@ -77,7 +77,13 @@ public class BakedAspectPainterOrderTests
         // book.obj is copied to output via the test csproj; resolve from base.
         var path = Path.Combine(AppContext.BaseDirectory, "Samples", "book.obj");
         Assert.True(File.Exists(path), $"book.obj missing at {path}");
-        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model);
+        // Production guidance: SubdivideForPainter is OPT-IN (default false)
+        // because BAG mode's ExpressionAnimation length cap can't hold the
+        // expanded per-cell predicates. SpritePainter callers can opt-in for
+        // painter-correct non-convex rendering. This test exercises the
+        // per-fragment correctness guarantee directly via WithPainterSubdivision.
+        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model)
+            .WithPainterSubdivision();
         var fail = SweepRandomRotations(geom, RandomRotationsPerModel, RandomSeed);
         Assert.True(fail.violationCount == 0,
             $"book: {fail.violationCount}/{RandomRotationsPerModel} rotations produced painter-order violations. " +
@@ -500,7 +506,8 @@ public class BakedAspectPainterOrderTests
     public void Book_MultiRevolutionYawSpinHasNoViolations(float pitchDeg, float rollDeg)
     {
         var path = Path.Combine(AppContext.BaseDirectory, "Samples", "book.obj");
-        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model);
+        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model)
+            .WithPainterSubdivision();
         // 5 full revolutions, 1° steps = 1800 samples.
         int violations = 0;
         for (int s = 0; s < 1800; s++)
@@ -523,7 +530,8 @@ public class BakedAspectPainterOrderTests
     public void Book_FineGridRotationsAllProduceCorrectPainterOrder()
     {
         var path = Path.Combine(AppContext.BaseDirectory, "Samples", "book.obj");
-        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model);
+        var geom = ObjGeometry.Build(ObjParser.Parse(File.ReadAllText(path)).Model)
+            .WithPainterSubdivision();
         var (sigs, _, _) = MiniBake(geom, BakeSweep());
         // 10× finer grid: 240 yaw, 120 pitch, 120 roll = 3.45M samples — too many.
         // Instead use 3.6M but stratified-random so cost is bounded.

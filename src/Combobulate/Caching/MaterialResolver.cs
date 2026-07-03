@@ -21,13 +21,22 @@ namespace Combobulate.Caching;
 /// <summary>Per-quad brush + fallback colour binding produced by <see cref="MaterialResolver"/>.</summary>
 internal readonly struct QuadBrushBinding
 {
-    public QuadBrushBinding(CompositionBrush brush, Color fallbackColor)
+    public QuadBrushBinding(CompositionBrush brush, Color fallbackColor, ObjMaterial? material = null)
     {
         Brush = brush;
         FallbackColor = fallbackColor;
+        Material = material;
     }
     public CompositionBrush Brush { get; }
     public Color FallbackColor { get; }
+    /// <summary>
+    /// The resolved <see cref="ObjMaterial"/> backing this binding, or
+    /// <c>null</c> for the fallback-color path. The sprite-update loop reads
+    /// this to recompute the brush <c>TransformMatrix</c> against the
+    /// sprite's pixel size — see
+    /// <see cref="MaterialResolver.UpdateBrushTransformForSprite"/>.
+    /// </summary>
+    public ObjMaterial? Material { get; }
 }
 
 internal sealed class ResolvedQuadMaterials
@@ -315,7 +324,7 @@ internal static class MaterialResolver
             brush = compositor.CreateColorBrush(fallback);
         }
 
-        return new QuadBrushBinding(brush, fallback);
+        return new QuadBrushBinding(brush, fallback, material);
     }
 
     private static QuadBrushBinding UpdateBinding(
@@ -338,7 +347,7 @@ internal static class MaterialResolver
             if (existing.Brush is CompositionSurfaceBrush surfaceBrush)
             {
                 ApplySurfaceBrush(compositor, surfaceBrush, quad, material);
-                return new QuadBrushBinding(surfaceBrush, fallback);
+                return new QuadBrushBinding(surfaceBrush, fallback, material);
             }
 
             return CreateBinding(compositor, quad, material);
@@ -347,10 +356,10 @@ internal static class MaterialResolver
         if (existing.Brush is CompositionColorBrush colorBrush)
         {
             colorBrush.Color = fallback;
-            return new QuadBrushBinding(colorBrush, fallback);
+            return new QuadBrushBinding(colorBrush, fallback, material);
         }
 
-        return new QuadBrushBinding(compositor.CreateColorBrush(fallback), fallback);
+        return new QuadBrushBinding(compositor.CreateColorBrush(fallback), fallback, material);
     }
 
     private static void ApplySurfaceBrush(
@@ -362,7 +371,14 @@ internal static class MaterialResolver
         surfaceBrush.Stretch = CompositionStretch.Fill;
         surfaceBrush.HorizontalAlignmentRatio = 0;
         surfaceBrush.VerticalAlignmentRatio = 0;
-        surfaceBrush.TransformMatrix = BuildBrushTransform(quad, material);
+        // TransformMatrix is intentionally NOT set here: it depends on the
+        // owning sprite's pixel size (CompositionBrush.TransformMatrix
+        // translations are in sprite pixels, not normalised UV — see
+        // BrushTransformMath). The sprite-update loop calls
+        // UpdateBrushTransformForSprite once it knows the sprite size.
+        // Initialise to identity so a freshly-created brush samples sanely
+        // until the first sprite-update pass runs.
+        surfaceBrush.TransformMatrix = Matrix3x2.Identity;
         // Avoid a one-frame flash: only null the existing surface when the new
         // target hasn't finished decoding. If it's already in the cache loaded,
         // GetOrLoadSurface will swap atomically and we never go through blank.
@@ -471,20 +487,56 @@ internal static class MaterialResolver
         }
     }
 
-    private static Matrix3x2 BuildBrushTransform(CachedQuad q, ObjMaterial material)
+    /// <summary>
+    /// Refreshes the per-sprite brush <c>TransformMatrix</c> using the
+    /// supplied sprite size. Must be called whenever a sprite is created or
+    /// resized so the matrix translation lands at the correct pixel
+    /// coordinate (see <see cref="BrushTransformMath"/> for the unit
+    /// derivation). No-ops if the brush is not a surface-textured binding.
+    /// </summary>
+    internal static void UpdateBrushTransformForSprite(
+        CompositionBrush? brush, CachedQuad quad, ObjMaterial? material, Vector2 spriteSize)
+        => UpdateBrushTransformForSprite(
+            brush, quad.Uv0, quad.Uv1, quad.Uv2, quad.Uv3, quad.IsTriangle,
+            material, spriteSize);
+
+    /// <summary>
+    /// UV-explicit overload used by the anti-seam conservative outset in the
+    /// BAG renderer: the caller passes UVs EXPANDED to match a sprite that has
+    /// been grown by a small pad on every side, so the interior texel
+    /// registration is preserved while the overlap region extrapolates into
+    /// the neighbouring sub-quad's texels (same-face) or edge-clamps
+    /// (cross-face). See BakedAspectGraphRenderer.MaterialiseChunk.
+    /// </summary>
+    internal static void UpdateBrushTransformForSprite(
+        CompositionBrush? brush, Vector2 uv0, Vector2 uv1, Vector2 uv2, Vector2 uv3,
+        bool isTriangle, ObjMaterial? material, Vector2 spriteSize)
     {
-        // Compute axis-aligned UV bounds and V-flip (OBJ origin = bottom-left, image = top-left).
-        var (uMin, vMin, uMax, vMax) = ComputeCrop(q);
-        var width = MathF.Max(uMax - uMin, 1e-6f);
-        var height = MathF.Max(vMax - vMin, 1e-6f);
-
-        // Apply material UV scale/offset on top.
-        var sx = width * material.UvScale.X;
-        var sy = height * material.UvScale.Y;
-        var tx = uMin + material.UvOffset.X;
-        var ty = (1f - vMax) + material.UvOffset.Y; // V-flip
-
-        return new Matrix3x2(sx, 0, 0, sy, tx, ty);
+        if (brush == null) return;
+        if (spriteSize.X <= 0f || spriteSize.Y <= 0f) return;
+        // Only meaningful when the binding has a textured surface — the
+        // matrix is a no-op on solid color brushes.
+        if (material?.DiffuseTexture == null && material?.NormalMap == null) return;
+        var matrix = isTriangle
+            ? BrushTransformMath.BuildTriangleAffine(
+                uv0, uv1, uv2, material!.UvScale, material.UvOffset, spriteSize)
+            : BrushTransformMath.BuildQuadAxisAlignedCrop(
+                uv0, uv1, uv2, uv3, material!.UvScale, material.UvOffset, spriteSize);
+        if (brush is CompositionSurfaceBrush surfaceBrush)
+        {
+            surfaceBrush.TransformMatrix = matrix;
+        }
+        else if (brush is CompositionEffectBrush effectBrush)
+        {
+            // Lit path: inner brushes are wrapped as effect sources named
+            // "Diffuse" and "NormalMap" (see BuildLitBrush). Update both so
+            // the per-pixel normal sample stays aligned with the diffuse
+            // texel.
+            if (effectBrush.GetSourceParameter("Diffuse") is CompositionSurfaceBrush diffuse)
+                diffuse.TransformMatrix = matrix;
+            if (effectBrush.GetSourceParameter("NormalMap") is CompositionSurfaceBrush normal)
+                normal.TransformMatrix = matrix;
+        }
     }
 
     private static (float uMin, float vMin, float uMax, float vMax) ComputeCrop(CachedQuad q)
@@ -587,13 +639,14 @@ internal static class MaterialResolver
                 compositor.CreateColorBrush(material.DiffuseColor ?? quad.FallbackColor));
         }
 
-        // Normal map source
+        // Normal map source — TransformMatrix deferred to UpdateBrushTransformForSprite
+        // so the sprite-size-scaled translation matches the diffuse brush.
         normalBrush = compositor.CreateSurfaceBrush();
         normalBrush.Surface = material.NormalMap;
         normalBrush.Stretch = CompositionStretch.Fill;
         normalBrush.HorizontalAlignmentRatio = 0;
         normalBrush.VerticalAlignmentRatio = 0;
-        normalBrush.TransformMatrix = BuildBrushTransform(quad, material);
+        normalBrush.TransformMatrix = Matrix3x2.Identity;
         effectBrush.SetSourceParameter("NormalMap", normalBrush);
 
         // Pin the inner brushes' managed wrappers to the effect brush's

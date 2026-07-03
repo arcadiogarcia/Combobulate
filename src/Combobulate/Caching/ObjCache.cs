@@ -67,6 +67,16 @@ public static class ObjCache
     private static readonly ConditionalWeakTable<ObjModel, ObjGeometry> _byModel = new();
 
     /// <summary>
+    /// Subdivided variant of <see cref="_byModel"/>: the per-fragment
+    /// painter-correct decomposition (see
+    /// <see cref="ObjGeometry.WithPainterSubdivision"/>). Cached separately so
+    /// callers that opt out (or in) of subdivision get a stable, shared
+    /// geometry instance for their choice, without invalidating the
+    /// other variant.
+    /// </summary>
+    private static readonly ConditionalWeakTable<ObjModel, ObjGeometry> _byModelSubdivided = new();
+
+    /// <summary>
     /// Returns the cached <see cref="ObjGeometry"/> for <paramref name="model"/>,
     /// building it on first use. Subsequent calls with the same instance return the
     /// same object. The entry is dropped automatically when the model is collected.
@@ -75,6 +85,26 @@ public static class ObjCache
     {
         if (model == null) throw new ArgumentNullException(nameof(model));
         return _byModel.GetValue(model, ObjGeometry.Build);
+    }
+
+    /// <summary>
+    /// Returns the cached <see cref="ObjGeometry"/> for <paramref name="model"/>
+    /// after running <see cref="ObjGeometry.WithPainterSubdivision"/>. Use this
+    /// when feeding the geometry into a per-fragment painter pipeline
+    /// (Combobulate's default when <c>SubdivideForPainter</c> is true) — it
+    /// guarantees that, for any view direction, a single back-to-front
+    /// ordering of <see cref="ObjGeometry.Quads"/> is a correct painter
+    /// order. Non-convex meshes (e.g. a book with a cover overhanging the
+    /// inset pages) need this to avoid mis-occlusion glitches; convex
+    /// meshes pass through unchanged.
+    ///
+    /// <para>The subdivided variant is cached independently from
+    /// <see cref="ForModel"/>: both can coexist for the same model.</para>
+    /// </summary>
+    public static ObjGeometry ForModelSubdivided(ObjModel model)
+    {
+        if (model == null) throw new ArgumentNullException(nameof(model));
+        return _byModelSubdivided.GetValue(model, m => ForModel(m).WithPainterSubdivision());
     }
 
     /// <summary>

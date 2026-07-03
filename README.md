@@ -1,15 +1,18 @@
 # Combobulate
 
 A XAML controls library for UWP and WinUI 3 / Windows App SDK that renders
-3D `.obj` files made of quads using the [Windows Composition][composition]
+3D `.obj` files made of triangles and quads using the [Windows Composition][composition]
 visual layer — no D3D, no SwapChainPanel, no shaders.
 
 > **combobulate** *(humorous)* — to compose (oneself); to compose, organize,
 > design, or arrange; to reverse the effect of discombobulation.
 > *([Wiktionary](https://en.wiktionary.org/wiki/combobulate))*
 
-Each quad becomes a `SpriteVisual` placed in 3D by a perspective
-`TransformMatrix`. Back-face culling and a polygon sort keep the draw
+Each face becomes a `SpriteVisual` placed in 3D by a perspective
+`TransformMatrix`. Quad faces use the full sprite rectangle; triangle
+faces add a triangular `CompositionGeometricClip` (one shared unit-triangle
+path geometry, per-face scale) plus a 3-point affine brush transform that
+maps brush UVs exactly. Back-face culling and a polygon sort keep the draw
 order right without a depth buffer, and a fully analytical *baked aspect
 graph* renderer can sustain GPU-driven animation with **zero CPU work
 per frame**.
@@ -97,13 +100,23 @@ For everything beyond "drop a control, point `Source` at a file" see the
 - `v x y z [w]` — vertex positions
 - `vt u v [w]` — texture coordinates
 - `vn x y z` — vertex normals (parsed; not used for shading today)
+- `f a b c` — **triangle** faces; `a/ta/na` style references accepted
 - `f a b c d` — **quad** faces; `a/ta/na` style references accepted
 - `usemtl <name>`, `mtllib <file>` — material binding and library load
 - `o`, `g`, `s` — preserved; `l`, `p`, `vp`, curves/surfaces are ignored
 
-Faces must be **quads** (triangles and n-gons are reported as parse errors).
-Wind each face so that `(V1 - V0) × (V3 - V0)` points outward — that's the
-direction the renderer treats as front-facing for back-face culling.
+Both triangles and quads are first-class faces. Triangles render via a
+SpriteVisual + shared triangle `CompositionGeometricClip` + exact 3-point
+affine brush transform; quads render directly as parallelogram sprites as
+before. A geometry-build preprocess fuses coplanar adjacent triangle pairs
+back into single quads where it is safe to do so (same material, matching
+UVs at the shared edge, convex result), so triangulated-quad meshes hit the
+1-sprite-per-quad fast path with no overdraw.
+
+Wind each face so that `(V1 - V0) × (V_last - V0)` points outward — that's
+the direction the renderer treats as front-facing for back-face culling
+(`V_last` is `V2` for triangles, `V3` for quads). Faces with fewer than 3
+or more than 4 vertices are reported as parse errors and skipped.
 
 See [`samples/book.obj`](samples/book.obj) for a worked example.
 

@@ -11,16 +11,18 @@ namespace Combobulate.Parsing;
 ///
 /// Supports:
 ///   v, vt, vn (with optional w / defaulted components)
-///   f with v, v/vt, v//vn, v/vt/vn references (quads only)
+///   f with v, v/vt, v//vn, v/vt/vn references (triangles and quads)
 ///   negative (relative) indices
 ///   o, g (multi-name), usemtl, mtllib, s
 /// Ignores (without error):
 ///   l, p, vp, curv, curv2, surf, parm, trim, hole, scrv, sp, end, and any unknown keyword
 /// Recoverable errors (collected, parsing continues):
-///   invalid numbers, out-of-range indices, malformed vertex refs, non-quad faces, missing args
+///   invalid numbers, out-of-range indices, malformed vertex refs, n-gon (>4) faces, missing args
 ///
-/// This parser intentionally accepts only quads. Triangles or n-gons in <c>f</c> directives
-/// produce an <see cref="ObjParseErrorKind.UnsupportedFaceArity"/> error and the face is skipped.
+/// Triangle faces (<c>f a b c</c>) are added to <see cref="ObjModel.Triangles"/>; quad
+/// faces (<c>f a b c d</c>) are added to <see cref="ObjModel.Quads"/>. Faces with fewer
+/// than 3 or more than 4 vertices produce an
+/// <see cref="ObjParseErrorKind.UnsupportedFaceArity"/> error and the face is skipped.
 /// </summary>
 public static class ObjParser
 {
@@ -243,15 +245,15 @@ public static class ObjParser
         string? currentObject, IReadOnlyList<string> currentGroups,
         string? currentMaterial, int currentSmoothing)
     {
-        if (args.Count != 4)
+        if (args.Count != 3 && args.Count != 4)
         {
             errors.Add(new ObjParseError(line, ObjParseErrorKind.UnsupportedFaceArity,
-                $"Only quads are supported; face has {args.Count} vertices."));
+                $"Only triangles and quads are supported; face has {args.Count} vertices."));
             return;
         }
 
-        var verts = new ObjVertex[4];
-        for (int i = 0; i < 4; i++)
+        var verts = new ObjVertex[args.Count];
+        for (int i = 0; i < args.Count; i++)
         {
             if (!TryParseFaceVertex(
                     args.Array![args.Offset + i],
@@ -266,9 +268,18 @@ public static class ObjParser
             }
         }
 
-        model.Quads.Add(new ObjQuad(
-            verts[0], verts[1], verts[2], verts[3],
-            currentObject, currentGroups, currentMaterial, currentSmoothing));
+        if (args.Count == 3)
+        {
+            model.Triangles.Add(new ObjTriangle(
+                verts[0], verts[1], verts[2],
+                currentObject, currentGroups, currentMaterial, currentSmoothing));
+        }
+        else
+        {
+            model.Quads.Add(new ObjQuad(
+                verts[0], verts[1], verts[2], verts[3],
+                currentObject, currentGroups, currentMaterial, currentSmoothing));
+        }
     }
 
     private static bool TryParseFaceVertex(

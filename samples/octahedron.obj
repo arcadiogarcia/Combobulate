@@ -1,0 +1,33 @@
+# Triangle-only sample for Combobulate. An octahedron (8 triangular faces).
+#
+# Each face is wound so (V1-V0) x (V2-V0) points outward. No vt entries —
+# the renderer uses the per-face fallback colour palette.
+#
+# This file exercises:
+#   * Triangle parsing (model.Triangles).
+#   * ObjGeometry quad-recovery preprocess: pairs of coplanar adjacent
+#     triangles cannot be fused here because the octahedron has no two
+#     triangles in the same plane, so every triangle stays as a triangle
+#     CachedQuad. This is the worst case for the triangle path — eight
+#     SpriteVisuals with eight CompositionGeometricClips.
+#   * Back-face culling and painter sort across triangular faces.
+
+# 6 octahedron vertices: tips on each axis.
+v  1  0  0    # 1  +X
+v -1  0  0    # 2  -X
+v  0  1  0    # 3  +Y
+v  0 -1  0    # 4  -Y
+v  0  0  1    # 5  +Z
+v  0  0 -1    # 6  -Z
+
+# Upper hemisphere (4 triangles meeting at +Y)
+f 5 1 3       # +Z, +X, +Y   normal (+X+Z+Y)/sqrt(3) — outward
+f 1 6 3       # +X, -Z, +Y   outward
+f 6 2 3       # -Z, -X, +Y
+f 2 5 3       # -X, +Z, +Y
+
+# Lower hemisphere (4 triangles meeting at -Y)
+f 1 5 4       # +X, +Z, -Y
+f 6 1 4       # -Z, +X, -Y
+f 2 6 4       # -X, -Z, -Y
+f 5 2 4       # +Z, -X, -Y

@@ -34,6 +34,9 @@
             <Button Content="Load book sample"
                     Click="LoadBook_Click"
                     ToolTipService.ToolTip="Loads samples/book.obj which references book.mtl with cover/pages textures."/>
+            <Button Content="Load tetrahedron"
+                    Click="LoadTetrahedron_Click"
+                    ToolTipService.ToolTip="Loads samples/tetrahedron.obj — 4 triangle faces, the smallest mesh that exercises the triangle clip + 3-point affine brush rendering path."/>
             <Button Content="Reset cube" Click="ResetCube_Click"/>
             <Button Content="Reset rotation" Click="ResetRotation_Click"/>
             <ComboBox x:Name="MaterialModeBox"
@@ -52,8 +55,8 @@
             </ComboBox>
             <ComboBox x:Name="RenderingModeBox"
                       SelectionChanged="RenderingModeBox_SelectionChanged"
-                      ToolTipService.ToolTip="Rendering pipeline. SpritePainter (default): per-frame UI-thread sort. BakedAspectGraph: pre-bake every constant-order interval at setup, drive opacity entirely from a compositor expression — zero per-frame UI work, no GPU/CPU clock drift by construction.">
-                <ComboBoxItem Content="SpritePainter" IsSelected="True"/>
+                      ToolTipService.ToolTip="Rendering pipeline. SpritePainter: per-frame UI-thread sort. BakedAspectGraph (demo default): pre-bake every constant-order interval at setup, drive opacity entirely from a compositor expression — zero per-frame UI work, no GPU/CPU clock drift by construction.">
+                <ComboBoxItem Content="SpritePainter"/>
                 <ComboBoxItem Content="BakedAspectGraph"/>
             </ComboBox>
             <Button x:Name="RebakeButton"
@@ -101,6 +104,18 @@
                           IsOn="False"
                           Toggled="ShowSceneVisualToggle_Toggled"
                           ToolTipService.ToolTip="Show the SceneVisual (z-buffer) reference panel beside the SpriteVisual painter-sort panel. Off by default; the SpriteVisual panel takes the full width when off."/>
+            <ToggleSwitch x:Name="EnablePerspectiveToggle"
+                          OnContent="Perspective"
+                          OffContent="Orthographic"
+                          IsOn="True"
+                          Toggled="EnablePerspectiveToggle_Toggled"
+                          ToolTipService.ToolTip="Apply a perspective projection (M34 = -1/PerspectiveDistance). When OFF the projection is orthographic — useful when validating painter ordering decisions that the orthographic case can reason about cleanly, then re-enabling perspective to confirm the same configuration still sorts correctly."/>
+            <ToggleSwitch x:Name="SubdivideForPainterToggle"
+                          OnContent="Subdivide for painter"
+                          OffContent="No subdivision"
+                          IsOn="False"
+                          Toggled="SubdivideForPainterToggle_Toggled"
+                          ToolTipService.ToolTip="Pre-split mesh faces by every other face's plane so the painter sorter operates on guaranteed-correct fragments — required for non-convex meshes (e.g. book.obj). Combine with BakedAspectGraph to validate the quad-preserving decomposer + coplanar masking keep the per-cell predicate within Composition's ExpressionAnimation string cap."/>
         </StackPanel>
         </StackPanel>
         </ScrollViewer>
@@ -239,6 +254,7 @@
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock Grid.Column="0" Text="Zoom" VerticalAlignment="Center"/>
                 <Slider x:Name="ZoomSlider"
@@ -255,7 +271,14 @@
                         Minimum="0" Maximum="2000"
                         Value="{x:Bind combobulate.PerspectiveDistance, Mode=TwoWay}"
                         StepFrequency="10"
-                        TickFrequency="200" TickPlacement="Outside"/>
+                        TickFrequency="200" TickPlacement="Outside"
+                        ValueChanged="PerspectiveSlider_ValueChanged"/>
+                <TextBlock x:Name="PerspectiveValueText"
+                           Grid.Column="4"
+                           Text="(follows host width)"
+                           VerticalAlignment="Center"
+                           Width="120"
+                           ToolTipService.ToolTip="0 = focal distance is the host control width (legacy default — perspective dip changes with zoom). Drag the slider right of 0 to lock to a fixed focal distance in pixels."/>
             </Grid>
         </StackPanel>
     </Grid>

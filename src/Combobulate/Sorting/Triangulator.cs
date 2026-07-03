@@ -30,9 +30,19 @@ public static class Triangulator
         return result;
     }
 
-    /// <summary>Triangulate a single quad and append the (up to two) triangles to <paramref name="dest"/>.</summary>
+    /// <summary>Triangulate a single quad and append the (up to two) triangles to <paramref name="dest"/>.
+    /// If <paramref name="quad"/> is a triangle face (<see cref="CachedQuad.IsTriangle"/>),
+    /// only the single (V0,V1,V2) triangle is emitted — V3 equals V2 and the
+    /// duplicate would be degenerate.</summary>
     public static void TriangulateInto(CachedQuad quad, int sourceQuadIndex, List<RenderTriangle> dest)
     {
+        if (quad.IsTriangle)
+        {
+            // Triangle face: V3==V2, so the second triangle (V0,V2,V3) is degenerate. Emit only one.
+            TryAdd(dest, quad.V0, quad.V1, quad.V2, quad.Uv0, quad.Uv1, quad.Uv2, sourceQuadIndex);
+            return;
+        }
+
         // Quad winding: V0, V1, V2, V3. Diagonal split V0→V2 produces
         // triangles (V0,V1,V2) and (V0,V2,V3) — both CCW if the quad was
         // CCW. The two triangles share an edge along the diagonal, so the

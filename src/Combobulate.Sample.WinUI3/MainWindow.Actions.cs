@@ -186,6 +186,26 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
   }
 }"),
         new ActionDescriptor(
+            name: "SetSubdivideForPainter",
+            description: "Toggles Combobulate.SubdivideForPainter at runtime. When true, faces are pre-split by MeshDecomposer so the painter sorter operates on guaranteed-correct fragments — required for non-convex meshes (e.g. book.obj). Combine with BakedAspectGraph to validate that the per-cell predicate length still fits inside CompositionExpressions' string cap after the recent quad-preserving decomposer + coplanar masking work.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""required"": [""enabled""],
+  ""properties"": {
+    ""enabled"": { ""type"": ""boolean"" }
+  }
+}"),
+        new ActionDescriptor(
+            name: "SetPerspective",
+            description: "Sets Combobulate.EnablePerspective and/or PerspectiveDistance at runtime, mirroring the on-screen toggle + slider. Use distance=0 to follow the host width (legacy default); set distance to a positive value for a fixed focal distance in pixels (smaller = stronger perspective). Either property may be omitted to keep the current value. Useful for headless tests that need to validate perspective independent of input-injection flakiness on the slider thumb.",
+            parameterSchema: @"{
+  ""type"": ""object"",
+  ""properties"": {
+    ""enabled"": { ""type"": ""boolean"" },
+    ""distance"": { ""type"": ""number"", ""minimum"": 0, ""maximum"": 5000 }
+  }
+}"),
+        new ActionDescriptor(
             name: "SetRenderingMode",
             description: "Switches Combobulate's render path. 'SpritePainter' (default) is the original single-tree path with per-frame UI-thread Remove+InsertAtTop reorder — vulnerable to UI/GPU clock drift, which causes the spin flicker. 'DualTreeAtomicSwap' pre-builds a SECOND sprite tree pre-sorted at yaw_now+Δ and drives its Opacity via an ExpressionAnimation referencing the same SpinYaw scalar that drives the rotation matrix — so the swap is GPU-frame-synchronous with the rotation it pre-sorted for, eliminating the drift-induced flicker by construction.",
             parameterSchema: @"{
@@ -198,6 +218,30 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
         new ActionDescriptor(
             name: "DumpBakedAspectGraph",
             description: "Diagnostic dump of the BakedAspectGraph renderer's current state: cell count, _root.Children leak count, current axis live values, and which children currently have non-zero Opacity. Writes to LocalState/debug-artifacts/baked-aspect-state.txt and returns the same content inline.",
+            parameterSchema: @"{ ""type"": ""object"", ""properties"": {} }"),
+        new ActionDescriptor(
+            name: "DumpSpriteGeometry",
+            description: "Diagnostic dump of the first N sprites' Size, TransformMatrix translation (v0), basis lengths, IsTriangle, IsVisible, Clip, and Brush. Used to diagnose why subdivided triangle fragments render at sub-pixel sizes.",
+            parameterSchema: @"{ ""type"": ""object"", ""properties"": { ""count"": { ""type"": ""integer"", ""minimum"": 1, ""maximum"": 200 } } }"),
+        new ActionDescriptor(
+            name: "ForceTriangleColorBrush",
+            description: "Diagnostic: replaces every triangle sprite's brush with a solid red ColorBrush. Isolates whether triangle sprite/clip rendering itself works (vs. brush math).",
+            parameterSchema: @"{ ""type"": ""object"", ""properties"": {} }"),
+        new ActionDescriptor(
+            name: "ForceTriangleIdentityBrushTransform",
+            description: "Diagnostic: sets every triangle sprite's CompositionSurfaceBrush.TransformMatrix to Identity (no flip/scale). Isolates whether BuildTriangleAffine math is the cause of blank rendering.",
+            parameterSchema: @"{ ""type"": ""object"", ""properties"": {} }"),
+        new ActionDescriptor(
+            name: "ForceTriangleBrushTransform",
+            description: "Diagnostic: sets every triangle sprite's CompositionSurfaceBrush.TransformMatrix to the given 3x2 matrix. Use to test which matrices Composition renders.",
+            parameterSchema: @"{ ""type"": ""object"", ""required"": [""m11"",""m12"",""m21"",""m22"",""m31"",""m32""], ""properties"": { ""m11"": {""type"":""number""},""m12"": {""type"":""number""},""m21"": {""type"":""number""},""m22"": {""type"":""number""},""m31"": {""type"":""number""},""m32"": {""type"":""number""} } }"),
+        new ActionDescriptor(
+            name: "ForceTriangleBrushScale",
+            description: "Diagnostic: sets Scale/Offset/Rotation on triangle CompositionSurfaceBrush (not TransformMatrix). Test if these handle negative scales differently.",
+            parameterSchema: @"{ ""type"": ""object"", ""required"": [""sx"",""sy""], ""properties"": { ""sx"": {""type"":""number""},""sy"": {""type"":""number""},""ox"": {""type"":""number""},""oy"": {""type"":""number""},""rotDeg"": {""type"":""number""} } }"),
+        new ActionDescriptor(
+            name: "ClearTriangleClips",
+            description: "Diagnostic: removes the GeometricClip from every triangle sprite so the full rectangular sprite area renders. Isolates whether the triangle clip is hiding the sprites.",
             parameterSchema: @"{ ""type"": ""object"", ""properties"": {} }"),
     };
 
@@ -238,7 +282,18 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             case "ClearAtomicSwapTest": return RunOnUi(ClearAtomicSwapTest);
             case "RunBspBoundaryEquivalenceTest": return DispatchRunBspBoundaryEquivalenceTestAsync(parametersJson);
             case "SetRenderingMode": return DispatchSetRenderingModeAsync(parametersJson);
+            case "SetSubdivideForPainter": return DispatchSetSubdivideForPainterAsync(parametersJson);
+            case "SetPerspective": return DispatchSetPerspectiveAsync(parametersJson);
             case "DumpBakedAspectGraph": return DispatchDumpBakedAspectGraphAsync();
+            case "DumpSpriteGeometry": return DispatchDumpSpriteGeometryAsync(parametersJson);
+            case "ForceTriangleColorBrush": return DispatchSimpleAsync(() =>
+                $"ForceTriangleColorBrush replaced {(combobulate?.ForceTriangleColorBrush(Microsoft.UI.Colors.Red) ?? 0)} brushes");
+            case "ForceTriangleIdentityBrushTransform": return DispatchSimpleAsync(() =>
+                $"ForceTriangleIdentityBrushTransform modified {(combobulate?.ForceTriangleIdentityBrushTransform() ?? 0)} brushes");
+            case "ForceTriangleBrushTransform": return DispatchForceTriangleBrushTransformAsync(parametersJson);
+            case "ForceTriangleBrushScale": return DispatchForceTriangleBrushScaleAsync(parametersJson);
+            case "ClearTriangleClips": return DispatchSimpleAsync(() =>
+                $"ClearTriangleClips cleared {(combobulate?.ClearTriangleClips() ?? 0)} clips");
             default: return Task.FromResult(ActionResult.Fail("unknown_action", $"No action named '{actionName}'."));
         }
     }
@@ -259,14 +314,14 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
         try { geometry = ObjCache.GetOrLoadFile(path); }
         catch (Exception ex) { return ActionResult.Fail("execution_error", $"Load failed: {ex.Message}"); }
 
-        if (geometry.Model.Quads.Count == 0)
-            return ActionResult.Fail("execution_error", "No quads parsed.");
+        if (geometry.Model.IsEmpty)
+            return ActionResult.Fail("execution_error", "No faces parsed.");
 
         return await RunOnUi(() =>
         {
             combobulate.Source = path;
             var name = Path.GetFileName(path);
-            StatusText.Text = $"Loaded: {name} ({geometry.Quads.Length} quads, cached)";
+            StatusText.Text = $"Loaded: {name} ({geometry.Quads.Length} faces, cached)";
         });
     }
 
@@ -422,6 +477,32 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
         return tcs.Task;
     }
 
+    private Task<ActionResult> DispatchDumpSpriteGeometryAsync(string parametersJson)
+    {
+        int count = 20;
+        try
+        {
+            var p = JObject.Parse(parametersJson ?? "{}");
+            if (p["count"] != null) count = p["count"]!.Value<int>();
+        }
+        catch { }
+        var tcs = new TaskCompletionSource<ActionResult>();
+        var dq = this.DispatcherQueue;
+        if (!dq.TryEnqueue(DispatcherQueuePriority.Normal, () =>
+        {
+            try
+            {
+                var lines = combobulate?.GetSpriteGeometryDump(count) ?? Array.Empty<string>();
+                tcs.SetResult(ActionResult.Ok(lines));
+            }
+            catch (Exception ex) { tcs.SetResult(ActionResult.Fail("execution_error", ex.Message)); }
+        }))
+        {
+            tcs.SetResult(ActionResult.Fail("execution_error", "Failed to enqueue UI work."));
+        }
+        return tcs.Task;
+    }
+
     private Task<ActionResult> DispatchDumpSortDiagnosticsAsync(string parametersJson)
     {
         // No UI-thread marshalling required: SpinDiagnostics is lock-free and
@@ -486,6 +567,7 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
                     $"externalRotation={(ExternalRotationToggle?.IsOn == true)}",
                     $"autoRefresh={(AutoRefreshToggle?.IsOn == true)}",
                     $"perspective={combobulate.EnablePerspective}",
+                    $"perspectiveDistance={combobulate.PerspectiveDistance:F1}",
                     $"source={combobulate.Source ?? "(null)"}",
                     $"cache.visible={string.Join(",", cacheVisible)}",
                     $"cache.order={string.Join(",", cacheOrder)}",
@@ -532,6 +614,46 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             tcs.SetResult(ActionResult.Fail("execution_error", "Failed to enqueue UI work."));
         }
         return tcs.Task;
+    }
+
+    private Task<ActionResult> DispatchSimpleAsync(Func<string> work)
+    {
+        var tcs = new TaskCompletionSource<ActionResult>();
+        var dq = this.DispatcherQueue;
+        if (!dq.TryEnqueue(DispatcherQueuePriority.Normal, () =>
+        {
+            try { tcs.SetResult(ActionResult.Ok(new[] { work() })); }
+            catch (Exception ex) { tcs.SetResult(ActionResult.Fail("execution_error", ex.Message)); }
+        }))
+        {
+            tcs.SetResult(ActionResult.Fail("execution_error", "Failed to enqueue UI work."));
+        }
+        return tcs.Task;
+    }
+
+    private Task<ActionResult> DispatchForceTriangleBrushTransformAsync(string parametersJson)
+    {
+        JObject p;
+        try { p = JObject.Parse(parametersJson ?? "{}"); }
+        catch { return Task.FromResult(ActionResult.Fail("validation_error", "params is not valid JSON.")); }
+        float Get(string k) => (float)(p[k]?.Value<double>() ?? 0.0);
+        var m11 = Get("m11"); var m12 = Get("m12");
+        var m21 = Get("m21"); var m22 = Get("m22");
+        var m31 = Get("m31"); var m32 = Get("m32");
+        return DispatchSimpleAsync(() =>
+            $"ForceTriangleBrushTransform modified {(combobulate?.ForceTriangleBrushTransform(m11, m12, m21, m22, m31, m32) ?? 0)} brushes");
+    }
+
+    private Task<ActionResult> DispatchForceTriangleBrushScaleAsync(string parametersJson)
+    {
+        JObject p;
+        try { p = JObject.Parse(parametersJson ?? "{}"); }
+        catch { return Task.FromResult(ActionResult.Fail("validation_error", "params is not valid JSON.")); }
+        float Get(string k) => (float)(p[k]?.Value<double>() ?? 0.0);
+        var sx = Get("sx"); var sy = Get("sy");
+        var ox = Get("ox"); var oy = Get("oy"); var rotDeg = Get("rotDeg");
+        return DispatchSimpleAsync(() =>
+            $"ForceTriangleBrushScale modified {(combobulate?.ForceTriangleBrushScale(sx, sy, ox, oy, rotDeg) ?? 0)} brushes");
     }
 
     // ---------- Z-sort validation spike ----------
@@ -855,6 +977,59 @@ public sealed partial class MainWindow : zRover.Core.IActionableApp
             return RunOnUi(() =>
             {
                 if (combobulate != null) combobulate.RenderingMode = mode;
+            });
+        }
+        catch (Exception ex)
+        {
+            return Task.FromResult(ActionResult.Fail("execution_error", ex.Message));
+        }
+    }
+
+    private Task<ActionResult> DispatchSetSubdivideForPainterAsync(string parametersJson)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(parametersJson);
+            bool enabled = doc.RootElement.GetProperty("enabled").GetBoolean();
+            return RunOnUi(() =>
+            {
+                if (combobulate != null) combobulate.SubdivideForPainter = enabled;
+            });
+        }
+        catch (Exception ex)
+        {
+            return Task.FromResult(ActionResult.Fail("execution_error", ex.Message));
+        }
+    }
+
+    private Task<ActionResult> DispatchSetPerspectiveAsync(string parametersJson)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(parametersJson);
+            bool? enabled = doc.RootElement.TryGetProperty("enabled", out var enabledEl)
+                ? enabledEl.GetBoolean() : (bool?)null;
+            double? distance = doc.RootElement.TryGetProperty("distance", out var distEl)
+                ? distEl.GetDouble() : (double?)null;
+            return RunOnUi(() =>
+            {
+                if (combobulate == null) return;
+                _suspendUiHandlers = true;
+                try
+                {
+                    if (enabled.HasValue)
+                    {
+                        combobulate.EnablePerspective = enabled.Value;
+                        if (combobulateSceneVisual != null) combobulateSceneVisual.EnablePerspective = enabled.Value;
+                        if (EnablePerspectiveToggle != null) EnablePerspectiveToggle.IsOn = enabled.Value;
+                    }
+                    if (distance.HasValue)
+                    {
+                        combobulate.PerspectiveDistance = distance.Value;
+                        if (PerspectiveSlider != null) PerspectiveSlider.Value = distance.Value;
+                    }
+                }
+                finally { _suspendUiHandlers = false; }
             });
         }
         catch (Exception ex)

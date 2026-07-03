@@ -21,14 +21,23 @@
     <Compile Include="..\..\src\Combobulate\Diagnostics\*.cs" LinkBase="Diagnostics" />
     <Compile Include="..\..\src\Combobulate\Rendering\AspectGraphBake.cs" LinkBase="Rendering" />
     <!-- Caching depends on Windows.UI types via ObjMaterial/ObjTextureSource; we only need
-         CachedQuad + ObjGeometry for the sorter tests. Pull in just what's safe (those two
-         live in ObjGeometry.cs and don't reference Windows.UI). -->
+         CachedQuad + ObjGeometry + QuadRecovery for the sorter tests. Pull in just what's
+         safe (those types live in ObjGeometry.cs / QuadRecovery.cs and don't reference
+         Windows.UI). -->
     <Compile Include="..\..\src\Combobulate\Caching\ObjGeometry.cs" LinkBase="Caching" />
+    <Compile Include="..\..\src\Combobulate\Caching\QuadRecovery.cs" LinkBase="Caching" />
+    <Compile Include="..\..\src\Combobulate\Caching\BrushTransformMath.cs" LinkBase="Caching" />
   </ItemGroup>
 
   <ItemGroup>
     <!-- Real-world model used by the painter-correctness sweep tests. -->
     <None Include="..\..\samples\book.obj" Link="Samples\book.obj">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\samples\octahedron.obj" Link="Samples\octahedron.obj">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\samples\tetrahedron.obj" Link="Samples\tetrahedron.obj">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>

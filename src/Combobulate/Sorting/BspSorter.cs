@@ -112,7 +112,7 @@ public sealed class BspSorter : IFaceSorter
         // the BSP can still flip its front-/back-subtree order at the precise
         // yaw where the camera crosses a partitioning plane, producing visible
         // sort glitches even when the visible set is unchanged.
-        Walk(_root, cameraDir, cameraPosObj, persp, cullMarginCos, visibleBuffer, seen, orderBuffer, ref written);
+        Walk(_root, cameraDir, cameraPosObj, persp, cullMarginCos, visibleBuffer, seen, orderBuffer, ref written, in rotation);
         return written;
     }
 
@@ -125,7 +125,7 @@ public sealed class BspSorter : IFaceSorter
     /// <see cref="Sort"/> for why mixing them produces order glitches at
     /// extreme tilts.
     /// </summary>
-    private static void Walk(Node? node, Vector3 cameraDir, Vector3 cameraPosObj, bool isPerspective, float sortMargin, bool[] visible, bool[] seen, int[] order, ref int written)
+    private static void Walk(Node? node, Vector3 cameraDir, Vector3 cameraPosObj, bool isPerspective, float sortMargin, bool[] visible, bool[] seen, int[] order, ref int written, in Matrix4x4 rotation)
     {
         if (node == null) return;
 
@@ -145,19 +145,69 @@ public sealed class BspSorter : IFaceSorter
             hemi = GeometryPredicates.CameraHemisphere(Vector3.Dot(node.Plane.Normal, cameraDir), sortMargin);
         }
 
+        // ────────────────────────────────────────────────────────────────
+        // Grazing tie-break via subtree centroid Z (transformed by `rotation`).
+        //
+        // When `hemi == 0` the partition plane is nearly perpendicular to the
+        // view (or in the perspective case, the camera point lies essentially
+        // on the plane). Either traversal order is geometrically valid against
+        // the BSP invariants, but ONE of them paints the back triangles after
+        // the front ones — producing a visible "wedge" of the back face
+        // overlapping the front face. The bug reproduces in Deet at pitch=±87°
+        // where the spine partition plane is grazing.
+        //
+        // The runtime BAG predicate compares centroid Z's directly. Aligning
+        // BSP's tie-break to the same metric makes the bake-time sort agree
+        // with the runtime predicate at grazing samples without changing the
+        // non-grazing behaviour or the (face-signs, varying-pair-signs)
+        // signature shape, so cell count stays bounded by the predicate-length
+        // cap. Pick the order that draws the deeper-Z subtree first
+        // (back-to-front). If both subtrees share a single representative
+        // triangle the difference is zero and the default branch is taken.
+        // ────────────────────────────────────────────────────────────────
+        if (hemi == 0 && (node.Front != null || node.Back != null))
+        {
+            float frontZ = SubtreeRepresentativeZ(node.Front, rotation);
+            float backZ  = SubtreeRepresentativeZ(node.Back,  rotation);
+            // We want to render the subtree with the SMALLER Z first (further
+            // from camera under +Z = toward-viewer convention).
+            if (backZ < frontZ - GeometryPredicates.CosineEpsilon) hemi = +1;
+            else if (frontZ < backZ - GeometryPredicates.CosineEpsilon) hemi = -1;
+            // else: subtrees essentially coplanar → fall through to default.
+        }
+
         if (hemi >= 0)
         {
             // Camera on/above front side → render back subtree, then node, then front.
-            Walk(node.Back, cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written);
+            Walk(node.Back, cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written, in rotation);
             EmitBundle(node, visible, seen, order, ref written);
-            Walk(node.Front, cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written);
+            Walk(node.Front, cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written, in rotation);
         }
         else
         {
-            Walk(node.Front, cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written);
+            Walk(node.Front, cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written, in rotation);
             EmitBundle(node, visible, seen, order, ref written);
-            Walk(node.Back,  cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written);
+            Walk(node.Back,  cameraDir, cameraPosObj, isPerspective, sortMargin, visible, seen, order, ref written, in rotation);
         }
+    }
+
+    /// <summary>
+    /// Returns the transformed-Z of a representative triangle centroid in the
+    /// subtree, or float.NaN if the subtree is null/empty. Used as a centroid-Z
+    /// tiebreaker at grazing partition planes (see <see cref="Walk"/>).
+    /// Picks the FIRST triangle in the node's bundle (deterministic and
+    /// independent of camera pose), then recurses into the first non-empty
+    /// child for slightly more representative depth on tall trees.
+    /// </summary>
+    private static float SubtreeRepresentativeZ(Node? node, in Matrix4x4 rotation)
+    {
+        if (node == null) return float.NaN;
+        if (node.Bundle.Count > 0)
+        {
+            var tri = node.Bundle[0];
+            return Vector3.Transform(tri.Centroid, rotation).Z;
+        }
+        return SubtreeRepresentativeZ(node.Front ?? node.Back, in rotation);
     }
 
     private static void EmitBundle(Node node, bool[] visible, bool[] seen, int[] order, ref int written)

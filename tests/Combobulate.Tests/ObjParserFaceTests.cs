@@ -137,7 +137,7 @@ public class ObjParserFaceTests
     }
 
     [Theory]
-    [InlineData("f 1 2 3", 3)]
+    [InlineData("f 1 2", 2)]
     [InlineData("f 1 2 3 4 5", 5)]
     [InlineData("f 1 2 3 4 5 6 7 8", 8)]
     public void NonQuadFaceProducesUnsupportedFaceArityError(string face, int arity)
@@ -146,6 +146,7 @@ public class ObjParserFaceTests
 
         Assert.False(r.Success);
         Assert.Empty(r.Model.Quads);
+        Assert.Empty(r.Model.Triangles);
         var err = Assert.Single(r.Errors);
         Assert.Equal(ObjParseErrorKind.UnsupportedFaceArity, err.Kind);
         Assert.Contains(arity.ToString(), err.Message);
@@ -156,14 +157,14 @@ public class ObjParserFaceTests
     {
         var src = Cube4Verts + """
 
-            f 1 2 3
+            f 1 2 3 4 5
             f 1 2 3 4
             """;
         var r = ObjParser.Parse(src);
 
         Assert.False(r.Success);
         Assert.Single(r.Errors);
-        Assert.Single(r.Model.Quads); // Quad after the bad triangle still parsed.
+        Assert.Single(r.Model.Quads); // Quad after the bad n-gon still parsed.
     }
 
     [Fact]

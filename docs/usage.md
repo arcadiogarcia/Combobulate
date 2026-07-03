@@ -525,18 +525,29 @@ A few things worth knowing:
 - `vt u v [w]` — texture coordinates (used when materials supply textures)
 - `vn x y z` — vertex normals (parsed, but shading uses the per-face
   geometric normal computed from winding)
+- `f a b c` — **triangle** faces (3 indices, 1-based, positive or negative)
 - `f a b c d` — **quad** faces (4 indices, 1-based, positive or negative)
-- `f a/ta b/tb c/tc d/td` and `f a/ta/na …` — quads with texture and/or
-  normal indices
+- `f a/ta b/tb c/tc [d/td]` and `f a/ta/na …` — triangles and quads with
+  texture and/or normal indices
 - `usemtl <name>` — selects the active material for subsequent faces
 - `mtllib <file> [<file>…]` — relative paths resolved against the OBJ
 - `o`, `g`, `s` — recorded on each face but otherwise informational
 - `l`, `p`, `vp`, curves, surfaces, and unknown keywords are ignored
   silently
 
-Faces must be **quads** — triangles and n-gons are reported as parse errors.
-Wind each face so `(V1 - V0) × (V3 - V0)` points outward; that's the
-direction the renderer treats as front-facing for back-face culling.
+Both triangles and quads are first-class face types. Wind each face so
+`(V1 - V0) × (V_last - V0)` points outward (`V_last` is `V2` for triangles,
+`V3` for quads); that's the direction the renderer treats as front-facing
+for back-face culling. Faces with fewer than 3 or more than 4 vertices are
+reported as parse errors and skipped.
+
+Triangulated meshes that originated as quads (a common DCC export pattern)
+are automatically recovered to quads when triangle pairs are coplanar,
+adjacent, share material, and have matching UVs at the shared edge — those
+fused faces hit the existing 1-sprite-per-quad fast path. Triangles that
+can't be paired render via a SpriteVisual with a shared unit-triangle
+`CompositionGeometricClip` and an exact 3-point affine brush transform; see
+[the rendering pipeline doc](rendering-pipeline.md#53-triangle-faces-clip--3-point-affine-brush).
 
 See [`samples/book.obj`](../samples/book.obj) for a worked example.
 

@@ -1,0 +1,35 @@
+# Regular tetrahedron, 4 triangle faces — the simplest possible
+# demonstration of Combobulate's triangle rendering path.
+#
+# Vertices are placed at alternating corners of a unit cube
+# (the classic inscribed-tetrahedron construction):
+#
+#   v1 = ( 1,  1,  1)
+#   v2 = ( 1, -1, -1)
+#   v3 = (-1,  1, -1)
+#   v4 = (-1, -1,  1)
+#
+# Edge length = 2*sqrt(2) ≈ 2.83. Each face is an equilateral triangle.
+#
+# Every face is wound CCW so that (V1-V0) × (V2-V0) points outward (away
+# from the centroid at the origin), satisfying Combobulate's back-face
+# culling convention.
+#
+# No two faces are coplanar, so the quad-recovery preprocess cannot fuse
+# any of them — the geometry ends up as four triangle CachedQuads that
+# all render through the triangle clip + 3-point affine brush path. This
+# is the smallest mesh that exercises that path end-to-end.
+
+v  1  1  1   # 1
+v  1 -1 -1   # 2
+v -1  1 -1   # 3
+v -1 -1  1   # 4
+
+# Face opposite v4
+f 1 2 3
+# Face opposite v3
+f 1 4 2
+# Face opposite v2
+f 1 3 4
+# Face opposite v1
+f 2 4 3

@@ -32,9 +32,13 @@ public sealed partial class MainPage : Page
 
     private void LoadCube()
     {
-        // Resolve from the keyed cache. The first call built the geometry; this just
-        // hands the same ObjModel back to the control.
-        combobulate.Model = ObjCache.TryGet(CubeKey)!.Model;
+        // Resolve via the Source DP (not direct Model assignment) so that subsequent
+        // toggles between this cube and any other Source-driven model always trigger
+        // a fresh OnSourceChanged. Setting Model directly here would leave the Source
+        // DP pointing at whatever was last loaded, and re-assigning that same path
+        // later would be a no-op due to DP value coalescing, silently leaving the
+        // wrong geometry on screen.
+        combobulate.Source = CubeKey;
         StatusText.Text = $"Loaded: built-in cube (cache key '{CubeKey}')";
     }
 
@@ -55,6 +59,30 @@ public sealed partial class MainPage : Page
         catch (Exception ex)
         {
             StatusText.Text = $"Load book failed: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Loads <c>samples\tetrahedron.obj</c> — a 4-triangle regular tetrahedron.
+    /// No two faces are coplanar, so quad recovery cannot fuse any pair; all
+    /// 4 faces render through the triangle clip + 3-point affine brush path.
+    /// Provides an immediate visual smoke test for triangle rendering.
+    /// </summary>
+    private async void LoadTetrahedron_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var uri = new Uri("ms-appx:///Assets/samples/tetrahedron.obj");
+            var file = await StorageFile.GetFileFromApplicationUriAsync(uri);
+            var text = await FileIO.ReadTextAsync(file);
+            var geometry = ObjCache.GetOrAddText(file.Path, text);
+            combobulate.Source = file.Path;
+            StatusText.Text =
+                $"Loaded tetrahedron.obj — {geometry.Quads.Length} triangle faces via triangle clip path.";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Load tetrahedron failed: {ex.Message}";
         }
     }
 
@@ -166,14 +194,14 @@ public sealed partial class MainPage : Page
                 geometry = ObjCache.GetOrAddText(file.Path, text);
             }
 
-            if (geometry.Model.Quads.Count == 0)
+            if (geometry.Model.IsEmpty)
             {
-                StatusText.Text = $"{file.Name}: no quads found";
+                StatusText.Text = $"{file.Name}: no faces found";
                 return;
             }
 
             combobulate.Model = geometry.Model;
-            StatusText.Text = $"Loaded: {file.Name} ({geometry.Quads.Length} quads, cached)";
+            StatusText.Text = $"Loaded: {file.Name} ({geometry.Quads.Length} faces, cached)";
         }
         catch (Exception ex)
         {

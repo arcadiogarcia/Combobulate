@@ -24,6 +24,9 @@
         <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="12">
             <Button Content="Load OBJ…" Click="LoadObjButton_Click"/>
             <Button Content="Load book sample" Click="LoadBook_Click"/>
+            <Button Content="Load tetrahedron"
+                    Click="LoadTetrahedron_Click"
+                    ToolTipService.ToolTip="Loads samples/tetrahedron.obj — 4 triangle faces, the smallest mesh that exercises the triangle clip + 3-point affine brush rendering path."/>
             <Button Content="Reset cube" Click="ResetCube_Click"/>
             <Button Content="Reset rotation" Click="ResetRotation_Click"/>
             <ComboBox x:Name="MaterialModeBox" SelectionChanged="MaterialModeBox_SelectionChanged">

@@ -67,6 +67,20 @@ internal static class PredicateCompiler
         int n = quads.Length;
         BooleanNode? acc = null;
 
+        // Deduplicate identical terms. Subdivision splits each coplanar face
+        // into many sub-quads that all share the SAME normal (and, within a
+        // coplanar group, produce the SAME face-front comparison) and often the
+        // SAME centroid-difference vector for a pair test. Because the predicate
+        // is a pure conjunction, an identical term is idempotent (A && A == A),
+        // so emitting it once is exactly equivalent and dramatically shorter.
+        // Without this, a 52-sub-quad book produces a predicate that overflows
+        // Composition's expression-string length cap and StartAnimation throws
+        // "The expression string is too long" for every cell — leaving the whole
+        // model invisible (only its drop shadow renders). Keying on the quantised
+        // vector + sign collapses the duplicates that subdivision introduces.
+        var seen = new System.Collections.Generic.HashSet<(int kind, long x, long y, long z, int sign)>();
+        static long Quant(float f) => (long)System.MathF.Round(f * 4096f);
+
         // Face-front tests for every face (visible or hidden).
         //
         // Bake-time classification uses GeometryPredicates.IsFrontFacing(normalZ, cullMarginCos)
@@ -81,6 +95,10 @@ internal static class PredicateCompiler
         float negThreshold = -cullMarginCos + PredicateEpsilon;     // hidden:  normalZ < negThreshold
         for (int q = 0; q < n; q++)
         {
+            int fsign = sig.FaceSigns[q] > 0 ? 1 : -1;
+            var fn = quads[q].Normal;
+            if (!seen.Add((0, Quant(fn.X), Quant(fn.Y), Quant(fn.Z), fsign)))
+                continue; // identical face-front comparison already emitted
             var normalZ = EventFunctions.TransformedDirectionZ(bakedMatrix, quads[q].Normal);
             BooleanNode test = sig.FaceSigns[q] > 0
                 ? normalZ > (ScalarNode)posThreshold
@@ -105,6 +123,9 @@ internal static class PredicateCompiler
                 sbyte s = sig.PairSigns[i, j];
                 if (s == 0) continue;
                 var diff = quads[j].Centroid - quads[i].Centroid;
+                int psign = s > 0 ? 1 : -1;
+                if (!seen.Add((1, Quant(diff.X), Quant(diff.Y), Quant(diff.Z), psign)))
+                    continue; // identical pair-order comparison already emitted
                 var diffZ = EventFunctions.TransformedDirectionZ(bakedMatrix, diff);
                 BooleanNode test = s > 0
                     ? diffZ > (ScalarNode)(-PredicateEpsilon)

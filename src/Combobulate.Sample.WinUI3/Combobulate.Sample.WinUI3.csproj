@@ -46,5 +46,6 @@
     <Content Include="..\..\samples\book.mtl" Link="samples\book.mtl" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\samples\cover.png" Link="samples\cover.png" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\samples\pages.png" Link="samples\pages.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\samples\tetrahedron.obj" Link="samples\tetrahedron.obj" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

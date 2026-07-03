@@ -4,6 +4,7 @@ using System.Linq;
 using System.Numerics;
 using Combobulate.Caching;
 using Combobulate.Parsing;
+using Combobulate.Rendering;
 using CompositionExpressions;
 using Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork;
 
@@ -307,6 +308,97 @@ public sealed class Combobulate : Control
             new PropertyMetadata(0.0, (d, _) => ((Combobulate)d).Rebuild()));
 
     /// <summary>
+    /// Whether to pre-split the source mesh into per-fragment painter
+    /// units before sorting. Default <c>false</c>.
+    ///
+    /// <para><b>What it does.</b> Runs every loaded <see cref="ObjGeometry"/>
+    /// through <see cref="global::Combobulate.Sorting.MeshDecomposer"/>,
+    /// which splits faces against every other face's plane so the painter
+    /// sorter operates on a fragment set that is mathematically guaranteed
+    /// to admit a single correct back-to-front ordering for any view
+    /// direction or finite-point camera position. See the
+    /// <see cref="global::Combobulate.Sorting.MeshDecomposer"/> class-level
+    /// remarks for the algorithm and the per-fragment invariant it
+    /// provides.</para>
+    ///
+    /// <para><b>Why off by default — BakedAspectGraph incompatibility.</b>
+    /// Subdivision dramatically grows quad count (e.g. book.obj 12 → 69
+    /// when fully triangulated) which expands each
+    /// <see cref="global::Combobulate.Rendering.PredicateCompiler"/>
+    /// per-cell predicate to O(N + visible² ) signed terms AND'd together.
+    /// The resulting <see cref="global::Microsoft.UI.Composition.ExpressionAnimation"/>
+    /// string exceeds Composition's hard length cap and every cell's
+    /// <c>StartAnimation("Opacity", predicate)</c> throws
+    /// <c>ArgumentException: The expression string is too long.</c> —
+    /// the visual stays blank. Two mitigations are already in place but
+    /// may still be insufficient for the largest meshes:
+    /// <list type="bullet">
+    /// <item>The quad-preserving decomposer
+    /// (<see cref="global::Combobulate.Sorting.MeshDecomposer.DecomposeForPainterOrder"/>)
+    /// preserves quad topology where possible — book.obj subdivides to
+    /// 33 quads, not 69 triangles.</item>
+    /// <item><see cref="ObjGeometry.CoplanarGroups"/> identifies fragments
+    /// that lie on a shared plane; the bake (<c>SignatureBake</c>) skips
+    /// pair-sign tests between them since coplanar fragments never
+    /// occlude each other. This trims the predicate by the count of
+    /// same-plane pairs (often 10–20% of all pairs for typical meshes).
+    /// </item>
+    /// </list>
+    /// Even small subdivided meshes (a cube with 12 quads, 2 cells) can
+    /// still hit the cap. SpritePainter and DualTreeAtomicSwap render
+    /// modes don't use baked predicates and are safe to combine with
+    /// subdivision. Future work: split per-cell predicates across chained
+    /// CompositionPropertySet scalars (pre-compute per-face <c>M·n_q</c>
+    /// and per-pair <c>M·(c_j − c_i)</c> in a shared PropertySet so cell
+    /// predicates become tiny scalar references). Tracked in plan.md.</para>
+    ///
+    /// <para><b>Rendering of fragment triangles.</b> Subdivision produces
+    /// triangle <see cref="CachedQuad"/>s (V3 == V2). The renderer routes
+    /// these through a per-sprite
+    /// <see cref="global::Microsoft.UI.Composition.CompositionGeometricClip"/>
+    /// referencing the shared unit-triangle path from
+    /// <see cref="global::Combobulate.Rendering.TriangleClipFactory"/>, so
+    /// the otherwise-rectangular sprite is masked to the triangle's
+    /// (V0, V1, V2) area. Slivers whose
+    /// <c>Cross(xAxis, yAxis)</c> underflows fall back to a unit Z basis
+    /// inside the renderer rather than producing NaN transforms.</para>
+    ///
+    /// <para><b>Triggers.</b> A live change triggers <see cref="Rebuild"/>.
+    /// The subdivided and non-subdivided geometry variants are cached
+    /// separately by <see cref="ObjCache.ForModelSubdivided"/> and
+    /// <see cref="ObjCache.ForModel"/>, so toggling this property back
+    /// and forth is cheap after the first build.</para>
+    /// </summary>
+    public bool SubdivideForPainter
+    {
+        get => (bool)GetValue(SubdivideForPainterProperty);
+        set => SetValue(SubdivideForPainterProperty, value);
+    }
+
+    public static readonly DependencyProperty SubdivideForPainterProperty =
+        DependencyProperty.Register(
+            nameof(SubdivideForPainter),
+            typeof(bool),
+            typeof(Combobulate),
+            // Default OFF because BakedAspectGraph predicates explode past
+            // Composition's ExpressionAnimation length cap when quad count
+            // grows (see SubdivideForPainter XML doc for the empirical
+            // measurement). Callers using SpritePainter or
+            // DualTreeAtomicSwap may safely opt-in for painter-correct
+            // non-convex rendering.
+            new PropertyMetadata(false, (d, _) => ((Combobulate)d).OnSubdivideForPainterChanged()));
+
+    private void OnSubdivideForPainterChanged()
+    {
+        // Switching variants is a topology change — the per-quad sprite
+        // pool, sorter buffers, and bindings all become stale. A full
+        // Rebuild is the safe path; ObjCache holds both variants so the
+        // new lookup is a single weak-table hit.
+        _geometry = null;
+        Rebuild();
+    }
+
+    /// <summary>
     /// Selects the per-frame composition strategy. Default
     /// <see cref="global::Combobulate.Rendering.RenderingMode.SpritePainter"/>
     /// is the original single-tree path that runs cull and sort on the UI
@@ -554,11 +646,19 @@ public sealed class Combobulate : Control
     private void UpdateRootTransform()
     {
         if (_root == null || _host == null) return;
-        // BakedAspectGraph owns _root.TransformMatrix while active; don't
-        // overwrite it with a static slider-derived matrix.
+        // BakedAspectGraph owns _root.TransformMatrix while active. Forward
+        // perspective / EnablePerspective changes by re-installing the
+        // baked TransformMatrix animation (ApplyBakedTransformAnimation
+        // detects the perspective delta via its idempotency guard) and
+        // letting UpdateBakeIfNeeded rebake the painter ordering when the
+        // sort camera distance changes. Without this forwarding the
+        // PerspectiveDistance / EnablePerspective DPs would be silently
+        // dropped in BAG mode.
         if (RenderingMode == global::Combobulate.Rendering.RenderingMode.BakedAspectGraph
             && _transformNode is not null)
         {
+            ApplyBakedTransformAnimation();
+            UpdateBakeIfNeeded();
             return;
         }
 
@@ -682,7 +782,7 @@ public sealed class Combobulate : Control
             return;
         }
 
-        var geometry = ObjCache.ForModel(model);
+        var geometry = ResolveGeometryForModel(model);
         _geometry = geometry;
         var pack = ResolveMaterialPack(model);
         var changedQuads = FindMaterialSlotQuads(geometry, updates.Keys);
@@ -748,6 +848,21 @@ public sealed class Combobulate : Control
         return pack;
     }
 
+    /// <summary>
+    /// Single source of truth for resolving an <see cref="ObjModel"/> to
+    /// the <see cref="ObjGeometry"/> this control should render. Honours
+    /// <see cref="SubdivideForPainter"/> by routing to the subdivided cache
+    /// variant when enabled. Both variants are cached separately by
+    /// <see cref="ObjCache"/> on the ObjModel weak table, so live toggles
+    /// of the DP cost one cache hit after the first build.
+    /// </summary>
+    private ObjGeometry ResolveGeometryForModel(ObjModel model)
+    {
+        return SubdivideForPainter
+            ? ObjCache.ForModelSubdivided(model)
+            : ObjCache.ForModel(model);
+    }
+
     private ResolvedQuadMaterials ResolveCurrentMaterials(ObjGeometry geometry, ObjMaterialPack? pack)
     {
         if (!_materialSlotsActive)
@@ -808,7 +923,14 @@ public sealed class Combobulate : Control
         ObjGeometry geometry;
         try
         {
-            geometry = ObjCache.Resolve(newValue!);
+            // ObjCache.Resolve returns the base (non-subdivided) variant —
+            // the keyed/file caches don't carry a subdivide flag. Run the
+            // result through the same subdivide selector the Model-driven
+            // path uses so XAML <c>Source="..."</c> behaves identically.
+            var baseGeometry = ObjCache.Resolve(newValue!);
+            geometry = SubdivideForPainter
+                ? ObjCache.ForModelSubdivided(baseGeometry.Model)
+                : baseGeometry;
         }
         catch (Exception)
         {
@@ -910,6 +1032,21 @@ public sealed class Combobulate : Control
     private Matrix4x4Node? _bakedInstalledTransform;
     private float _bakedInstalledW;
     private float _bakedInstalledH;
+    // Snapshot of (EnablePerspective, effective focal distance) for the
+    // currently-installed BAG TransformMatrix animation. Tracked alongside
+    // the host-size snapshot so that PerspectiveDistance / EnablePerspective
+    // DP changes can re-install the perspective matrix in ApplyBakedTransformAnimation
+    // (without these the cached _bakedInstalledTransform == _transformNode check
+    // would silently keep the old projection).
+    private bool _bakedInstalledEnablePerspective;
+    private float _bakedInstalledFocalDistance;
+    // Snapshot of the perspective-derived sort camera distance and the
+    // EnablePerspective flag used by the last bake. Included in the
+    // needRebake comparison so changing PerspectiveDistance / EnablePerspective
+    // at runtime invalidates the painter ordering (the sort uses these to
+    // pick the eye ray for the front-face cull and depth comparator).
+    private float _bakedCameraDistanceCache = float.NaN;
+    private bool _bakedEnablePerspectiveCache;
     // Secondary-input change detection: snapshots of the transform matrix
     // sampled at known primary-axis probe points captured during the last
     // bake. Compared against fresh probes (throttled) on each Update tick.
@@ -1111,11 +1248,27 @@ public sealed class Combobulate : Control
         var h = (float)_host.ActualHeight;
         if (w <= 0 || h <= 0) return;
 
+        // Resolve the effective focal distance the same way the legacy
+        // SpritePainter path does: user PerspectiveDistance when > 0,
+        // otherwise the host width (legacy default). When EnablePerspective
+        // is false the focal distance is irrelevant — record 0 so the
+        // idempotency guard treats every distance as equivalent.
+        bool enablePersp = EnablePerspective;
+        float focal = 0f;
+        if (enablePersp)
+        {
+            float pd = (float)PerspectiveDistance;
+            focal = pd > 0f ? pd : (w > 0 ? w : 1f);
+        }
+
         // Idempotent guard: only (re)install when transform identity OR
-        // host size changed. Reinstalling a TransformMatrix animation per
-        // frame leaks composition objects and crashes the app.
+        // host size OR perspective parameters changed. Reinstalling a
+        // TransformMatrix animation per frame leaks composition objects
+        // and crashes the app.
         if (ReferenceEquals(_bakedInstalledTransform, _transformNode)
-            && _bakedInstalledW == w && _bakedInstalledH == h)
+            && _bakedInstalledW == w && _bakedInstalledH == h
+            && _bakedInstalledEnablePerspective == enablePersp
+            && _bakedInstalledFocalDistance == focal)
         {
             return;
         }
@@ -1123,17 +1276,36 @@ public sealed class Combobulate : Control
         _root.Size = new Vector2(w, h);
         _root.StopAnimation("TransformMatrix");
 
-        // Compose toOrigin * userRotation * fromOrigin so the user-supplied
-        // transformNode is interpreted as a rotation around the host center,
-        // matching the convention used elsewhere in the renderer.
+        // Compose toOrigin * userRotation [ * perspective ] * fromOrigin so the
+        // user-supplied transformNode is interpreted as a rotation around the
+        // host center, matching the convention used by the legacy SpritePainter
+        // UpdateRootTransform path. Perspective is applied AFTER rotation (in
+        // model-to-screen order) so that rotated-into-depth quads exhibit the
+        // expected foreshortening; the focal-distance formula M34 = -1/d
+        // mirrors the SpritePainter perspective matrix exactly.
         var toOriginM = Matrix4x4.CreateTranslation(-w / 2f, -h / 2f, 0);
         var fromOriginM = Matrix4x4.CreateTranslation(w / 2f, h / 2f, 0);
-        Matrix4x4Node centered = (Matrix4x4Node)toOriginM * _transformNode * (Matrix4x4Node)fromOriginM;
+        Matrix4x4Node centered;
+        if (enablePersp)
+        {
+            var perspM = new Matrix4x4(
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, -1f / focal,
+                0, 0, 0, 1);
+            centered = (Matrix4x4Node)toOriginM * _transformNode * (Matrix4x4Node)perspM * (Matrix4x4Node)fromOriginM;
+        }
+        else
+        {
+            centered = (Matrix4x4Node)toOriginM * _transformNode * (Matrix4x4Node)fromOriginM;
+        }
 
         _root.StartAnimation("TransformMatrix", centered);
         _bakedInstalledTransform = _transformNode;
         _bakedInstalledW = w;
         _bakedInstalledH = h;
+        _bakedInstalledEnablePerspective = enablePersp;
+        _bakedInstalledFocalDistance = focal;
     }
 
     private void OnRenderingModeChanged()
@@ -1387,6 +1559,176 @@ public sealed class Combobulate : Control
     }
 
     /// <summary>
+    /// Diagnostic: replaces every triangle sprite's brush with a solid color
+    /// brush. Quad sprites are unchanged. Use to determine whether triangle
+    /// sprites/clips render at all (isolates brush issues from clip/sprite
+    /// transform issues). Returns the count replaced.
+    /// </summary>
+    public int ForceTriangleColorBrush(Windows.UI.Color color)
+    {
+        if (_spritePool == null || _spritePoolGeometry == null || _compositor == null) return 0;
+        int n = Math.Min(_spritePool.Length, _spritePoolGeometry.Quads.Length);
+        int replaced = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (!_spritePoolGeometry.Quads[i].IsTriangle) continue;
+            var s = _spritePool[i];
+            if (s == null) continue;
+            s.Brush = _compositor.CreateColorBrush(color);
+            replaced++;
+        }
+        return replaced;
+    }
+
+    /// <summary>
+    /// Diagnostic: forces every triangle sprite's CompositionSurfaceBrush to
+    /// have TransformMatrix=Identity. Use to determine whether the
+    /// BuildTriangleAffine math is the cause of blank rendering (vs. broken
+    /// surface assignment or sprite/clip setup). Returns count modified.
+    /// </summary>
+    public int ForceTriangleIdentityBrushTransform()
+    {
+        if (_spritePool == null || _spritePoolGeometry == null) return 0;
+        int n = Math.Min(_spritePool.Length, _spritePoolGeometry.Quads.Length);
+        int modified = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (!_spritePoolGeometry.Quads[i].IsTriangle) continue;
+            var s = _spritePool[i];
+            if (s?.Brush is Microsoft.UI.Composition.CompositionSurfaceBrush sb)
+            {
+                sb.TransformMatrix = System.Numerics.Matrix3x2.Identity;
+                modified++;
+            }
+        }
+        return modified;
+    }
+
+    /// <summary>
+    /// Diagnostic: forces every triangle sprite's CompositionSurfaceBrush to
+    /// have a specific TransformMatrix. Use to test which kinds of matrices
+    /// Composition will render vs. silently drop.
+    /// </summary>
+    public int ForceTriangleBrushTransform(float m11, float m12, float m21, float m22, float m31, float m32)
+    {
+        if (_spritePool == null || _spritePoolGeometry == null) return 0;
+        int n = Math.Min(_spritePool.Length, _spritePoolGeometry.Quads.Length);
+        int modified = 0;
+        var mat = new System.Numerics.Matrix3x2(m11, m12, m21, m22, m31, m32);
+        for (int i = 0; i < n; i++)
+        {
+            if (!_spritePoolGeometry.Quads[i].IsTriangle) continue;
+            var s = _spritePool[i];
+            if (s?.Brush is Microsoft.UI.Composition.CompositionSurfaceBrush sb)
+            {
+                sb.TransformMatrix = mat;
+                modified++;
+            }
+        }
+        return modified;
+    }
+
+    /// <summary>
+    /// Diagnostic: sets every triangle sprite's CompositionSurfaceBrush.Scale,
+    /// Offset, RotationAngleInDegrees. Tests whether these accept negative
+    /// scales differently from TransformMatrix.
+    /// </summary>
+    public int ForceTriangleBrushScale(float sx, float sy, float ox, float oy, float rotDeg)
+    {
+        if (_spritePool == null || _spritePoolGeometry == null) return 0;
+        int n = Math.Min(_spritePool.Length, _spritePoolGeometry.Quads.Length);
+        int modified = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (!_spritePoolGeometry.Quads[i].IsTriangle) continue;
+            var s = _spritePool[i];
+            if (s?.Brush is Microsoft.UI.Composition.CompositionSurfaceBrush sb)
+            {
+                sb.TransformMatrix = System.Numerics.Matrix3x2.Identity;
+                sb.Scale = new System.Numerics.Vector2(sx, sy);
+                sb.Offset = new System.Numerics.Vector2(ox, oy);
+                sb.RotationAngleInDegrees = rotDeg;
+                sb.CenterPoint = new System.Numerics.Vector2(0.5f, 0.5f);
+                modified++;
+            }
+        }
+        return modified;
+    }
+
+    /// <summary>
+    /// Diagnostic: removes the GeometricClip from every triangle sprite so
+    /// the full rectangular sprite renders. Use to determine whether the
+    /// TriangleClip is the cause of blank rendering. Returns count cleared.
+    /// </summary>
+    public int ClearTriangleClips()
+    {
+        if (_spritePool == null || _spritePoolGeometry == null) return 0;
+        int n = Math.Min(_spritePool.Length, _spritePoolGeometry.Quads.Length);
+        int cleared = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (!_spritePoolGeometry.Quads[i].IsTriangle) continue;
+            var s = _spritePool[i];
+            if (s?.Clip != null) { s.Clip = null; cleared++; }
+        }
+        return cleared;
+    }
+
+    /// <summary>
+    /// Diagnostic: returns per-sprite human-readable dump of Size, TransformMatrix
+    /// translation (v0), basis lengths, and IsTriangle flag for the first
+    /// <paramref name="count"/> sprites in the pool. Used to diagnose why subdivided
+    /// triangle fragments don't render even though IsVisible=true.
+    /// </summary>
+    public string[] GetSpriteGeometryDump(int count)
+    {
+        if (_spritePool == null) return Array.Empty<string>();
+        var geo = _spritePoolGeometry;
+        var n = Math.Min(count, _spritePool.Length);
+        var lines = new string[n];
+        for (int i = 0; i < n; i++)
+        {
+            var s = _spritePool[i];
+            if (s == null) { lines[i] = $"#{i}: null"; continue; }
+            var tm = s.TransformMatrix;
+            var size = s.Size;
+            var v0 = new System.Numerics.Vector3(tm.M41, tm.M42, tm.M43);
+            var nx = new System.Numerics.Vector3(tm.M11, tm.M12, tm.M13);
+            var ny = new System.Numerics.Vector3(tm.M21, tm.M22, tm.M23);
+            var nz = new System.Numerics.Vector3(tm.M31, tm.M32, tm.M33);
+            string triFlag = "?";
+            string uvInfo = "";
+            if (geo != null && i < geo.Quads.Length)
+            {
+                var q = geo.Quads[i];
+                triFlag = q.IsTriangle ? "T" : "Q";
+                if (q.IsTriangle)
+                {
+                    uvInfo = $" uv0=({q.Uv0.X:F3},{q.Uv0.Y:F3}) uv1=({q.Uv1.X:F3},{q.Uv1.Y:F3}) uv2=({q.Uv2.X:F3},{q.Uv2.Y:F3})";
+                }
+                else
+                {
+                    uvInfo = $" uv0=({q.Uv0.X:F3},{q.Uv0.Y:F3}) uv1=({q.Uv1.X:F3},{q.Uv1.Y:F3}) uv2=({q.Uv2.X:F3},{q.Uv2.Y:F3}) uv3=({q.Uv3.X:F3},{q.Uv3.Y:F3})";
+                }
+            }
+            string clip = s.Clip == null ? "no-clip" : "clipped";
+            string brush = s.Brush == null ? "no-brush" : s.Brush.GetType().Name;
+            string surfaceInfo = "";
+            if (s.Brush is Microsoft.UI.Composition.CompositionSurfaceBrush sb)
+            {
+                surfaceInfo = sb.Surface == null
+                    ? " surface=NULL"
+                    : $" surface={sb.Surface.GetType().Name}";
+                var bt = sb.TransformMatrix;
+                float det = bt.M11 * bt.M22 - bt.M12 * bt.M21;
+                surfaceInfo += $" bxform=[{bt.M11:F3},{bt.M12:F3},{bt.M21:F3},{bt.M22:F3},{bt.M31:F2},{bt.M32:F2}] det={det:F4}";
+            }
+            lines[i] = $"#{i} {triFlag} vis={s.IsVisible} size=({size.X:F1},{size.Y:F1}) v0=({v0.X:F1},{v0.Y:F1},{v0.Z:F1}){uvInfo} {clip} {brush}{surfaceInfo}";
+        }
+        return lines;
+    }
+
+    /// <summary>
     /// Diagnostic: produces a human-readable report of the BakedAspectGraph
     /// renderer's state — cell count, _root.Children leak count, current
     /// axis live values, and which cell(s) the compositor currently has at
@@ -1502,7 +1844,7 @@ public sealed class Combobulate : Control
 
         ApplyBakedTransformAnimation();
 
-        var geometry = ObjCache.ForModel(model);
+        var geometry = ResolveGeometryForModel(model);
         var pack = ResolveMaterialPack(model);
         var materialToken = CurrentMaterialToken(pack);
         var scale = (float)ModelScale;
@@ -1560,6 +1902,21 @@ public sealed class Combobulate : Control
         }
         var bakedResolved = ResolveCurrentMaterials(geometry, pack);
         var cullMarginCosNow = ComputeCullMarginCos();
+        // BAG bake MUST use cameraDistance=0 (orthographic) regardless of
+        // EnablePerspective. Why: the runtime predicate in PredicateCompiler
+        // tests `TransformedDirectionZ(M, normal) > threshold` — an orthographic
+        // face-front test. If the bake classifies faces using the perspective
+        // IsFrontFacingPerspective(viewNormal, viewCentroid, cameraZ) test,
+        // boundary faces visible under perspective but back-facing under
+        // orthographic disagree with the runtime predicate, so their signature
+        // never matches and the entire book renders invisible (only the drop
+        // shadow remains because it has its own transform). The visual
+        // perspective applied to _root.TransformMatrix in
+        // ApplyBakedTransformAnimation is independent of this — perspective
+        // foreshortening still renders correctly; only the painter sort
+        // remains orthographic. Combine with SubdivideForPainter for the
+        // non-convex-overhang painter-order correctness at extreme tilts.
+        var cameraDistanceNow = 0f;
         _baked.RequestBake(
             transformNode: _transformNode!,
             axes: _transformAxes!,
@@ -1569,7 +1926,7 @@ public sealed class Combobulate : Control
             hostW: hostW,
             hostH: hostH,
             cullMarginCos: cullMarginCosNow,
-            cameraDistance: ComputeSortCameraDistance(scale),
+            cameraDistance: cameraDistanceNow,
             sortAlgorithm: SortAlgorithm);
         _bakedGeometry = geometry;
         _bakedScale = scale;
@@ -1577,6 +1934,8 @@ public sealed class Combobulate : Control
         _bakedHostH = hostH;
         _bakedAlgorithm = SortAlgorithm;
         _bakedCullMarginCosCache = cullMarginCosNow;
+        _bakedCameraDistanceCache = cameraDistanceNow;
+        _bakedEnablePerspectiveCache = EnablePerspective;
         _bakedMaterialsToken = materialToken;
         CaptureSecondaryProbe();
     }
@@ -1603,13 +1962,14 @@ public sealed class Combobulate : Control
             return;
         }
 
-        // Resolve cached geometry. ObjCache.ForModel is a ConditionalWeakTable lookup —
-        // O(1) amortised — so reusing the same ObjModel across many controls and across
-        // every rotation tick costs nothing beyond the first build.
+        // Resolve cached geometry. ObjCache.ForModel(/Subdivided) is a
+        // ConditionalWeakTable lookup — O(1) amortised — so reusing the
+        // same ObjModel across many controls and across every rotation
+        // tick costs nothing beyond the first build.
         var geometry = _geometry;
         if (geometry == null || !ReferenceEquals(geometry.Model, model))
         {
-            geometry = ObjCache.ForModel(model);
+            geometry = ResolveGeometryForModel(model);
             _geometry = geometry;
         }
 
@@ -1688,7 +2048,7 @@ public sealed class Combobulate : Control
 
             if (isNew || transformChanged)
             {
-                var cq = cachedQuads[i];
+                var cq = cachedQuads[i].WithCanonicalAxisAlignedUv();
                 var v0 = cq.V0 * scale + origin;
                 var v1 = cq.V1 * scale + origin;
                 var v3 = cq.V3 * scale + origin;
@@ -1705,17 +2065,53 @@ public sealed class Combobulate : Control
                 sprite!.Size = new Vector2(lenX > 0f ? lenX : 1f, lenY > 0f ? lenY : 1f);
                 var nx = lenX > 0f ? xAxis / lenX : Vector3.UnitX;
                 var ny = lenY > 0f ? yAxis / lenY : Vector3.UnitY;
-                var zAxis = Vector3.Normalize(Vector3.Cross(xAxis, yAxis));
+                // Guard against degenerate cross (sliver triangles where xAxis ∥ yAxis):
+                // Vector3.Normalize divides by Length() which underflows to 0 for
+                // very thin slivers, producing NaN basis vectors that break the
+                // entire TransformMatrix. Fall back to a unit Z so the (already
+                // sub-pixel) sprite renders harmlessly off-axis instead of NaN.
+                var crossVec = Vector3.Cross(xAxis, yAxis);
+                var crossLen = crossVec.Length();
+                var zAxis = crossLen > 1e-6f ? crossVec / crossLen : Vector3.UnitZ;
                 sprite.TransformMatrix = new Matrix4x4(
                     nx.X, nx.Y, nx.Z, 0,
                     ny.X, ny.Y, ny.Z, 0,
                     zAxis.X, zAxis.Y, zAxis.Z, 0,
                     v0.X, v0.Y, v0.Z, 1);
+                // Triangle fragments (V3==V2) render their (V0,V1,V2) area as a
+                // right-triangle inscribed in the rectangular sprite: the renderer
+                // sets xAxis=V1-V0, yAxis=V2-V0 so the sprite spans (0..lenX, 0..lenY)
+                // in local space and the triangle's three corners land at (0,0),
+                // (lenX,0), (0,lenY). A GeometricClip referencing the shared
+                // unit-triangle path (scaled by Matrix3x2.CreateScale(lenX,lenY))
+                // masks the other half of the rectangle. Quads (V3!=V2) keep
+                // sprite.Clip == null and render the full parallelogram.
+                if (cq.IsTriangle && lenX > 0f && lenY > 0f)
+                {
+                    sprite.Clip = TriangleClipFactory.CreateTriangleClip(_compositor, lenX, lenY);
+                }
+                else if (sprite.Clip != null)
+                {
+                    sprite.Clip = null;
+                }
             }
 
             if ((isNew || packChanged) && resolved != null)
             {
                 sprite!.Brush = resolved.Bindings[i].Brush;
+            }
+
+            // CompositionBrush.TransformMatrix translations are in sprite
+            // pixels, not normalised UV — so the matrix must be rebuilt
+            // every time the sprite is created or resized. Without this
+            // call, sub-pixel translations leave the sampled rectangle
+            // anchored at (0,0) and any negative-diagonal UV mapping
+            // (typical for subdivided triangles) samples off-surface.
+            if ((isNew || transformChanged) && resolved != null)
+            {
+                var binding = resolved.Bindings[i];
+                MaterialResolver.UpdateBrushTransformForSprite(
+                    binding.Brush, cachedQuads[i].WithCanonicalAxisAlignedUv(), binding.Material, sprite!.Size);
             }
         }
 

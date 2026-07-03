@@ -504,8 +504,20 @@ public sealed class CombobulateSceneVisual : Control
     private void OnModelChanged()
     {
         _geometry = null;
+
+        // Mirror Combobulate.OnModelChanged: when Model is set directly (bypassing the
+        // Source DP), clear the Source DP so a later assignment to the SAME path still
+        // triggers a reload. Without this, DP value coalescing turns the reload into a
+        // silent no-op.
+        if (!_settingModelFromSource && GetValue(SourceProperty) != null)
+        {
+            ClearValue(SourceProperty);
+        }
+
         RebuildMesh();
     }
+
+    private bool _settingModelFromSource;
 
     private void OnSourceChanged(string? newValue)
     {
@@ -531,7 +543,15 @@ public sealed class CombobulateSceneVisual : Control
         _geometry = geometry;
         if (!ReferenceEquals(Model, geometry.Model))
         {
-            Model = geometry.Model;
+            _settingModelFromSource = true;
+            try
+            {
+                Model = geometry.Model;
+            }
+            finally
+            {
+                _settingModelFromSource = false;
+            }
             _geometry = geometry;
         }
         else

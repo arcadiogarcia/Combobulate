@@ -255,6 +255,47 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
     /// </summary>
     private const int MaterialiseChunkSize = 32;
 
+    /// <summary>
+    /// Conservative anti-seam outset, in host pixels, applied to every quad
+    /// sprite on all four sides. Adjacent sub-quads are independent
+    /// SpriteVisuals; where they abut, each anti-aliases its own shared edge
+    /// to ~50% coverage so the composited union is only ~75% opaque and the
+    /// background bleeds through as a hairline seam. Growing each sprite
+    /// outward by this many pixels makes neighbours overlap so the union is
+    /// fully opaque. The brush UV crop is expanded by the same fraction (see
+    /// MaterialiseChunk) so interior texels stay exactly registered.
+    ///
+    /// Overridable per-bake via the file <c>C:\Users\Public\combobulate_outset.txt</c>
+    /// (diagnostic sweep knob, read fresh each bake so it survives the packaged-app
+    /// environment-block cache); falls back to the default below when the file is
+    /// absent or unparseable. The value actually used is echoed to
+    /// <c>combobulate_outset_used.txt</c> next to it for test verification.
+    /// </summary>
+    private const float EdgeOutsetPxDefault = 3.0f;
+
+    private static float EdgeOutsetPx
+    {
+        get
+        {
+            float v = EdgeOutsetPxDefault;
+            try
+            {
+                var p = @"C:\Users\Public\combobulate_outset.txt";
+                if (System.IO.File.Exists(p))
+                {
+                    var s = System.IO.File.ReadAllText(p).Trim();
+                    if (float.TryParse(s, System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out var parsed) && parsed >= 0f)
+                        v = parsed;
+                }
+                System.IO.File.WriteAllText(@"C:\Users\Public\combobulate_outset_used.txt",
+                    v.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            catch { }
+            return v;
+        }
+    }
+
     private void Materialise(
         ComputedBake computed,
         ObjGeometry geometry,
@@ -370,8 +411,27 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             _lastBakeGeometry = geometry;
             int started = 0;
             string? firstError = null;
+            int minLen = int.MaxValue, maxLen = 0;
+            long sumLen = 0;
+            string? firstFailExpr = null;
             for (int i = 0; i < newTrees.Length; i++)
             {
+                // Measure the expression's serialized length so we know whether
+                // BAG's per-cell predicate fits Composition's hard cap (the
+                // "expression string is too long" ArgumentException). For
+                // subdivided high-quad geometry the predicate exceeds the cap
+                // and StartAnimation throws for every cell; the model stays
+                // blank because every cell's Opacity stays at the initial 0.
+                int exprLen = 0;
+                string? exprText = null;
+                try { exprText = newOpacityExprs[i]?.ToString(); exprLen = exprText?.Length ?? 0; }
+                catch { }
+                if (exprLen > 0)
+                {
+                    if (exprLen < minLen) minLen = exprLen;
+                    if (exprLen > maxLen) maxLen = exprLen;
+                    sumLen += exprLen;
+                }
                 try
                 {
                     newTrees[i].StartAnimation("Opacity", newOpacityExprs[i]);
@@ -379,9 +439,10 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    if (firstError == null) firstError = $"cell {i}: {ex.GetType().Name}: {ex.Message}";
+                    if (firstError == null) { firstError = $"cell {i}: {ex.GetType().Name}: {ex.Message} [exprLen={exprLen}]"; firstFailExpr = exprText; }
                 }
             }
+            int avgLen = newTrees.Length > 0 ? (int)(sumLen / newTrees.Length) : 0;
             _bakeCts?.Dispose();
             _bakeCts = null;
 
@@ -395,6 +456,8 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
                 var path = System.IO.Path.Combine(dir, "baked-aspect-state.txt");
                 System.IO.File.WriteAllText(path,
                     $"[{DateTime.Now:HH:mm:ss.fff}] post-bake snapshot — animations started: {started}/{newTrees.Length}; firstError={firstError ?? "none"}\n"
+                    + $"  predicate expr lengths: min={minLen} max={maxLen} avg={avgLen}\n"
+                    + (firstFailExpr != null ? $"  failing expr (cell 0 head, 500 chars): {firstFailExpr.Substring(0, Math.Min(500, firstFailExpr.Length))}\n" : "")
                     + GetDiagnosticReport(axes, null));
             }
             catch { }
@@ -421,10 +484,11 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
         var origin = new Vector3(hostW / 2f, hostH / 2f, 0);
         var quads = geometry.Quads;
         var sprites = new SpriteVisual[quads.Length];
+        float outsetPx = EdgeOutsetPx;   // snapshot once per bake (env-overridable)
         for (int q = 0; q < quads.Length; q++)
         {
             var sprite = _compositor.CreateSpriteVisual();
-            var cq = quads[q];
+            var cq = quads[q].WithCanonicalAxisAlignedUv();
             var v0 = cq.V0 * scale + origin;
             var v1 = cq.V1 * scale + origin;
             var v3 = cq.V3 * scale + origin;
@@ -444,16 +508,87 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             // correct number of sampling tiles for the brush.
             var lenX = xAxis.Length();
             var lenY = yAxis.Length();
-            sprite.Size = new Vector2(lenX > 0f ? lenX : 1f, lenY > 0f ? lenY : 1f);
             var nx = lenX > 0f ? xAxis / lenX : Vector3.UnitX;
             var ny = lenY > 0f ? yAxis / lenY : Vector3.UnitY;
-            var zAxis = Vector3.Normalize(Vector3.Cross(xAxis, yAxis));
+
+            // ── Anti-seam conservative outset ────────────────────────────────
+            // Grow every quad sprite by EdgeOutsetPx on all four sides so
+            // neighbouring sub-quads OVERLAP instead of meeting at a shared
+            // anti-aliased edge (two abutting AA edges only sum to ~75%
+            // coverage, letting the background bleed through as a hairline
+            // seam — dominant at oblique cover/spine folds). The UV crop is
+            // expanded by the SAME fraction so interior texels stay exactly
+            // registered and the overlap samples the neighbour's continuous
+            // texels (same-face → invisible) or edge-clamps (cross-face → a
+            // ~1px overhang, far better than a background gap). Triangles keep
+            // exact geometry: their GeometricClip path is sized to lenX/lenY
+            // and would need matching inflation, and the book has none.
+            Vector2 euv0 = cq.Uv0, euv1 = cq.Uv1, euv2 = cq.Uv2, euv3 = cq.Uv3;
+            if (!cq.IsTriangle && lenX > 0.5f && lenY > 0.5f)
+            {
+                // Apply the outset to EVERY quad, including the thin (3-6px)
+                // face-boundary strips that form the cover/spine and
+                // cover/pages FOLDS — the earlier `lenX > outsetPx` guard
+                // skipped exactly those strips, so the dominant fold seams
+                // never got bridged (and a larger pad skipped even more).
+                float fu = outsetPx / lenX;   // UV fraction of one pad along U
+                float fv = outsetPx / lenY;   // UV fraction of one pad along V
+                var duX = cq.Uv1 - cq.Uv0;        // U-axis UV delta across lenX
+                var duY = cq.Uv3 - cq.Uv0;        // V-axis UV delta across lenY
+                euv0 = cq.Uv0 - fu * duX - fv * duY;
+                euv1 = cq.Uv1 + fu * duX - fv * duY;
+                euv3 = cq.Uv3 - fu * duX + fv * duY;
+                euv2 = cq.Uv2 + fu * duX + fv * duY;
+                // Clamp the expanded crop to the face's [0,1] surface domain so
+                // the padded geometry never samples OFF the whole-face surface
+                // (which returns transparent → a background fringe worse than
+                // the seam). Interior sub-quad pads stay inside [0,1] and are
+                // unaffected; boundary-strip pads clamp to the face edge texel
+                // (book colour), extending it a couple of px across the fold.
+                euv0 = Vector2.Clamp(euv0, Vector2.Zero, Vector2.One);
+                euv1 = Vector2.Clamp(euv1, Vector2.Zero, Vector2.One);
+                euv2 = Vector2.Clamp(euv2, Vector2.Zero, Vector2.One);
+                euv3 = Vector2.Clamp(euv3, Vector2.Zero, Vector2.One);
+                v0 = v0 - outsetPx * nx - outsetPx * ny;
+                lenX += 2f * outsetPx;
+                lenY += 2f * outsetPx;
+            }
+
+            sprite.Size = new Vector2(lenX > 0f ? lenX : 1f, lenY > 0f ? lenY : 1f);
+            // Guard against degenerate cross (sliver triangles where xAxis ∥ yAxis):
+            // Vector3.Normalize divides by Length() which underflows to 0 for
+            // very thin slivers, producing NaN basis vectors that break the
+            // entire TransformMatrix. Fall back to a unit Z so the (already
+            // sub-pixel) sprite renders harmlessly off-axis instead of NaN.
+            var crossVec = Vector3.Cross(xAxis, yAxis);
+            var crossLen = crossVec.Length();
+            var zAxis = crossLen > 1e-6f ? crossVec / crossLen : Vector3.UnitZ;
             sprite.TransformMatrix = new Matrix4x4(
                 nx.X, nx.Y, nx.Z, 0,
                 ny.X, ny.Y, ny.Z, 0,
                 zAxis.X, zAxis.Y, zAxis.Z, 0,
                 v0.X, v0.Y, v0.Z, 1);
+            // Triangle fragments (V3==V2) render their (V0,V1,V2) area as a
+            // right-triangle inscribed in the rectangular sprite: xAxis=V1-V0,
+            // yAxis=V2-V0 → sprite spans (0..lenX, 0..lenY) in local space and
+            // the triangle's three corners land at (0,0), (lenX,0), (0,lenY).
+            // A GeometricClip referencing the shared unit-triangle path (scaled
+            // by Matrix3x2.CreateScale(lenX,lenY)) masks the other half of the
+            // rectangle. Quads keep sprite.Clip == null. See TriangleClipFactory.
+            if (cq.IsTriangle && lenX > 0f && lenY > 0f)
+            {
+                sprite.Clip = TriangleClipFactory.CreateTriangleClip(_compositor, lenX, lenY);
+            }
             sprite.Brush = bindings.Bindings[q].Brush;
+            // CompositionBrush.TransformMatrix translations are in sprite
+            // pixels: rebuild the matrix now that sprite.Size is known so
+            // negative-diagonal UV layouts (typical for subdivided
+            // triangles) sample within [0, spriteSize] instead of off-
+            // surface. Pass the outset-EXPANDED UVs so the padded sprite's
+            // interior stays registered. See BrushTransformMath / MaterialResolver.
+            MaterialResolver.UpdateBrushTransformForSprite(
+                bindings.Bindings[q].Brush, euv0, euv1, euv2, euv3, cq.IsTriangle,
+                bindings.Bindings[q].Material, sprite.Size);
             sprite.IsVisible = visibility[q];
             sprites[q] = sprite;
         }
@@ -652,16 +787,39 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             string liveKey = keyB.ToString();
 
             sb.AppendLine($"  liveKey = {liveKey}");
+            // The bake encodes pair bits as '0' when the pair is INVARIANT across
+            // all sampled poses (PredicateCompiler skips those at runtime — they
+            // contribute no constraint). Hamming distance must skip those bake-'0'
+            // positions, otherwise it counts hundreds of invariant pairs as
+            // "mismatches" and the closest-sig diagnostic becomes meaningless.
             int matchIdx = -1;
-            int bestHamming = int.MaxValue;
+            int bestEffective = int.MaxValue;
             int bestIdx = -1;
+            int bestFaceMismatch = -1;
+            int bestPairMismatch = -1;
             for (int s = 0; s < _lastBakeSignatures.Length; s++)
             {
                 var bk = _lastBakeSignatures[s].Key;
-                if (bk == liveKey) { matchIdx = s; break; }
-                int h = 0;
-                for (int c = 0; c < bk.Length && c < liveKey.Length; c++) if (bk[c] != liveKey[c]) h++;
-                if (h < bestHamming) { bestHamming = h; bestIdx = s; }
+                int faceMismatch = 0;
+                int pairMismatch = 0;
+                int pipe = bk.IndexOf('|');
+                if (pipe < 0) continue;
+                for (int c = 0; c < pipe && c < liveKey.Length; c++)
+                    if (bk[c] != liveKey[c]) faceMismatch++;
+                for (int c = pipe + 1; c < bk.Length && c < liveKey.Length; c++)
+                {
+                    if (bk[c] == '0') continue;
+                    if (bk[c] != liveKey[c]) pairMismatch++;
+                }
+                int effective = faceMismatch + pairMismatch;
+                if (faceMismatch == 0 && pairMismatch == 0) { matchIdx = s; break; }
+                if (effective < bestEffective)
+                {
+                    bestEffective = effective;
+                    bestIdx = s;
+                    bestFaceMismatch = faceMismatch;
+                    bestPairMismatch = pairMismatch;
+                }
             }
             if (matchIdx >= 0)
             {
@@ -670,21 +828,54 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             }
             else
             {
-                sb.AppendLine($"  liveKey MATCHES NONE — closest sig[{bestIdx}] hamming={bestHamming}: {_lastBakeSignatures[bestIdx].Key}");
+                sb.AppendLine($"  liveKey MATCHES NONE — closest sig[{bestIdx}] faceMismatch={bestFaceMismatch} pairMismatch={bestPairMismatch} (effective={bestEffective}): {_lastBakeSignatures[bestIdx].Key}");
                 // Diff the two keys to show which events disagree.
                 var ck = _lastBakeSignatures[bestIdx].Key;
                 int diffStart = -1;
                 for (int c = 0; c < liveKey.Length && c < ck.Length; c++)
                 {
-                    if (liveKey[c] != ck[c])
+                    if (liveKey[c] != ck[c] && ck[c] != '0')
                     {
                         if (diffStart < 0) diffStart = c;
                     }
                 }
-                if (diffStart >= 0) sb.AppendLine($"  first diff at column {diffStart}");
+                if (diffStart >= 0) sb.AppendLine($"  first effective diff at column {diffStart}");
             }
+            // Per-sig predicate-fire summary: count sigs whose face bits match
+            // AND whose varying-pair bits all match the live pose. That's what
+            // the runtime ExpressionAnimation predicate effectively requires.
+            int faceOnlyMatch = 0;
+            int fullPredicateMatch = 0;
+            var matches = new System.Collections.Generic.List<int>();
+            for (int s = 0; s < _lastBakeSignatures.Length; s++)
+            {
+                var bk = _lastBakeSignatures[s].Key;
+                int pipe = bk.IndexOf('|');
+                if (pipe < 0) continue;
+                bool faceMatch = true;
+                for (int c = 0; c < pipe && c < liveKey.Length; c++)
+                    if (bk[c] != liveKey[c]) { faceMatch = false; break; }
+                if (!faceMatch) continue;
+                faceOnlyMatch++;
+                bool varyingMatch = true;
+                for (int c = pipe + 1; c < bk.Length && c < liveKey.Length; c++)
+                {
+                    if (bk[c] == '0') continue;
+                    if (bk[c] != liveKey[c]) { varyingMatch = false; break; }
+                }
+                if (varyingMatch) { fullPredicateMatch++; matches.Add(s); }
+            }
+            sb.AppendLine($"  sigs with matching face bits: {faceOnlyMatch}; with matching face+varying-pair bits: {fullPredicateMatch} (these should be active)");
+            if (matches.Count > 0)
+                sb.AppendLine($"  expected-active sig indices: {string.Join(",", matches)}");
         }
         sb.AppendLine($"  --- _parent.Children scalar Opacity values ---");
+        sb.AppendLine($"  NOTE: ContainerVisual.Opacity returns the LAST SET value (CPU mirror),");
+        sb.AppendLine($"        NOT the live GPU-animated value. When an ExpressionAnimation drives");
+        sb.AppendLine($"        Opacity, this mirror stays at the initial value (0) even when the");
+        sb.AppendLine($"        compositor is rendering the cell at Opacity=1. So 'total Opacity > 0' here");
+        sb.AppendLine($"        will almost always read 0 in BAG mode — that does NOT mean nothing renders.");
+        sb.AppendLine($"        Use 'expected-active sig indices' above plus a visual capture to confirm.");
         int idx = 0;
         int nonZero = 0;
         foreach (var child in _parent.Children)
@@ -695,12 +886,12 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
                 if (op > 0.0001f)
                 {
                     nonZero++;
-                    sb.AppendLine($"    child[{idx}] Opacity={op:F4} children={cv.Children.Count}");
+                    sb.AppendLine($"    child[{idx}] CPU-mirror Opacity={op:F4} children={cv.Children.Count}");
                 }
             }
             idx++;
         }
-        sb.AppendLine($"  total children with Opacity > 0: {nonZero}");
+        sb.AppendLine($"  total children with CPU-mirror Opacity > 0: {nonZero} (see NOTE above)");
         return sb.ToString();
     }
 

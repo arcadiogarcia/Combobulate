@@ -150,6 +150,17 @@ internal static class SignatureBake
 
         var pairFirstSign = new sbyte[n, n];
         var pairVaries = new bool[n, n];
+        // Tracks pairs where the BSP sorter's painter order and the centroid-Z
+        // ordering (the criterion the RUNTIME predicate uses, see PredicateCompiler)
+        // genuinely disagree at some sample — i.e. the sign differs AND the
+        // centroid-Z magnitude is outside the predicate's epsilon deadzone. The
+        // runtime predicate can only reproduce centroid-Z ordering, so it can
+        // never satisfy a signature whose pair sign came from a conflicting BSP
+        // order. Such pairs are dropped from the predicate below (treated as
+        // invariant) so that every reachable pose matches a baked signature; the
+        // pair's actual draw order still comes from the BSP Order, so painter
+        // correctness for genuinely-overlapping fragments is preserved.
+        var pairBspCentroidConflict = new bool[n, n];
 
         var orderBuf = new int[n];
         var visBuf = new bool[n];
@@ -181,6 +192,22 @@ internal static class SignatureBake
                         pairSigns[j, i] = (sbyte)-s;
                         if (pairFirstSign[i, j] == 0) pairFirstSign[i, j] = s;
                         else if (pairFirstSign[i, j] != s) pairVaries[i, j] = true;
+
+                        // Detect a genuine BSP-vs-centroid-Z ordering conflict for
+                        // this pair at this sample. The runtime predicate orders the
+                        // pair by the sign of centroid-Z (c_j - c_i); if that sign
+                        // is definite (outside the epsilon deadzone) yet opposes the
+                        // BSP draw order 's', the runtime can never satisfy this
+                        // signature's pair bit — mark the pair as conflicting so it
+                        // is excluded from the predicate.
+                        float centroidDiffZ = EventFunctions.EvalDirectionZ(
+                            M, quads[j].Centroid - quads[i].Centroid);
+                        if (MathF.Abs(centroidDiffZ) > PredicateCompiler.PredicateEpsilon)
+                        {
+                            sbyte centroidSign = centroidDiffZ > 0f ? (sbyte)+1 : (sbyte)-1;
+                            if (centroidSign != s)
+                                pairBspCentroidConflict[i, j] = true;
+                        }
                     }
                 }
 
@@ -272,6 +299,40 @@ internal static class SignatureBake
         }
 
         // Reduction: dedupe by (visibility, varying-pair-signs).
+        //
+        // Coplanar masking: two fragments lying on the same plane (within
+        // the decomposer's coplanarity thresholds) can never occlude each
+        // other from any view angle — at every rotation the camera sees
+        // them as the same depth, so per-pair order is irrelevant for
+        // pixel correctness. Force such pairs to "invariant" (key '0',
+        // no runtime test, no entry in runtimePairs) regardless of what
+        // the sorter happened to emit in either direction. This shrinks
+        // the bake's per-cell predicate length linearly in the number of
+        // co-plane pairs, which is critical for the BAG runtime to fit
+        // inside CompositionExpressions' ExpressionAnimation string cap
+        // on subdivided meshes (book.obj subdivided into 33 fragments
+        // has ~60 same-plane pairs out of 528 total — a ~12% reduction
+        // that often takes a borderline-too-long predicate under the cap).
+        var coplanarGroups = geometry.CoplanarGroups;
+        if (coplanarGroups != null && coplanarGroups.Length == n)
+        {
+            for (int i = 0; i < n; i++)
+                for (int j = i + 1; j < n; j++)
+                    if (coplanarGroups[i] == coplanarGroups[j])
+                        pairVaries[i, j] = false;
+        }
+
+        // Drop pairs where the BSP order conflicts with the centroid-Z order the
+        // runtime predicate uses. Leaving these in the predicate makes the
+        // affected signatures unreachable at runtime (the compositor computes a
+        // centroid-Z sign that no baked BSP-derived signature contains), which
+        // rendered the book blank at the offending oblique angles. The pair's
+        // draw order is still carried by the signature's BSP Order.
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++)
+                if (pairBspCentroidConflict[i, j])
+                    pairVaries[i, j] = false;
+
         var sigDict = new Dictionary<string, Signature>();
         for (int r = 0; r < rawPerSample.Count; r++)
         {
