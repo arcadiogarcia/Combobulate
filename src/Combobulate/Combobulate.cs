@@ -460,11 +460,20 @@ public sealed class Combobulate : Control
 
         // Re-layout when the rasterization scale changes (e.g. the window moves
         // to a monitor with a different display scaling), so the DIP→composition
-        // mapping stays correct.
+        // mapping stays correct. Track the root we subscribe to so OnUnloaded can
+        // detach even if XamlRoot has already been cleared by then (XamlRoot
+        // outlives an unloaded control, so a dangling handler would leak this
+        // instance across load/unload cycles).
+        if (_subscribedXamlRoot != null && !ReferenceEquals(_subscribedXamlRoot, XamlRoot))
+        {
+            _subscribedXamlRoot.Changed -= OnXamlRootChanged;
+            _subscribedXamlRoot = null;
+        }
         if (XamlRoot != null)
         {
             XamlRoot.Changed -= OnXamlRootChanged;
             XamlRoot.Changed += OnXamlRootChanged;
+            _subscribedXamlRoot = XamlRoot;
         }
 
         // If a Source set in XAML failed to resolve during construction (e.g. the
@@ -480,6 +489,7 @@ public sealed class Combobulate : Control
     }
 
     private double _lastRasterScale;
+    private XamlRoot? _subscribedXamlRoot;
     private void OnXamlRootChanged(XamlRoot sender, XamlRootChangedEventArgs args)
     {
         if (sender.RasterizationScale != _lastRasterScale)
@@ -492,6 +502,11 @@ public sealed class Combobulate : Control
 
     private void OnUnloaded(object sender, RoutedEventArgs e)
     {
+        if (_subscribedXamlRoot != null)
+        {
+            _subscribedXamlRoot.Changed -= OnXamlRootChanged;
+            _subscribedXamlRoot = null;
+        }
         DisableAutoRefresh();
         ClearSpritePool();
         if (_host != null)
