@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 
@@ -45,6 +46,13 @@ internal static class QuadRecovery
     /// epsilon = 1e-7), tightening to a strict coplanarity test. Set loosely
     /// at 1e-4 to absorb float quantisation across exporters.</summary>
     public const float CoplanarCosineEpsilon = 1e-4f;
+
+    /// <summary>Relative tolerance (as a fraction of the longer spanning edge)
+    /// for the parallelogram test in <see cref="TryFuse"/>. A recovered quad is
+    /// only accepted when its fourth corner V2 lies within this fraction of the
+    /// ideal parallelogram corner V1 + V3 - V0, because the quad sprite path
+    /// renders quads as parallelograms and ignores the stored V2.</summary>
+    public const float ParallelogramEpsilon = 1e-3f;
 
     /// <summary>
     /// Recover quads from <paramref name="triangles"/>. Returns the list of
@@ -224,6 +232,23 @@ internal static class QuadRecovery
         // Convexity check: walk the four corners, ensure all interior cross
         // products have the same sign as the face normal.
         if (!IsConvexCcw(v0, v1, v2, v3, quadNormal)) return false;
+
+        // Parallelogram check: the quad sprite fast-path renders a quad as a
+        // parallelogram spanned by V0, the edge V0->V1 (xAxis) and the edge
+        // V0->V3 (yAxis); it never references V2 and implicitly assumes
+        // V2 == V1 + V3 - V0. Fusing a *non*-parallelogram convex quad (e.g. a
+        // pair of fan triangles from an n-gon, which is a trapezoid/kite, not a
+        // parallelogram) would therefore render the wrong silhouette — the true
+        // V2 corner is dropped, leaving a background gap where the quad should
+        // be and an overhang on the opposite side. Only fuse when the recovered
+        // quad is a genuine parallelogram; otherwise leave the two triangles
+        // un-fused so they render exactly via the per-triangle clip path.
+        var expectedV2 = v1 + v3 - v0;
+        float edgeScale = MathF.Max(
+            MathF.Max((v1 - v0).Length(), (v3 - v0).Length()),
+            1e-6f);
+        if ((v2 - expectedV2).Length() > ParallelogramEpsilon * edgeScale)
+            return false;
 
         var centroid = (v0 + v1 + v2 + v3) * 0.25f;
 

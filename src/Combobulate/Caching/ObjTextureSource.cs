@@ -13,7 +13,9 @@ using Microsoft.UI.Composition;
 using Microsoft.UI.Xaml.Media;
 #else
 using Windows.UI.Composition;
+#if !COMBOBULATE_NO_XAML
 using Windows.UI.Xaml.Media;
+#endif
 #endif
 
 namespace Combobulate.Caching;
@@ -189,6 +191,25 @@ public abstract class ObjTextureSource
         return new ExternalSurfaceSource(surface);
     }
 
+    /// <summary>
+    /// Opt-in switch that forces file:// URIs through the OS-managed
+    /// <see cref="LoadedImageSurface"/> decode path instead of the default
+    /// Win2D <see cref="CompositionDrawingSurface"/> path.
+    ///
+    /// <para>
+    /// The Win2D path is the default because <see cref="LoadedImageSurface"/>
+    /// silently stops firing <c>LoadCompleted</c> after ~30-40 surfaces per
+    /// process (see <see cref="LoadAsCompositionSurfaceAsync"/>). However, the
+    /// Win2D <see cref="CompositionDrawingSurface"/> path can intermittently
+    /// trigger a Direct2D "Objects used together must be created from the same
+    /// factory instance" fail-fast at composition-commit time under repeated
+    /// surface churn. Apps that create only a small, bounded number of surfaces
+    /// (well under the LoadedImageSurface ceiling) can set this to <c>true</c>
+    /// to take the stable OS-managed path and avoid that fail-fast entirely.
+    /// </para>
+    /// </summary>
+    public static bool PreferLoadedImageSurface { get; set; }
+
 #if WINAPPSDK
     /// <summary>
     /// One <see cref="CompositionGraphicsDevice"/> per Compositor. Created
@@ -258,6 +279,10 @@ public abstract class ObjTextureSource
         /// </summary>
         private static readonly System.Threading.SemaphoreSlim _decodeGate = new(4, 4);
 
+#if COMBOBULATE_NO_XAML
+        internal override Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
+            => throw new NotSupportedException("Texture loading is not available in the XAML-free build.");
+#else
         internal override async Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
         {
             // Diagnostic path: a host app (typically a #if DEBUG hook) can take
@@ -287,12 +312,13 @@ public abstract class ObjTextureSource
             // explains why we can't keep using LoadedImageSurface here. Non-file
             // URIs (ms-appx://, http(s)://, etc.) still go through
             // LoadedImageSurface because Win2D can't load those directly.
-            if (targetUri.IsFile)
+            if (targetUri.IsFile && !PreferLoadedImageSurface)
                 return await LoadAsCompositionSurfaceAsync(compositor, targetUri, _desiredMaxSize, log).ConfigureAwait(true);
 #endif
 
             return await LoadFromLoadedImageSurfaceAsync(targetUri, _desiredMaxSize, log).ConfigureAwait(true);
         }
+#endif
 
 #if WINAPPSDK
         internal override async Task<bool> TryDecodeIntoAsync(Compositor compositor, CompositionDrawingSurface target)
@@ -413,6 +439,7 @@ public abstract class ObjTextureSource
         /// target. Always releases the gate, including on decode failure or
         /// exception, so a single bad image can't permanently hold a slot.
         /// </summary>
+#if !COMBOBULATE_NO_XAML
         private static async Task<ICompositionSurface> LoadFromLoadedImageSurfaceAsync(Uri uri, Size desiredMaxSize, Action<string>? log)
         {
             await _decodeGate.WaitAsync().ConfigureAwait(true);
@@ -429,6 +456,7 @@ public abstract class ObjTextureSource
                 _decodeGate.Release();
             }
         }
+#endif
 
 #if WINAPPSDK
         /// <summary>
@@ -548,6 +576,7 @@ public abstract class ObjTextureSource
         /// bind time and never repaint when the surface's pixels arrive,
         /// leaving the rendered face as the lighting gradient only (no diffuse).
         /// </summary>
+#if !COMBOBULATE_NO_XAML
         private static Task AwaitLoadAsync(LoadedImageSurface lis, Uri uri, Action<string>? log)
         {
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -560,6 +589,7 @@ public abstract class ObjTextureSource
             lis.LoadCompleted += Handler;
             return tcs.Task;
         }
+#endif
     }
 
     private sealed class StreamSource : ObjTextureSource
@@ -574,9 +604,13 @@ public abstract class ObjTextureSource
         public override string CacheKey => "stream:" + _key;
         internal override Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
         {
+#if COMBOBULATE_NO_XAML
+            throw new NotSupportedException("Texture loading is not available in the XAML-free build.");
+#else
             var stream = _factory();
             var surface = LoadedImageSurface.StartLoadFromStream(stream);
             return Task.FromResult<ICompositionSurface>(surface);
+#endif
         }
         public override void Update(SoftwareBitmap bitmap)
         {
@@ -599,9 +633,13 @@ public abstract class ObjTextureSource
         public override string CacheKey => _key;
         internal override Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
         {
+#if COMBOBULATE_NO_XAML
+            throw new NotSupportedException("Texture loading is not available in the XAML-free build.");
+#else
             var stream = BytesToStream(_pngBytes);
             var surface = LoadedImageSurface.StartLoadFromStream(stream);
             return Task.FromResult<ICompositionSurface>(surface);
+#endif
         }
         public override void Update(SoftwareBitmap bitmap)
         {

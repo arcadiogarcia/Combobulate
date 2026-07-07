@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>Combobulate</RootNamespace>
+    <AssemblyName>Combobulate.SystemComp</AssemblyName>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Platforms>AnyCPU;x86;x64;ARM64</Platforms>
+    <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
+    <DefineConstants>$(DefineConstants);COMBOBULATE_NO_XAML</DefineConstants>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- System-composition (.NET 5+) flavor of the CompositionExpressions DSL:
+         the typed AST bound to the SYSTEM Windows.UI.Composition surface with no
+         WindowsAppSDK dependency. This is what unblocks the BakedAspectGraph
+         rendering mode in the XAML-free build (arcadiogarcia/Combobulate#7 root
+         cause fix). Same public namespaces (CompositionExpressions /
+         ...ExpressionsFork) as the lifted arcadiog.CompositionExpressions used by
+         the WinAppSdk build; only the backing composition surface + assembly name
+         differ, so Combobulate.cs consumes it unchanged. -->
+    <PackageReference Include="arcadiog.CompositionExpressions.SystemComp" Version="0.2.0" />
+    <PackageReference Include="PolySharp" Version="1.14.1">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- CombobulateSceneVisual.cs is a XAML-bound diagnostic/sample renderer
+         (Windows.UI.Xaml + Composition.Scenes); it has nothing to do with the
+         DSL and stays excluded from the XAML-free build. Everything else,
+         including the full BakedAspectGraph DSL path, now compiles here. -->
+    <Compile Include="..\Combobulate\**\*.cs"
+             Exclude="..\Combobulate\obj\**;..\Combobulate\bin\**;..\Combobulate\Properties\**;..\Combobulate\CombobulateSceneVisual.cs"
+             LinkBase="" />
+  </ItemGroup>
+</Project>

@@ -18,10 +18,12 @@ using Microsoft.UI.Xaml.Media;
 #else
 using Windows.UI;
 using Windows.UI.Composition;
+#if !COMBOBULATE_NO_XAML
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
 using Windows.UI.Xaml.Hosting;
 using Windows.UI.Xaml.Media;
+#endif
 #endif
 
 namespace Combobulate;
@@ -42,13 +44,30 @@ namespace Combobulate;
 /// be required.
 /// </para>
 /// </summary>
+#if COMBOBULATE_NO_XAML
+public sealed class Combobulate : DependencyObjectBase
+#else
 public sealed class Combobulate : Control
+#endif
 {
     private const string PartHost = "PART_Host";
 
+#if !COMBOBULATE_NO_XAML
     private FrameworkElement? _host;
+#endif
     private Compositor? _compositor;
     private ContainerVisual? _root;
+
+#if COMBOBULATE_NO_XAML
+    private float _hostWidthPx, _hostHeightPx, _rasterScale = 1f;
+    private float HostWidth => _hostWidthPx;
+    private float HostHeight => _hostHeightPx;
+    private bool HasHost => true;
+#else
+    private float HostWidth => (float)(_host?.ActualWidth ?? 0);
+    private float HostHeight => (float)(_host?.ActualHeight ?? 0);
+    private bool HasHost => _host != null;
+#endif
 
     /// <summary>
     /// The root <see cref="ContainerVisual"/> that hosts all rendered
@@ -63,10 +82,12 @@ public sealed class Combobulate : Control
 
     public Combobulate()
     {
+#if !COMBOBULATE_NO_XAML
         this.DefaultStyleKey = typeof(Combobulate);
         Loaded += OnLoaded;
         Unloaded += OnUnloaded;
         SizeChanged += OnSizeChanged;
+#endif
     }
 
     #region Dependency Properties
@@ -425,6 +446,7 @@ public sealed class Combobulate : Control
 
     #endregion
 
+#if !COMBOBULATE_NO_XAML
     protected override void OnApplyTemplate()
     {
         base.OnApplyTemplate();
@@ -435,6 +457,16 @@ public sealed class Combobulate : Control
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         TryAttachVisuals();
+
+        // Re-layout when the rasterization scale changes (e.g. the window moves
+        // to a monitor with a different display scaling), so the DIP→composition
+        // mapping stays correct.
+        if (XamlRoot != null)
+        {
+            XamlRoot.Changed -= OnXamlRootChanged;
+            XamlRoot.Changed += OnXamlRootChanged;
+        }
+
         // If a Source set in XAML failed to resolve during construction (e.g. the
         // app registered the keyed cache entry from code-behind AFTER InitializeComponent
         // returned), retry now that we are loaded and any code-behind initialisation has
@@ -444,6 +476,17 @@ public sealed class Combobulate : Control
             var key = _pendingSource;
             _pendingSource = null;
             OnSourceChanged(key);
+        }
+    }
+
+    private double _lastRasterScale;
+    private void OnXamlRootChanged(XamlRoot sender, XamlRootChangedEventArgs args)
+    {
+        if (sender.RasterizationScale != _lastRasterScale)
+        {
+            _lastRasterScale = sender.RasterizationScale;
+            UpdateRootTransform();
+            Rebuild();
         }
     }
 
@@ -474,6 +517,51 @@ public sealed class Combobulate : Control
         UpdateRootTransform();
         Rebuild();
     }
+#endif
+
+#if COMBOBULATE_NO_XAML
+    /// <summary>Bind to a system/lifted compositor. Creates the root container.
+    /// After calling, the host must parent <see cref="RootVisual"/> into its target.</summary>
+    public void BindHost(Compositor compositor)
+    {
+        _compositor = compositor;
+        if (_root == null) _root = _compositor.CreateContainerVisual();
+        UpdateRootTransform();
+        Rebuild();
+    }
+
+    /// <summary>Provide the host surface size (device pixels) and rasterization scale.</summary>
+    public void SetHostMetrics(float widthPx, float heightPx, float rasterScale)
+    {
+        _hostWidthPx = widthPx; _hostHeightPx = heightPx;
+        _rasterScale = rasterScale > 0 ? rasterScale : 1f;
+        UpdateRootTransform();
+        Rebuild();
+    }
+
+    /// <summary>Drive one auto-refresh frame (cull/sort) — call from a host timer/clock.</summary>
+    public void Tick(TimeSpan renderingTime)
+    {
+        var samplerT = _autoRefreshSamplerWithTime;
+        var sampler = _autoRefreshSampler;
+        if (samplerT == null && sampler == null) return;
+        try
+        {
+            Vector3 rotation = samplerT != null ? samplerT(renderingTime) : sampler!();
+            RebuildForExternalRotation(rotation);
+        }
+        catch { }
+    }
+
+    /// <summary>Tear down composition resources.</summary>
+    public void Unbind()
+    {
+        DisableAutoRefresh();
+        ClearSpritePool();
+        _root?.Dispose();
+        _root = null;
+    }
+#endif
 
     private ExpressionAnimation? _externalRotationExpression;
     private ExpressionAnimation? _externalRotationAnimation;
@@ -562,7 +650,7 @@ public sealed class Combobulate : Control
 
     private void TryStartExternalRotationAnimation()
     {
-        if (_root == null || _compositor == null || _host == null) return;
+        if (_root == null || _compositor == null || !HasHost) return;
         if (_externalRotationExpression == null) return;
         // BakedAspectGraph owns _root.TransformMatrix when SetTransformAnimation
         // has been wired up. Skip installing the legacy external-rotation
@@ -575,8 +663,8 @@ public sealed class Combobulate : Control
             return;
         }
 
-        var w = (float)_host.ActualWidth;
-        var h = (float)_host.ActualHeight;
+        var w = (float)HostWidth;
+        var h = (float)HostHeight;
         // Even with a degenerate size we still install the animation \u2014 the
         // expression references this.Target.Size, so it will re-evaluate
         // once the host gets a real layout pass and we update _root.Size.
@@ -643,9 +731,19 @@ public sealed class Combobulate : Control
         _root.StartAnimation("TransformMatrix", _externalRotationAnimation);
     }
 
+    private float RasterScale()
+    {
+#if COMBOBULATE_NO_XAML
+        var rs = _rasterScale;
+#else
+        var rs = (float)(XamlRoot?.RasterizationScale ?? 1.0);
+#endif
+        return rs > 0f ? rs : 1f;
+    }
+
     private void UpdateRootTransform()
     {
-        if (_root == null || _host == null) return;
+        if (_root == null || !HasHost) return;
         // BakedAspectGraph owns _root.TransformMatrix while active. Forward
         // perspective / EnablePerspective changes by re-installing the
         // baked TransformMatrix animation (ApplyBakedTransformAnimation
@@ -662,8 +760,25 @@ public sealed class Combobulate : Control
             return;
         }
 
-        var w = (float)_host.ActualWidth;
-        var h = (float)_host.ActualHeight;
+        // Composition child visuals attached via SetElementChildVisual are
+        // authored in a space that the framework magnifies by the XamlRoot
+        // rasterization scale (2.0 at 200% display scaling). The sprite
+        // positions are built in the same DIP/rasterScale-divided space, so
+        // divide the host dimensions here too to keep the rotation centre and
+        // perspective focal length consistent. On a 100% display rs == 1 and
+        // this is a no-op.
+        // The composition child visual attached via SetElementChildVisual authors
+        // its coordinates in the element's DIP space and the framework magnifies
+        // them by the rasterization scale at render time. So the rotation centre,
+        // _root.Size and perspective focal must be expressed in FULL DIP units
+        // (ActualWidth/Height, NOT divided by rs) to line up with the element's
+        // true centre — the same convention the external-rotation path uses. Only
+        // the model SCALE is divided by rs (see Update()) to keep a stable pixel
+        // size. Dividing the centre by rs here placed the die at 1/rs of the way
+        // to the card centre (upper-left at 200%) and made every settle animation
+        // orbit, because the sprite origin and rotation centre disagreed.
+        var w = (float)HostWidth;
+        var h = (float)HostHeight;
         if (w <= 0 || h <= 0) return;
 
         _root.Size = new Vector2(w, h);
@@ -725,7 +840,7 @@ public sealed class Combobulate : Control
     {
         if (!EnablePerspective || scale <= 0f) return 0f;
         float pd = (float)PerspectiveDistance;
-        float w = (float)(_host?.ActualWidth ?? 0);
+        float w = (float)HostWidth;
         float d = pd > 0f ? pd : (w > 0f ? w : 1f);
         return d / scale;
     }
@@ -776,7 +891,7 @@ public sealed class Combobulate : Control
         }
 
         var model = Model;
-        if (model == null || model.Quads.Count == 0)
+        if (model == null || model.IsEmpty)
         {
             Rebuild();
             return;
@@ -1243,9 +1358,9 @@ public sealed class Combobulate : Control
 
     private void ApplyBakedTransformAnimation()
     {
-        if (_root is null || _transformNode is null || _host is null) return;
-        var w = (float)_host.ActualWidth;
-        var h = (float)_host.ActualHeight;
+        if (_root is null || _transformNode is null || !HasHost) return;
+        var w = (float)HostWidth;
+        var h = (float)HostHeight;
         if (w <= 0 || h <= 0) return;
 
         // Resolve the effective focal distance the same way the legacy
@@ -1380,6 +1495,10 @@ public sealed class Combobulate : Control
     public void RequestRebuildForExternalRotation(Vector3 rotationDegrees)
     {
         _pendingExternalRotation = rotationDegrees;
+#if COMBOBULATE_NO_XAML
+        RebuildForExternalRotation(_pendingExternalRotation);
+        return;
+#else
         if (System.Threading.Interlocked.Exchange(ref _externalRebuildScheduled, 1) != 0) return;
 
 #if WINAPPSDK
@@ -1408,6 +1527,7 @@ public sealed class Combobulate : Control
             RebuildForExternalRotation(_pendingExternalRotation);
         });
 #endif
+#endif
     }
 
     /// <summary>
@@ -1431,11 +1551,13 @@ public sealed class Combobulate : Control
         if (rotationSampler is null) throw new ArgumentNullException(nameof(rotationSampler));
         DisableAutoRefresh();
         _autoRefreshSampler = rotationSampler;
+#if !COMBOBULATE_NO_XAML
         _renderingHandler = OnRenderingTick;
 #if WINAPPSDK
         Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
 #else
         Windows.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
+#endif
 #endif
     }
 
@@ -1455,11 +1577,13 @@ public sealed class Combobulate : Control
         if (rotationSampler is null) throw new ArgumentNullException(nameof(rotationSampler));
         DisableAutoRefresh();
         _autoRefreshSamplerWithTime = rotationSampler;
+#if !COMBOBULATE_NO_XAML
         _renderingHandler = OnRenderingTick;
 #if WINAPPSDK
         Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
 #else
         Windows.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
+#endif
 #endif
     }
 
@@ -1595,7 +1719,7 @@ public sealed class Combobulate : Control
         {
             if (!_spritePoolGeometry.Quads[i].IsTriangle) continue;
             var s = _spritePool[i];
-            if (s?.Brush is Microsoft.UI.Composition.CompositionSurfaceBrush sb)
+            if (s?.Brush is CompositionSurfaceBrush sb)
             {
                 sb.TransformMatrix = System.Numerics.Matrix3x2.Identity;
                 modified++;
@@ -1619,7 +1743,7 @@ public sealed class Combobulate : Control
         {
             if (!_spritePoolGeometry.Quads[i].IsTriangle) continue;
             var s = _spritePool[i];
-            if (s?.Brush is Microsoft.UI.Composition.CompositionSurfaceBrush sb)
+            if (s?.Brush is CompositionSurfaceBrush sb)
             {
                 sb.TransformMatrix = mat;
                 modified++;
@@ -1642,7 +1766,7 @@ public sealed class Combobulate : Control
         {
             if (!_spritePoolGeometry.Quads[i].IsTriangle) continue;
             var s = _spritePool[i];
-            if (s?.Brush is Microsoft.UI.Composition.CompositionSurfaceBrush sb)
+            if (s?.Brush is CompositionSurfaceBrush sb)
             {
                 sb.TransformMatrix = System.Numerics.Matrix3x2.Identity;
                 sb.Scale = new System.Numerics.Vector2(sx, sy);
@@ -1714,7 +1838,7 @@ public sealed class Combobulate : Control
             string clip = s.Clip == null ? "no-clip" : "clipped";
             string brush = s.Brush == null ? "no-brush" : s.Brush.GetType().Name;
             string surfaceInfo = "";
-            if (s.Brush is Microsoft.UI.Composition.CompositionSurfaceBrush sb)
+            if (s.Brush is CompositionSurfaceBrush sb)
             {
                 surfaceInfo = sb.Surface == null
                     ? " surface=NULL"
@@ -1743,7 +1867,7 @@ public sealed class Combobulate : Control
         sb.AppendLine($"Combobulate.BakedAspectGraph diagnostics:");
         sb.AppendLine($"  RenderingMode={RenderingMode}");
         sb.AppendLine($"  _root.Size={_root?.Size}");
-        sb.AppendLine($"  host ActualSize=({_host?.ActualWidth},{_host?.ActualHeight})");
+        sb.AppendLine($"  host ActualSize=({HostWidth},{HostHeight})");
         sb.AppendLine($"  bakedHost=({_bakedHostW},{_bakedHostH}) bakedScale={_bakedScale}");
         sb.Append(_baked.GetDiagnosticReport(_transformAxes, _transformNode));
         return sb.ToString();
@@ -1752,6 +1876,7 @@ public sealed class Combobulate : Control
     /// <summary>Stops the auto-refresh loop installed by <see cref="EnableAutoRefresh"/>.</summary>
     public void DisableAutoRefresh()
     {
+#if !COMBOBULATE_NO_XAML
         if (_renderingHandler != null)
         {
 #if WINAPPSDK
@@ -1761,10 +1886,12 @@ public sealed class Combobulate : Control
 #endif
             _renderingHandler = null;
         }
+#endif
         _autoRefreshSampler = null;
         _autoRefreshSamplerWithTime = null;
     }
 
+#if !COMBOBULATE_NO_XAML
     private void OnRenderingTick(object? sender, object e)
     {
         var samplerT = _autoRefreshSamplerWithTime;
@@ -1802,6 +1929,7 @@ public sealed class Combobulate : Control
             // re-tries. Silent by design — diagnostics belong in the caller's sampler.
         }
     }
+#endif
 
     private void Rebuild() => Rebuild(GetRotationMatrix());
 
@@ -1835,12 +1963,12 @@ public sealed class Combobulate : Control
     {
         if (!IsBakedAspectGraphActive()) return;
         if (_compositor == null || _root == null) return;
-        var hostW = (float)(_host?.ActualWidth ?? 0);
-        var hostH = (float)(_host?.ActualHeight ?? 0);
+        var hostW = (float)HostWidth;
+        var hostH = (float)HostHeight;
         if (hostW <= 0 || hostH <= 0) return;
 
         var model = Model;
-        if (model == null || model.Quads.Count == 0) return;
+        if (model == null || model.IsEmpty) return;
 
         ApplyBakedTransformAnimation();
 
@@ -1956,7 +2084,7 @@ public sealed class Combobulate : Control
         }
 
         var model = Model;
-        if (model == null || model.Quads.Count == 0)
+        if (model == null || model.IsEmpty)
         {
             ClearSpritePool();
             return;
@@ -1979,8 +2107,17 @@ public sealed class Combobulate : Control
         // size + material pack. Anything in here is rotation-invariant; the rotation
         // affects only IsVisible (cull) and sibling order (sort).
         var scale = (float)ModelScale;
-        var hostW = (float)(_host?.ActualWidth ?? 0);
-        var hostH = (float)(_host?.ActualHeight ?? 0);
+        // Divide only the model SCALE by the rasterization scale so the die keeps
+        // a stable on-screen pixel size at >100% display scaling (the composition
+        // child visual magnifies authored coordinates by rasterScale). The host
+        // dimensions used for the sprite ORIGIN stay in full DIP units so the die
+        // is centred on the element (matching UpdateRootTransform and the
+        // external-rotation path); dividing the origin by rs put the die at 1/rs
+        // of the way to centre and desynced it from the rotation centre.
+        var spriteRs = RasterScale();
+        scale /= spriteRs;
+        var hostW = (float)HostWidth;
+        var hostH = (float)HostHeight;
 
         // ---- BakedAspectGraph path ----
         // Already handled by UpdateBakeIfNeeded called from the
@@ -2103,11 +2240,13 @@ public sealed class Combobulate : Control
 
             // CompositionBrush.TransformMatrix translations are in sprite
             // pixels, not normalised UV — so the matrix must be rebuilt
-            // every time the sprite is created or resized. Without this
-            // call, sub-pixel translations leave the sampled rectangle
-            // anchored at (0,0) and any negative-diagonal UV mapping
-            // (typical for subdivided triangles) samples off-surface.
-            if ((isNew || transformChanged) && resolved != null)
+            // every time the sprite is created or resized. It must ALSO be
+            // rebuilt whenever the brush is (re)assigned (packChanged), because
+            // a freshly resolved/updated binding starts at identity
+            // (ApplySurfaceBrush) and would otherwise sample the whole atlas.
+            // The condition here therefore mirrors the brush-assignment
+            // condition above (isNew || packChanged) plus transformChanged.
+            if ((isNew || transformChanged || packChanged) && resolved != null)
             {
                 var binding = resolved.Bindings[i];
                 MaterialResolver.UpdateBrushTransformForSprite(

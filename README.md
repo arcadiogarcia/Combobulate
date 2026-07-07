@@ -21,12 +21,23 @@ per frame**.
 
 ## Packages
 
-NuGet: `Combobulate`
+- `Combobulate` — the XAML control library for UWP and WinUI 3 / Windows App SDK.
+- `Combobulate.SystemComp` — a **XAML-free** flavor of the renderer bound to the
+  **system** `Windows.UI.Composition` surface with **no Windows App SDK dependency**.
+  Use it to host a live 3D model on a raw `DesktopWindowTarget` (e.g. a per-pixel
+  alpha `WS_EX_NOREDIRECTION_BITMAP` window) from a plain .NET 5+ desktop process.
+  It exposes the same `Combobulate` API under a distinct assembly name
+  (`Combobulate.SystemComp`), so an app can reference it alongside the lifted
+  WinAppSdk build. It depends on `arcadiog.CompositionExpressions.SystemComp`
+  (the system-composition flavor of the expression DSL) and unlocks the
+  `BakedAspectGraph` rendering mode in the XAML-free build.
 
 ## Targets
 
 - UWP — `uap10.0.19041`
-- WinUI 3 / Windows App SDK — `net10.0-windows10.0.19041.0`
+- WinUI 3 / Windows App SDK — `net10.0-windows10.0.19041.0` (lifted composition)
+- System composition (`Combobulate.SystemComp`) — `net10.0-windows10.0.19041.0`
+  bound to the system `Windows.UI.Composition`, no Windows App SDK
 
 ## Repo Layout
 
@@ -34,6 +45,7 @@ NuGet: `Combobulate`
 src/
   Combobulate/                 UWP class library (canonical source)
   Combobulate.WinAppSdk/       WinUI 3 head — links sources from Combobulate
+  Combobulate.SystemComp/      XAML-free head (system composition, COMBOBULATE_NO_XAML)
   Combobulate.Sample.Uwp/      UWP sample app
   Combobulate.Sample.WinUI3/   WinUI 3 sample app
 samples/

@@ -4,8 +4,9 @@ using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
+#if !COMBOBULATE_NO_XAML
 using Microsoft.Graphics.Canvas.Effects;
-
+#endif
 #if WINAPPSDK
 using Windows.UI;
 using Microsoft.UI.Composition;
@@ -524,6 +525,11 @@ internal static class MaterialResolver
                 uv0, uv1, uv2, uv3, material!.UvScale, material.UvOffset, spriteSize);
         if (brush is CompositionSurfaceBrush surfaceBrush)
         {
+            // The brush TransformMatrix is applied to the surface CONTENT
+            // (content-space -> output-space), so to SAMPLE the sub-rect the
+            // matrix that maps sprite-pixel -> sample-coord must be inverted.
+            if (Matrix3x2.Invert(matrix, out var inv))
+                matrix = inv;
             surfaceBrush.TransformMatrix = matrix;
         }
         else if (brush is CompositionEffectBrush effectBrush)
@@ -553,6 +559,9 @@ internal static class MaterialResolver
 
     private static CompositionEffectFactory GetOrCreateLitFactory(Compositor compositor)
     {
+#if COMBOBULATE_NO_XAML
+        throw new NotSupportedException("Lit materials (Win2D effects) are not available in the XAML-free build.");
+#else
         if (_litEffectFactory is not null) return _litEffectFactory;
 
         // We use ArithmeticCompositeEffect (componentwise premultiplied math)
@@ -604,6 +613,7 @@ internal static class MaterialResolver
         });
 
         return _litEffectFactory;
+#endif
     }
 
     private static CompositionBrush BuildLitBrush(

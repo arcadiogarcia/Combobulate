@@ -1,8 +1,10 @@
 using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+#if !COMBOBULATE_NO_XAML
 using Microsoft.Graphics.Canvas;
 using Microsoft.Graphics.Canvas.Geometry;
+#endif
 
 #if WINAPPSDK
 using Microsoft.UI.Composition;
@@ -58,6 +60,15 @@ internal static class TriangleClipFactory
     /// <see cref="GetOrCreateUnitTrianglePath"/>.</summary>
     public static CompositionPathGeometry CreateUnitTrianglePath(Compositor compositor)
     {
+#if COMBOBULATE_NO_XAML
+        // Win2D is unavailable here; author the unit triangle with raw Direct2D
+        // interop and wrap it as a system CompositionPath. The path itself is a
+        // shared constant; only this per-compositor PathGeometry is unique.
+        var compositionPath = D2DTriangleGeometry.GetOrCreateUnitTriangleCompositionPath();
+        var pathGeo = compositor.CreatePathGeometry();
+        pathGeo.Path = compositionPath;
+        return pathGeo;
+#else
         var device = CanvasDevice.GetSharedDevice();
         using var canvasGeo = CanvasGeometry.CreatePolygon(
             device,
@@ -71,6 +82,7 @@ internal static class TriangleClipFactory
         var pathGeo = compositor.CreatePathGeometry();
         pathGeo.Path = compositionPath;
         return pathGeo;
+#endif
     }
 
     /// <summary>Builds a per-sprite <see cref="CompositionGeometricClip"/>
