@@ -211,8 +211,11 @@ internal static class MaterialResolver
         if (evict)
         {
             // Only remove if the cached entry is still ours (a parallel Acquire
-            // could have replaced it; defensive).
-            _textures.TryRemove(new KeyValuePair<string, TextureEntry>(key, entry));
+            // could have replaced it; defensive). ICollection.Remove does the same
+            // value-conditional removal as the KeyValuePair TryRemove overload but
+            // is available on every target runtime (UWP's BCL lacks that overload).
+            ((ICollection<KeyValuePair<string, TextureEntry>>)_textures)
+                .Remove(new KeyValuePair<string, TextureEntry>(key, entry));
             _pinnedKeysBySource.Remove(source);
             DisposeIfDisposable(toDispose);
         }
