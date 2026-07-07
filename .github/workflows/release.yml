@@ -54,11 +54,24 @@ jobs:
         shell: pwsh
         run: |
           # dotnet build has .NET 10 but not VS's PRI task DLLs. We just need AppxMSBuildToolsPath.
-          # Override AppxMSBuildToolsPath to point directly to VS's copy.
-          $vsPath = "${{ steps.vs.outputs.VS_PATH }}"
-          $msbuildDir = "$vsPath\MSBuild"
-          $vsVerDir = Get-ChildItem "$msbuildDir\Microsoft\VisualStudio" -Directory -Filter "v*" | Select-Object -First 1
-          $appxPath = "$($vsVerDir.FullName)\AppxPackage"
+          # MrtCore.PriGen.targets loads $(AppxMSBuildToolsPath)Microsoft.Build.Packaging.Pri.Tasks.dll.
+          # Runner-image drift (VS17 -> VS18) moves the versioned AppxPackage folder, so we can't
+          # assume the first "v*" dir under MSBuild\Microsoft\VisualStudio holds the task DLL
+          # (VS18's v17.0\AppxPackage exists but is empty). Locate the DLL BY NAME instead.
+          $ErrorActionPreference = 'Stop'
+          $roots = @(
+            "${{ steps.vs.outputs.VS_PATH }}",
+            "C:\Program Files\Microsoft Visual Studio",
+            "C:\Program Files (x86)\Microsoft Visual Studio"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+          $dll = $null
+          foreach ($root in $roots) {
+            $dll = Get-ChildItem -Path $root -Recurse -Filter "Microsoft.Build.Packaging.Pri.Tasks.dll" -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($dll) { break }
+          }
+          if (-not $dll) { throw "Could not locate Microsoft.Build.Packaging.Pri.Tasks.dll under: $($roots -join ', ')" }
+          $appxPath = $dll.Directory.FullName
           Write-Host "AppxMSBuildToolsPath: $appxPath"
           Write-Host "PRI DLL exists: $(Test-Path "$appxPath\Microsoft.Build.Packaging.Pri.Tasks.dll")"
           "APPX_PATH=$appxPath" >> $env:GITHUB_OUTPUT
@@ -75,6 +88,19 @@ jobs:
             --no-restore `
             -p:Platform=AnyCPU `
             "-p:AppxMSBuildToolsPath=${{ steps.appx.outputs.APPX_PATH }}\"
+
+      - name: Restore & Build SystemComp library (AnyCPU)
+        shell: pwsh
+        run: |
+          # System-composition (.NET5+) flavor: binds Combobulate's renderer to the
+          # SYSTEM Windows.UI.Composition surface with NO WindowsAppSDK, enabling the
+          # BakedAspectGraph path in a XAML-free host (arcadiogarcia/Combobulate#7).
+          # SDK-style, no PRI/Appx tasks needed; ships a single AnyCPU (MSIL) lib asset.
+          dotnet restore src/Combobulate.SystemComp/Combobulate.SystemComp.csproj -p:Platform=AnyCPU
+          dotnet build src/Combobulate.SystemComp/Combobulate.SystemComp.csproj `
+            -c Release `
+            --no-restore `
+            -p:Platform=AnyCPU
 
       - name: Restore & Build WinAppSdk library (x64)
         shell: pwsh
@@ -104,6 +130,10 @@ jobs:
             -Version ${{ steps.version.outputs.VERSION }} `
             -OutputDirectory artifacts
           if ($LASTEXITCODE -ne 0) { throw "nuget pack Combobulate failed" }
+          nuget pack Combobulate.SystemComp.nuspec `
+            -Version ${{ steps.version.outputs.VERSION }} `
+            -OutputDirectory artifacts
+          if ($LASTEXITCODE -ne 0) { throw "nuget pack Combobulate.SystemComp failed" }
 
       - name: Upload nupkg artifacts
         uses: actions/upload-artifact@v4

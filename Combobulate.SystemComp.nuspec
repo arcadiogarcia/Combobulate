@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Combobulate.SystemComp</id>
+    <version>$version$</version>
+    <authors>Arcadio Garcia</authors>
+    <license type="expression">MIT</license>
+    <projectUrl>https://github.com/arcadiogarcia/Combobulate</projectUrl>
+    <repository type="git" url="https://github.com/arcadiogarcia/Combobulate" />
+    <description>System-composition (.NET 5+) flavor of Combobulate: the 3D renderer bound to the system Windows.UI.Composition surface with NO Windows App SDK dependency, for XAML-free hosts (e.g. a DesktopWindowTarget on WS_EX_NOREDIRECTION_BITMAP). Exposes the same Combobulate API as the WinAppSdk build under a distinct assembly name (Combobulate.SystemComp) so both can be referenced side by side. Enables the BakedAspectGraph rendering mode in the XAML-free build.</description>
+    <tags>winui3 winappsdk composition windows.ui.composition system-composition 3d renderer xaml-free</tags>
+    <readme>docs\README.md</readme>
+    <dependencies>
+      <!-- net10.0-windows bound to the SYSTEM composition surface: no WindowsAppSDK. -->
+      <group targetFramework="net10.0-windows10.0.19041.0">
+        <dependency id="arcadiog.CompositionExpressions.SystemComp" version="0.2.0" />
+      </group>
+    </dependencies>
+  </metadata>
+  <files>
+    <!-- README -->
+    <file src="README.md" target="docs\README.md" />
+
+    <!-- Single AnyCPU (MSIL) lib asset — pure managed, no XAML/PRI/native payload,
+         so it is architecture-neutral and needs no per-arch runtime folders.
+         AnyCPU builds collapse `bin\AnyCPU\` to plain `bin\` by SDK convention. -->
+    <file src="src\Combobulate.SystemComp\bin\Release\net10.0-windows10.0.19041.0\Combobulate.SystemComp.dll" target="lib\net10.0-windows10.0.19041.0" />
+  </files>
+</package>
