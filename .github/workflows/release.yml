@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write   # required for NuGet trusted publishing (OIDC)
 
 jobs:
   release:
@@ -147,23 +148,31 @@ jobs:
           generate_release_notes: true
           files: artifacts/*.nupkg
 
+      - name: NuGet login (OIDC -> short-lived API key)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
       - name: Push to NuGet.org
         shell: pwsh
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)) {
-            throw "NUGET_API_KEY repository secret is not set."
+          $key = "${{ steps.login.outputs.NUGET_API_KEY }}"
+          if ([string]::IsNullOrWhiteSpace($key)) {
+            throw "OIDC login returned no API key. Check the nuget.org Trusted Publishing policy and the NUGET_USER secret."
           }
-          # NOTE: --skip-duplicate intentionally NOT used. Silent skip on a
-          # duplicate version masks "already pushed broken artifact from an
-          # earlier run" scenarios (see CompositionCollectionView 0.1.5).
-          # Bump the tag if a push conflicts.
+          # Trusted Publishing (OIDC): the key above is short-lived (~1h) and minted
+          # per-run by nuget.org from the GitHub OIDC token, so there is NO long-lived
+          # NUGET_API_KEY secret to rotate or leak. --skip-duplicate makes re-running a
+          # tag idempotent: if a prior run already pushed some of the lockstep-versioned
+          # packages (a partial failure), the re-run skips those and completes the rest
+          # instead of forcing a version bump. Non-duplicate errors still fail loudly.
           Get-ChildItem artifacts\*.nupkg | ForEach-Object {
             Write-Host "Pushing $($_.Name)..."
             dotnet nuget push $_.FullName `
-              --api-key $env:NUGET_API_KEY `
-              --source https://api.nuget.org/v3/index.json
+              --api-key $key `
+              --source https://api.nuget.org/v3/index.json `
+              --skip-duplicate
             if ($LASTEXITCODE -ne 0) { throw "Push failed for $($_.Name)" }
           }
