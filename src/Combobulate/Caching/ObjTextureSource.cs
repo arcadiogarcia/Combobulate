@@ -280,8 +280,42 @@ public abstract class ObjTextureSource
         private static readonly System.Threading.SemaphoreSlim _decodeGate = new(4, 4);
 
 #if COMBOBULATE_NO_XAML
-        internal override Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
-            => throw new NotSupportedException("Texture loading is not available in the XAML-free build.");
+        internal override async Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
+        {
+            // XAML-free / system-composition build: decode via raw WIC + Direct2D
+            // (SystemImageDecoder). Honor the diagnostic interceptor for parity
+            // with the WinAppSdk path, then decode file:// URIs directly. Non-file
+            // URIs (ms-appx://, http(s)://) are unsupported here.
+            var interceptor = UriDecodeInterceptor;
+            var log = DiagnosticLog;
+            Uri targetUri = _uri;
+            if (interceptor != null)
+            {
+                try
+                {
+                    var bakedUri = await interceptor(_uri, _desiredMaxSize).ConfigureAwait(true);
+                    if (bakedUri != null) targetUri = bakedUri;
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"[ObjTextureSource] interceptor threw for {_uri}: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            if (!targetUri.IsFile)
+                throw new NotSupportedException(
+                    $"The XAML-free build can only decode file:// textures (got {targetUri.Scheme} for {targetUri}).");
+
+            try
+            {
+                return SystemImageDecoder.DecodeFileToSurface(compositor, targetUri, _desiredMaxSize, log);
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"[ObjTextureSource] XAML-free decode failed for {targetUri}: {ex.GetType().Name}: {ex.Message}");
+                throw;
+            }
+        }
 #else
         internal override async Task<ICompositionSurface> CreateSurfaceAsync(Compositor compositor)
         {

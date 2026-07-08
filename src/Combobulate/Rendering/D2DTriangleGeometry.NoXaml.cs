@@ -60,6 +60,22 @@ internal static unsafe class D2DTriangleGeometry
     private const int E_NOINTERFACE = unchecked((int)0x80004002);
     private const int E_NOTIMPL = unchecked((int)0x80004001);
 
+    // D2D1_POINT_2F { FLOAT x; FLOAT y; }. Passing this as a real by-value struct
+    // (rather than a hand-packed 8-byte integer) is REQUIRED for cross-architecture
+    // correctness: the CLR then applies the platform ABI for the struct-by-value
+    // argument. On x64 an 8-byte struct is passed in one integer register, but on
+    // ARM64 (AAPCS64) a two-float struct is a homogeneous floating-point aggregate
+    // (HFA) passed in the SIMD registers s0/s1 — packing it into a long would place
+    // it in an integer register, so D2D would read garbage coordinates and the unit
+    // triangle would collapse to an empty path (masking every triangle sprite away).
+    [StructLayout(LayoutKind.Sequential)]
+    private struct D2D_POINT_2F
+    {
+        public float X;
+        public float Y;
+        public D2D_POINT_2F(float x, float y) { X = x; Y = y; }
+    }
+
     [DllImport("d2d1.dll", ExactSpelling = true)]
     private static extern int D2D1CreateFactory(
         int factoryType, in Guid riid, IntPtr pFactoryOptions, out IntPtr ppIFactory);
@@ -132,27 +148,22 @@ internal static unsafe class D2DTriangleGeometry
 
         // ID2D1SimplifiedGeometrySink::BeginFigure (slot 5), EndFigure (slot 8), Close (slot 9)
         // ID2D1GeometrySink::AddLine (slot 10).
-        // D2D1_POINT_2F {float x, float y} is an 8-byte struct passed by value in a
-        // single integer register on x64; we pack it into a long to sidestep any
-        // struct-classification ambiguity in the CLR's function-pointer marshaling.
-        var beginFigure = (delegate* unmanaged[Stdcall]<IntPtr, long, uint, void>)(*(void***)sink)[5];
-        var addLine     = (delegate* unmanaged[Stdcall]<IntPtr, long, void>)(*(void***)sink)[10];
+        // D2D1_POINT_2F is passed by value as a real struct so the platform ABI is
+        // applied correctly on both x64 (integer register) and ARM64 (HFA in s0/s1).
+        var beginFigure = (delegate* unmanaged[Stdcall]<IntPtr, D2D_POINT_2F, uint, void>)(*(void***)sink)[5];
+        var addLine     = (delegate* unmanaged[Stdcall]<IntPtr, D2D_POINT_2F, void>)(*(void***)sink)[10];
         var endFigure   = (delegate* unmanaged[Stdcall]<IntPtr, uint, void>)(*(void***)sink)[8];
         var close       = (delegate* unmanaged[Stdcall]<IntPtr, int>)(*(void***)sink)[9];
 
-        beginFigure(sink, PackPoint(0f, 0f), D2D1_FIGURE_BEGIN_FILLED);
-        addLine(sink, PackPoint(1f, 0f));
-        addLine(sink, PackPoint(0f, 1f));
+        beginFigure(sink, new D2D_POINT_2F(0f, 0f), D2D1_FIGURE_BEGIN_FILLED);
+        addLine(sink, new D2D_POINT_2F(1f, 0f));
+        addLine(sink, new D2D_POINT_2F(0f, 1f));
         endFigure(sink, D2D1_FIGURE_END_CLOSED);
         CheckHr(close(sink), "ID2D1GeometrySink::Close");
 
         Marshal.Release(sink);
         return pathGeo; // refcount 1
     }
-
-    private static long PackPoint(float x, float y)
-        => (long)(uint)BitConverter.SingleToUInt32Bits(x)
-           | ((long)(uint)BitConverter.SingleToUInt32Bits(y) << 32);
 
     // ---------------------------------------------------------------------
     //  Hand-rolled multi-interface COM object.
