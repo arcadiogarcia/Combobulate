@@ -41,4 +41,33 @@ public enum RenderingMode
     /// <see cref="Combobulate.SetTransformAnimation(Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node, TransformAnimationAxis[])"/>.</para>
     /// </summary>
     BakedAspectGraph = 2,
+
+    /// <summary>
+    /// Composition-thread live back-face cull for <b>convex</b> solids. Uses the
+    /// same single set of N <c>SpriteVisual</c>s as <see cref="SpritePainter"/>,
+    /// but instead of the UI thread running the face sorter every frame, each
+    /// face's <c>Opacity</c> is driven by an <c>ExpressionAnimation</c> that
+    /// evaluates the exact <see cref="Sorting.GeometryPredicates"/> front-face
+    /// test (orthographic or perspective, matching
+    /// <see cref="Combobulate.EnablePerspective"/>) against the live rotation
+    /// matrix on the <b>compositor thread</b>. A back-facing face animates its
+    /// Opacity to 0; a front-facing face to 1 — evaluated on the rendering
+    /// thread from the same matrix the GPU draws with, so there is zero CPU/GPU
+    /// sync lag (no <see cref="Combobulate.CullMarginDegrees"/> band needed) and
+    /// zero per-frame UI-thread work once installed.
+    ///
+    /// <para><b>Convex precondition.</b> No painter re-sort is performed: for a
+    /// convex polyhedron the set of front-facing faces never overlap in the
+    /// projected image, so their draw order is irrelevant. Using this mode with
+    /// a non-convex mesh will show incorrect occlusion between mutually visible
+    /// faces — use <see cref="SpritePainter"/> or <see cref="BakedAspectGraph"/>
+    /// for concave meshes.</para>
+    ///
+    /// <para><b>Requires a matrix external rotation.</b> The Opacity expressions
+    /// reference the rotation matrix installed via
+    /// <see cref="Combobulate.SetExternalRotationMatrix"/>.
+    /// When no matrix external rotation is active the renderer falls back to the
+    /// <see cref="SpritePainter"/> CPU cull for that frame.</para>
+    /// </summary>
+    ConvexLiveCull = 3,
 }

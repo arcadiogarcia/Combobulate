@@ -559,11 +559,18 @@ public sealed class Combobulate : Control
     {
         var samplerT = _autoRefreshSamplerWithTime;
         var sampler = _autoRefreshSampler;
-        if (samplerT == null && sampler == null) return;
+        var mSamplerT = _autoRefreshMatrixSamplerWithTime;
+        var mSampler = _autoRefreshMatrixSampler;
+        if (samplerT == null && sampler == null && mSamplerT == null && mSampler == null) return;
         try
         {
-            Vector3 rotation = samplerT != null ? samplerT(renderingTime) : sampler!();
-            RebuildForExternalRotation(rotation);
+            if (mSamplerT != null) RebuildForExternalRotation(mSamplerT(renderingTime));
+            else if (mSampler != null) RebuildForExternalRotation(mSampler());
+            else
+            {
+                Vector3 rotation = samplerT != null ? samplerT(renderingTime) : sampler!();
+                RebuildForExternalRotation(rotation);
+            }
         }
         catch { }
     }
@@ -581,6 +588,11 @@ public sealed class Combobulate : Control
     private ExpressionAnimation? _externalRotationExpression;
     private ExpressionAnimation? _externalRotationAnimation;
     private CompositionPropertySet? _externalRotationBuffer;
+    // When true, _externalRotationExpression evaluates to a Matrix4x4 rotation
+    // supplied via SetExternalRotationMatrix (buffered into propertyset key "M");
+    // when false it evaluates to a Vector3 of Euler degrees supplied via
+    // SetExternalRotation (buffered into key "R"). Mutually exclusive.
+    private bool _externalRotationIsMatrix;
 
     /// <summary>
     /// Drives the 3D rotation of the rendered model directly off a caller-
@@ -636,13 +648,67 @@ public sealed class Combobulate : Control
         // still showing the previous matrix while the cull/sort run on the
         // freshly-pushed property-set value. The visible symptom is a quad
         // jump that looks "wrong" until the next slider tick recovers.
-        if (ReferenceEquals(_externalRotationExpression, rotationDegrees)) return;
+        if (ReferenceEquals(_externalRotationExpression, rotationDegrees) && !_externalRotationIsMatrix) return;
         _externalRotationExpression = rotationDegrees;
+        _externalRotationIsMatrix = false;
         // BakedAspectGraph owns _root.TransformMatrix via the typed AST,
         // so don't install a competing ExpressionAnimation. Just record
         // the expression so future mode switches can restore it.
         if (IsBakedAspectGraphActive()) return;
         TryStartExternalRotationAnimation();
+    }
+
+    /// <summary>
+    /// Rotation-only <b>matrix</b> variant of <see cref="SetExternalRotation(ExpressionAnimation)"/>.
+    /// Installs a caller-supplied composition <see cref="ExpressionAnimation"/> that
+    /// evaluates to a <c>Matrix4x4</c> <b>pure rotation</b>; the control keeps ownership
+    /// of centering and perspective, wrapping the caller's matrix exactly as the Euler
+    /// path does: <c>toOrigin * &lt;callerMatrix&gt; * [persp] * fromOrigin</c> on
+    /// <c>_root.TransformMatrix</c>. Only the axis-angle synthesis is skipped, so for a
+    /// matrix equal to the Euler path's <c>RotZ * RotX * RotY</c> the rendered result is
+    /// identical.
+    ///
+    /// <para><b>Convention.</b> The matrix must be a standard <c>System.Numerics</c>
+    /// row-vector rotation (as produced by <c>Matrix4x4.CreateFromAxisAngle</c>,
+    /// <c>Matrix4x4.CreateFromQuaternion</c>, or <c>Matrix4x4.CreateFromYawPitchRoll</c>) —
+    /// the same convention <see cref="Rebuild"/> and the back-face cull/painter sort use.
+    /// To reproduce the Euler path exactly from angles, use
+    /// <see cref="RotationMatrixFromEulerDegrees(Vector3)"/>. Supply a <b>translation-free,
+    /// scale-free</b> rotation only; translation/perspective/centering are owned by the
+    /// control and composing them into the caller matrix would double-apply them.</para>
+    ///
+    /// <para>Mutually exclusive with <see cref="SetExternalRotation(ExpressionAnimation)"/>
+    /// and the <see cref="RotationX"/>/<see cref="RotationY"/>/<see cref="RotationZ"/> DPs
+    /// (last writer wins); <see cref="ClearExternalRotation"/> reverts to the DP-driven
+    /// rotation. To keep the CPU back-face cull/painter sort in sync while animating,
+    /// pair with <see cref="RebuildForExternalRotation(Matrix4x4)"/> or
+    /// <see cref="EnableAutoRefresh(System.Func{Matrix4x4})"/> feeding the same matrix.</para>
+    /// </summary>
+    /// <param name="rotationMatrix">Composition expression evaluating to a rotation-only <c>Matrix4x4</c>.</param>
+    public void SetExternalRotationMatrix(ExpressionAnimation rotationMatrix)
+    {
+        if (rotationMatrix is null) throw new ArgumentNullException(nameof(rotationMatrix));
+        if (ReferenceEquals(_externalRotationExpression, rotationMatrix) && _externalRotationIsMatrix) return;
+        _externalRotationExpression = rotationMatrix;
+        _externalRotationIsMatrix = true;
+        if (IsBakedAspectGraphActive()) return;
+        TryStartExternalRotationAnimation();
+    }
+
+    /// <summary>
+    /// Builds the same rotation matrix the Euler external-rotation / DP path uses for
+    /// the supplied (X = pitch, Y = yaw, Z = roll) angles <b>in degrees</b>, so callers of
+    /// <see cref="SetExternalRotationMatrix(ExpressionAnimation)"/> can reproduce or seed
+    /// the exact convention. Equivalent to
+    /// <c>Matrix4x4.CreateFromYawPitchRoll(Y, X, Z)</c> (row-vector <c>RotZ*RotX*RotY</c>).
+    /// </summary>
+    public static Matrix4x4 RotationMatrixFromEulerDegrees(Vector3 pitchYawRollDegrees)
+    {
+        const float deg2rad = MathF.PI / 180f;
+        return Matrix4x4.CreateFromYawPitchRoll(
+            pitchYawRollDegrees.Y * deg2rad,
+            pitchYawRollDegrees.X * deg2rad,
+            pitchYawRollDegrees.Z * deg2rad);
     }
 
     /// <summary>
@@ -656,9 +722,11 @@ public sealed class Combobulate : Control
         if (_externalRotationExpression == null) return;
         _root?.StopAnimation("TransformMatrix");
         _externalRotationBuffer?.StopAnimation("R");
+        _externalRotationBuffer?.StopAnimation("M");
         _externalRotationAnimation?.Dispose();
         _externalRotationAnimation = null;
         _externalRotationExpression = null;
+        _externalRotationIsMatrix = false;
         UpdateRootTransform();
         Rebuild();
     }
@@ -695,21 +763,37 @@ public sealed class Combobulate : Control
         {
             _externalRotationBuffer = _compositor.CreatePropertySet();
             _externalRotationBuffer.InsertVector3("R", Vector3.Zero);
+            _externalRotationBuffer.InsertMatrix4x4("M", Matrix4x4.Identity);
         }
-        _externalRotationBuffer.StopAnimation("R");
-        _externalRotationBuffer.StartAnimation("R", _externalRotationExpression);
 
         const string D2R = "0.01745329251994";
-        // Use the same composition order as Matrix4x4.CreateFromYawPitchRoll,
-        // which is what Rebuild/RebuildForExternalRotation use for back-face
-        // cull and painter sort. CreateFromYawPitchRoll(yaw,pitch,roll)
-        // produces a quaternion q = qY * qX * qZ; for row-vector
-        // multiplication that maps to a matrix M = RotZ * RotX * RotY,
-        // which means "roll first, then pitch, then yaw".
-        string rotationExpr =
-            $"Matrix4x4.CreateFromAxisAngle(Vector3(0,0,1), buf.R.Z * {D2R}) * " +
-            $"Matrix4x4.CreateFromAxisAngle(Vector3(1,0,0), buf.R.X * {D2R}) * " +
-            $"Matrix4x4.CreateFromAxisAngle(Vector3(0,1,0), buf.R.Y * {D2R})";
+        string rotationExpr;
+        if (_externalRotationIsMatrix)
+        {
+            // Caller supplies the rotation matrix directly; buffer it and
+            // reference it in place of the axis-angle synthesis. Everything
+            // downstream (centering, perspective, install) is identical to the
+            // Euler path, so an equivalent matrix renders pixel-identically.
+            _externalRotationBuffer.StopAnimation("M");
+            _externalRotationBuffer.StartAnimation("M", _externalRotationExpression);
+            rotationExpr = "buf.M";
+        }
+        else
+        {
+            _externalRotationBuffer.StopAnimation("R");
+            _externalRotationBuffer.StartAnimation("R", _externalRotationExpression);
+
+            // Use the same composition order as Matrix4x4.CreateFromYawPitchRoll,
+            // which is what Rebuild/RebuildForExternalRotation use for back-face
+            // cull and painter sort. CreateFromYawPitchRoll(yaw,pitch,roll)
+            // produces a quaternion q = qY * qX * qZ; for row-vector
+            // multiplication that maps to a matrix M = RotZ * RotX * RotY,
+            // which means "roll first, then pitch, then yaw".
+            rotationExpr =
+                $"Matrix4x4.CreateFromAxisAngle(Vector3(0,0,1), buf.R.Z * {D2R}) * " +
+                $"Matrix4x4.CreateFromAxisAngle(Vector3(1,0,0), buf.R.X * {D2R}) * " +
+                $"Matrix4x4.CreateFromAxisAngle(Vector3(0,1,0), buf.R.Y * {D2R})";
+        }
 
         string toOriginExpr = "Matrix4x4.CreateTranslation(Vector3(-this.Target.Size.X / 2, -this.Target.Size.Y / 2, 0))";
         string fromOriginExpr = "Matrix4x4.CreateTranslation(Vector3(this.Target.Size.X / 2, this.Target.Size.Y / 2, 0))";
@@ -1128,6 +1212,15 @@ public sealed class Combobulate : Control
     private ObjGeometry? _spritePoolGeometry;
     private float _spritePoolScale;
     private float _spritePoolHostW;
+    // ---- ConvexLiveCull state ----
+    // When ConvexLiveCull is active each sprite's Opacity is driven by a
+    // compositor ExpressionAnimation off the rotation-matrix buffer. These
+    // track the install so the expensive per-face StartAnimation is only
+    // (re)issued when the pool, projection, or matrix buffer identity change.
+    private bool _liveCullInstalled;
+    private float _liveCullCamZ;
+    private bool _liveCullPerspective;
+    private CompositionPropertySet? _liveCullBuffer;
     // ---- BakedAspectGraph state ----
     private global::Combobulate.Rendering.BakedAspectGraphRenderer? _baked;
     private ObjGeometry? _bakedGeometry;
@@ -1469,6 +1562,8 @@ public sealed class Combobulate : Control
     // Auto-refresh subscription state.
     private Func<Vector3>? _autoRefreshSampler;
     private Func<TimeSpan, Vector3>? _autoRefreshSamplerWithTime;
+    private Func<Matrix4x4>? _autoRefreshMatrixSampler;
+    private Func<TimeSpan, Matrix4x4>? _autoRefreshMatrixSamplerWithTime;
     private EventHandler<object>? _renderingHandler;
 
     /// <summary>
@@ -1501,7 +1596,21 @@ public sealed class Combobulate : Control
     }
 
     /// <summary>
-    /// Thread-safe, coalescing variant of <see cref="RebuildForExternalRotation(Vector3)"/>.
+    /// Matrix variant of <see cref="RebuildForExternalRotation(Vector3)"/> for callers
+    /// driving <see cref="SetExternalRotationMatrix(ExpressionAnimation)"/>. Re-runs the
+    /// back-face cull and painter sort against the supplied rotation matrix — the same
+    /// matrix the caller feeds the composition expression, so CPU cull and GPU draw stay
+    /// in lock-step with no Euler round-trip. UI thread only.
+    /// </summary>
+    /// <param name="rotation">Current rotation matrix (same convention as
+    /// <see cref="SetExternalRotationMatrix(ExpressionAnimation)"/>).</param>
+    public void RebuildForExternalRotation(Matrix4x4 rotation)
+    {
+        // BakedAspectGraph owns rotation entirely via the typed AST + GPU
+        // expression; the legacy CPU rotation matrix path does nothing.
+        if (IsBakedAspectGraphActive()) return;
+        Rebuild(rotation);
+    }
     /// Records the latest rotation and schedules a single rebuild on the UI thread; if
     /// further calls arrive before that rebuild runs, only the most recent value is used.
     /// Useful when feeding rotation samples from a non-UI thread or at a higher rate than
@@ -1603,7 +1712,46 @@ public sealed class Combobulate : Control
     }
 
     /// <summary>
-    /// Diagnostic helper: forces the next rebuild to re-emit IsVisible flags and
+    /// Matrix variant of <see cref="EnableAutoRefresh(System.Func{Vector3})"/> for callers
+    /// driving <see cref="SetExternalRotationMatrix(ExpressionAnimation)"/>. The sampler
+    /// returns the current rotation matrix (same value fed to the composition expression)
+    /// and the per-frame cull/sort runs against it directly — no Euler round-trip.
+    /// </summary>
+    public void EnableAutoRefresh(Func<Matrix4x4> rotationSampler)
+    {
+        if (rotationSampler is null) throw new ArgumentNullException(nameof(rotationSampler));
+        DisableAutoRefresh();
+        _autoRefreshMatrixSampler = rotationSampler;
+#if !COMBOBULATE_NO_XAML
+        _renderingHandler = OnRenderingTick;
+#if WINAPPSDK
+        Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
+#else
+        Windows.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
+#endif
+#endif
+    }
+
+    /// <summary>
+    /// Compositor-clock matrix variant of
+    /// <see cref="EnableAutoRefresh(System.Func{System.TimeSpan,Vector3})"/>. Samples the
+    /// rotation matrix from the frame's <c>RenderingTime</c> so the CPU cull/sort and the
+    /// GPU-evaluated matrix stay in lock-step even when the compositor stalls.
+    /// </summary>
+    public void EnableAutoRefresh(Func<TimeSpan, Matrix4x4> rotationSampler)
+    {
+        if (rotationSampler is null) throw new ArgumentNullException(nameof(rotationSampler));
+        DisableAutoRefresh();
+        _autoRefreshMatrixSamplerWithTime = rotationSampler;
+#if !COMBOBULATE_NO_XAML
+        _renderingHandler = OnRenderingTick;
+#if WINAPPSDK
+        Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
+#else
+        Windows.UI.Xaml.Media.CompositionTarget.Rendering += _renderingHandler;
+#endif
+#endif
+    }
     /// child-order updates for every quad, regardless of the per-frame skip
     /// optimisations (<c>_lastVisible</c> / <c>_lastOrder</c>). If a known-broken
     /// view heals after calling this, the bug lives in the skip caches.
@@ -1904,6 +2052,8 @@ public sealed class Combobulate : Control
 #endif
         _autoRefreshSampler = null;
         _autoRefreshSamplerWithTime = null;
+        _autoRefreshMatrixSampler = null;
+        _autoRefreshMatrixSamplerWithTime = null;
     }
 
 #if !COMBOBULATE_NO_XAML
@@ -1911,18 +2061,18 @@ public sealed class Combobulate : Control
     {
         var samplerT = _autoRefreshSamplerWithTime;
         var sampler = _autoRefreshSampler;
-        if (samplerT == null && sampler == null) return;
+        var mSamplerT = _autoRefreshMatrixSamplerWithTime;
+        var mSampler = _autoRefreshMatrixSampler;
+        if (samplerT == null && sampler == null && mSamplerT == null && mSampler == null) return;
         try
         {
-            Vector3 rotation;
-            if (samplerT != null)
+            // Pull the compositor's RenderingTime out of the event args so
+            // time-based samplers clock off the same source the compositor uses
+            // to evaluate ScalarKeyFrameAnimations. The runtime types differ
+            // between WinUI3 and UWP but both expose a RenderingTime TimeSpan.
+            TimeSpan ts = default;
+            if (samplerT != null || mSamplerT != null)
             {
-                // Pull the compositor's RenderingTime out of the event args
-                // so the caller can clock its rotation off the same source
-                // the compositor uses to evaluate ScalarKeyFrameAnimations.
-                // The runtime types differ between WinUI3 and UWP but both
-                // expose a RenderingTime TimeSpan property.
-                TimeSpan ts = default;
 #if WINAPPSDK
                 if (e is Microsoft.UI.Xaml.Media.RenderingEventArgs rea)
                     ts = rea.RenderingTime;
@@ -1930,13 +2080,12 @@ public sealed class Combobulate : Control
                 if (e is Windows.UI.Xaml.Media.RenderingEventArgs rea)
                     ts = rea.RenderingTime;
 #endif
-                rotation = samplerT(ts);
             }
-            else
-            {
-                rotation = sampler!();
-            }
-            RebuildForExternalRotation(rotation);
+
+            if (mSamplerT != null) RebuildForExternalRotation(mSamplerT(ts));
+            else if (mSampler != null) RebuildForExternalRotation(mSampler());
+            else if (samplerT != null) RebuildForExternalRotation(samplerT(ts));
+            else RebuildForExternalRotation(sampler!());
         }
         catch
         {
@@ -2269,6 +2418,28 @@ public sealed class Combobulate : Control
             }
         }
 
+        // ---- ConvexLiveCull path ----
+        // For a convex solid the set of front-facing faces never overlap in the
+        // projected image, so painter re-sorting is unnecessary — only per-face
+        // visibility matters. Drive each face's Opacity from a compositor
+        // ExpressionAnimation that evaluates the exact GeometryPredicates
+        // front-face test against the live rotation-matrix buffer (buf.M) on the
+        // composition thread: zero UI-thread cull work per frame and zero
+        // CPU/GPU sync lag (cull and draw read the same matrix on the same
+        // frame, so no cull margin is needed). Requires a matrix external
+        // rotation; without one buf.M is Identity, so fall through to the CPU
+        // sorter below.
+        if (RenderingMode == global::Combobulate.Rendering.RenderingMode.ConvexLiveCull
+            && _externalRotationIsMatrix && _externalRotationBuffer != null)
+        {
+            EnsureLiveCullOpacity(geometry, scale);
+            return;
+        }
+        // Switched away from live-cull (mode change or lost the matrix buffer):
+        // tear the per-face Opacity animations down so the CPU sorter path owns
+        // visibility again.
+        if (_liveCullInstalled) TeardownLiveCullOpacity();
+
         // Cull + paint-order: delegate to the configured face sorter.
         // The sorter writes a per-quad bool[] cull buffer and a back-to-front
         // permutation of cached-quad indices ([0..n) valid).
@@ -2365,8 +2536,163 @@ public sealed class Combobulate : Control
 
     /// <summary>Per-control monotonic frame counter used by <see cref="Combobulate.Diagnostics.SpinDiagnostics"/>.</summary>
     private long _diagFrameCounter;
-
     private static readonly object NoPackSentinel = new();
+
+    /// <summary>
+    /// ConvexLiveCull: (re)installs a per-face <c>Opacity</c> ExpressionAnimation
+    /// on every pooled sprite so the compositor culls back faces from the live
+    /// rotation-matrix buffer (<c>buf.M</c>). Idempotent — the (expensive) per-face
+    /// <c>StartAnimation</c> is only reissued when the sprite pool was rebuilt, the
+    /// projection (ortho/perspective + camera distance) changed, or the matrix
+    /// buffer identity changed. Otherwise the compositor keeps evaluating the
+    /// already-installed expressions each frame with no UI-thread involvement.
+    /// </summary>
+    private void EnsureLiveCullOpacity(ObjGeometry geometry, float scale)
+    {
+        var pool = _spritePool;
+        if (pool == null || _compositor == null || _externalRotationBuffer == null) return;
+
+        float camZ = ComputeSortCameraDistance(scale);
+        bool persp = camZ > 0f;
+
+        bool reinstall = !_liveCullInstalled
+            || !ReferenceEquals(_liveCullBuffer, _externalRotationBuffer)
+            || _liveCullCamZ != camZ
+            || _liveCullPerspective != persp;
+
+        if (!reinstall)
+        {
+            // Pool may have grown new sprites this Rebuild (transformChanged with
+            // isNew==true creates them at IsVisible=false); make sure any freshly
+            // created ones are visible + driven. New sprites are rare here (pool
+            // is created up front), so this stays O(n) with no StartAnimation.
+            for (int i = 0; i < pool.Length; i++)
+            {
+                var s = pool[i];
+                if (s != null && !s.IsVisible) s.IsVisible = true;
+            }
+            return;
+        }
+
+        var quads = geometry.Quads;
+        int count = Math.Min(pool.Length, quads.Length);
+        for (int i = 0; i < count; i++)
+        {
+            var sprite = pool[i];
+            if (sprite == null) continue;
+            sprite.IsVisible = true;
+            // Build a FRESH matrix reference node per face: the ExpressionsFork
+            // caches a single ExpressionAnimation on each typed node and reuses it
+            // across StartAnimation calls, so a node subtree shared between two
+            // independent per-face animations collides (StartAnimation throws
+            // E_INVALIDARG). The baked path does the same — GetBakedMatrixReference()
+            // is called once per cell. Reuse WITHIN one face's expression is fine.
+            var mNode = _externalRotationBuffer.GetReference()
+                .GetMatrix4x4Property(ExternalRotationMatrixKey);
+            var opacity = BuildLiveCullOpacity(mNode, quads[i].Normal, quads[i].Centroid, camZ, persp);
+            sprite.StartAnimation("Opacity", opacity);
+        }
+
+        _liveCullInstalled = true;
+        _liveCullBuffer = _externalRotationBuffer;
+        _liveCullCamZ = camZ;
+        _liveCullPerspective = persp;
+    }
+
+    /// <summary>
+    /// Stops any per-face ConvexLiveCull Opacity animations and restores full
+    /// opacity so the CPU sorter (SpritePainter) path owns visibility again.
+    /// Called when the rendering mode leaves ConvexLiveCull or the matrix
+    /// external rotation is cleared.
+    /// </summary>
+    private void TeardownLiveCullOpacity()
+    {
+        var pool = _spritePool;
+        if (pool != null)
+        {
+            for (int i = 0; i < pool.Length; i++)
+            {
+                var s = pool[i];
+                if (s == null) continue;
+                s.StopAnimation("Opacity");
+                s.Opacity = 1f;
+            }
+        }
+        _liveCullInstalled = false;
+        _liveCullBuffer = null;
+        _liveCullCamZ = 0f;
+        _liveCullPerspective = false;
+    }
+
+    /// <summary>Property-set key holding the buffered external rotation matrix (<c>buf.M</c>).</summary>
+    private const string ExternalRotationMatrixKey = "M";
+
+    /// <summary>
+    /// Builds the per-face Opacity ScalarNode (1 = front-facing, 0 = back-facing)
+    /// for ConvexLiveCull, replicating <see cref="Combobulate.Sorting.GeometryPredicates"/>
+    /// exactly on the compositor thread. <paramref name="m"/> is the pure rotation
+    /// matrix (translation-free), so the centroid is transformed as a direction —
+    /// identical to the sorter's <c>Vector3.Transform(centroid, rotation)</c> when
+    /// the matrix has no translation.
+    /// </summary>
+    private static Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode BuildLiveCullOpacity(
+        Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node m,
+        Vector3 normal, Vector3 centroid, float camZ, bool persp)
+    {
+        const float eps = global::Combobulate.Sorting.GeometryPredicates.CosineEpsilon;
+
+        var vnz = TransformedComponent(m, normal, 2);
+        if (!persp)
+        {
+            // Orthographic: front-facing iff (M·n).z > CosineEpsilon.
+            var orthoPred = vnz > (ScalarNode)eps;
+            return ExpressionFunctions.Conditional(orthoPred, (ScalarNode)1f, (ScalarNode)0f);
+        }
+
+        // Perspective (exact match to GeometryPredicates.IsFrontFacingPerspective,
+        // no cull margin): front-facing iff dot > 0 AND dot² > eps²·|ray|², where
+        // ray = cameraPos − vc, cameraPos = (0,0,camZ). Since buf.M is a pure
+        // rotation it preserves dot products and lengths, so:
+        //   dot   = (M·n)·(cam − M·vc) = camZ·(M·n).z − (n·vc)
+        //   |ray|²= camZ² − 2·camZ·(M·vc).z + |vc|²
+        // where (n·vc) and |vc|² are model-space CONSTANTS. This collapses the
+        // whole test onto the two z-row transforms vnz/vcz (Channel13/23/33 only),
+        // making the compositor string a fraction of the naïve per-component form
+        // (which blew past Composition's expression-length cap → E_INVALIDARG).
+        // The signed-square test dot²>eps²·lenSq with dot>0 is equivalent to
+        // dot > eps·√lenSq (eps>0, lenSq≥0), so the sqrt form matches exactly.
+        var vcz = TransformedComponent(m, centroid, 2);
+        float k = Vector3.Dot(normal, centroid);       // (n·vc), constant
+        float cc = centroid.LengthSquared();           // |vc|², constant
+        var dot = (ScalarNode)camZ * vnz - (ScalarNode)k;
+        var lenSq = (ScalarNode)(camZ * camZ + cc) - (ScalarNode)(2f * camZ) * vcz;
+        var perspPred = dot > (ScalarNode)eps * ExpressionFunctions.Sqrt(lenSq);
+        return ExpressionFunctions.Conditional(perspPred, (ScalarNode)1f, (ScalarNode)0f);
+    }
+
+    /// <summary>
+    /// One component (0=x, 1=y, 2=z) of <c>Vector3.TransformNormal(v, M)</c> as a
+    /// ScalarNode, row-vector convention (result.x = v·column0 = v.x·M11 + v.y·M21 +
+    /// v.z·M31, etc.), matching <see cref="Combobulate.Rendering.EventFunctions"/>.
+    /// Zero-coefficient terms are skipped to keep the emitted expression short.
+    /// </summary>
+    private static Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.ScalarNode TransformedComponent(
+        Microsoft.Toolkit.Uwp.UI.Animations.ExpressionsFork.Matrix4x4Node m, Vector3 v, int comp)
+    {
+        ScalarNode c1, c2, c3;
+        switch (comp)
+        {
+            case 0: c1 = m.Channel11; c2 = m.Channel21; c3 = m.Channel31; break;
+            case 1: c1 = m.Channel12; c2 = m.Channel22; c3 = m.Channel32; break;
+            default: c1 = m.Channel13; c2 = m.Channel23; c3 = m.Channel33; break;
+        }
+        ScalarNode? acc = null;
+        if (v.X != 0f) acc = c1 * (ScalarNode)v.X;
+        if (v.Y != 0f) acc = acc is null ? c2 * (ScalarNode)v.Y : acc + c2 * (ScalarNode)v.Y;
+        if (v.Z != 0f) acc = acc is null ? c3 * (ScalarNode)v.Z : acc + c3 * (ScalarNode)v.Z;
+        return acc ?? (ScalarNode)0f;
+    }
+
 
     private void ClearSpritePool()
     {
@@ -2390,6 +2716,13 @@ public sealed class Combobulate : Control
         _spritePoolScale = 0;
         _spritePoolHostW = 0;
         _spritePoolHostH = 0;
+        // Sprites (and their per-face Opacity animations) are disposed above;
+        // just reset the ConvexLiveCull install tracking so a later rebuild
+        // reinstalls cleanly.
+        _liveCullInstalled = false;
+        _liveCullBuffer = null;
+        _liveCullCamZ = 0f;
+        _liveCullPerspective = false;
     }
 
     private static bool OrderEquals(int[] a, int aCount, int[] b, int bCount)
