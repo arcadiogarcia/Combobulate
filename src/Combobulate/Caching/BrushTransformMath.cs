@@ -163,9 +163,27 @@ internal static class BrushTransformMath
         var m22 = uv2.Y - uv0.Y;
         var m31 = uv0.X;
         var m32 = uv0.Y;
+
+        // Convert the normalized-UV linear part into the sprite-pixel → brush-pixel
+        // space that CompositionBrush.TransformMatrix operates in. The input is in
+        // sprite pixels ([0,sx]×[0,sy]) and the output in brush pixels; with
+        // Stretch=Fill the surface is sampled at UV = brush/spriteSize, and the X
+        // and Y axes scale independently by sx and sy. The cross-axis linear terms
+        // therefore need an aspect-ratio correction (sy/sx on the sx→by term,
+        // sx/sy on the sy→bx term) — exactly as BuildQuadAxisAlignedCrop applies.
+        // WITHOUT this the affine fails to pin even the triangle's own V1/V2 in the
+        // cross axis whenever the sprite bounding box is non-square (sx≠sy), so
+        // adjacent fan triangles of an n-gon face (e.g. a d12 pentagon, whose three
+        // corner-fan triangles each have a different bbox aspect) disagree at their
+        // shared vertices and the texture tears along the seams. Square sprites
+        // (sx==sy, e.g. d6 quad faces) have ratio==1 and are unaffected.
+        var sx = spriteSize.X;
+        var sy = spriteSize.Y;
+        var ratioYoverX = sx > 0f ? sy / sx : 1f;
+        var ratioXoverY = sy > 0f ? sx / sy : 1f;
         return new Matrix3x2(
-            m11 * uvScale.X, m12 * uvScale.Y,
-            m21 * uvScale.X, m22 * uvScale.Y,
+            m11 * uvScale.X,                 m12 * uvScale.Y * ratioYoverX,
+            m21 * uvScale.X * ratioXoverY,   m22 * uvScale.Y,
             (m31 + uvOffset.X) * spriteSize.X,
             (m32 + uvOffset.Y) * spriteSize.Y);
     }
