@@ -350,7 +350,7 @@ public abstract class ObjTextureSource
                 return await LoadAsCompositionSurfaceAsync(compositor, targetUri, _desiredMaxSize, log).ConfigureAwait(true);
 #endif
 
-            return await LoadFromLoadedImageSurfaceAsync(targetUri, _desiredMaxSize, log).ConfigureAwait(true);
+            return await LoadFromLoadedImageSurfaceAsync(compositor, targetUri, _desiredMaxSize, log).ConfigureAwait(true);
         }
 #endif
 
@@ -474,21 +474,57 @@ public abstract class ObjTextureSource
         /// exception, so a single bad image can't permanently hold a slot.
         /// </summary>
 #if !COMBOBULATE_NO_XAML
-        private static async Task<ICompositionSurface> LoadFromLoadedImageSurfaceAsync(Uri uri, Size desiredMaxSize, Action<string>? log)
+        // LoadedImageSurface.LoadCompleted is not guaranteed to fire. Two failure
+        // modes are known and neither errors out — the awaiting load just never
+        // returns and the bound brush stays blank forever:
+        //   1. After a process accumulates ~30-40 surfaces the event silently
+        //      stops firing for new ones (documented on LoadAsCompositionSurfaceAsync).
+        //   2. LoadCompleted is a non-sticky event and StartLoadFromUri begins the
+        //      decode before it returns the object we subscribe to, so a load that
+        //      completes inline (already-decodable image) can deliver its
+        //      completion before our handler is attached.
+        // We can't detect either case up front (DecodedPhysicalSize/DecodedSize
+        // throw until the load completes, and there is no "already loaded" flag),
+        // so bound the wait. On timeout, fall back to the Win2D decode path for
+        // file:// URIs — it owns its surface outright and always completes.
+        private const int LoadedImageSurfaceLoadTimeoutMs = 1200;
+
+        private static async Task<ICompositionSurface> LoadFromLoadedImageSurfaceAsync(
+            Compositor compositor, Uri uri, Size desiredMaxSize, Action<string>? log, bool allowWin2DFallback = true)
         {
+            LoadedImageSurface lis;
+            bool completed;
             await _decodeGate.WaitAsync().ConfigureAwait(true);
             try
             {
-                LoadedImageSurface lis = desiredMaxSize.Width > 0 && desiredMaxSize.Height > 0
+                lis = desiredMaxSize.Width > 0 && desiredMaxSize.Height > 0
                     ? LoadedImageSurface.StartLoadFromUri(uri, desiredMaxSize)
                     : LoadedImageSurface.StartLoadFromUri(uri);
-                await AwaitLoadAsync(lis, uri, log).ConfigureAwait(true);
-                return lis;
+                completed = await AwaitLoadAsync(lis, uri, log).ConfigureAwait(true);
             }
             finally
             {
                 _decodeGate.Release();
             }
+
+            if (completed)
+                return lis;
+
+#if WINAPPSDK
+            // LoadCompleted never arrived (raced-ahead completion or the surface
+            // ceiling). For file:// URIs the Win2D path is a reliable substitute;
+            // pass allowLisFallback:false so its own error path can't bounce back
+            // here and ping-pong.
+            if (allowWin2DFallback && uri.IsFile)
+            {
+                log?.Invoke($"[ObjTextureSource] LoadedImageSurface did not signal within {LoadedImageSurfaceLoadTimeoutMs}ms; falling back to Win2D for {uri}");
+                return await LoadAsCompositionSurfaceAsync(compositor, uri, desiredMaxSize, log, allowLisFallback: false).ConfigureAwait(true);
+            }
+#endif
+            // No fallback available (non-file URI, or already inside the Win2D
+            // error path). Return the surface best-effort — it may still finish
+            // decoding even though we never observed the event.
+            return lis;
         }
 #endif
 
@@ -521,7 +557,7 @@ public abstract class ObjTextureSource
         /// then dispose it via <c>using</c>.
         /// </remarks>
         private static async Task<ICompositionSurface> LoadAsCompositionSurfaceAsync(
-            Compositor compositor, Uri uri, Size desiredMaxSize, Action<string>? log)
+            Compositor compositor, Uri uri, Size desiredMaxSize, Action<string>? log, bool allowLisFallback = true)
         {
             await _decodeGate.WaitAsync().ConfigureAwait(true);
             try
@@ -572,7 +608,11 @@ public abstract class ObjTextureSource
                 log?.Invoke($"[ObjTextureSource] Win2D decode failed uri={uri}: {ex.GetType().Name}: {ex.Message}");
                 // Fall back to the legacy path so a Win2D-specific failure
                 // (e.g. unsupported image format) doesn't leave the cover blank.
-                return await LoadFromLoadedImageSurfaceAsync(uri, desiredMaxSize, log).ConfigureAwait(true);
+                // Pass allowWin2DFallback:false so it can't bounce straight back
+                // here on its own timeout and ping-pong between the two paths.
+                if (allowLisFallback)
+                    return await LoadFromLoadedImageSurfaceAsync(compositor, uri, desiredMaxSize, log, allowWin2DFallback: false).ConfigureAwait(true);
+                throw;
             }
             finally
             {
@@ -611,7 +651,15 @@ public abstract class ObjTextureSource
         /// leaving the rendered face as the lighting gradient only (no diffuse).
         /// </summary>
 #if !COMBOBULATE_NO_XAML
-        private static Task AwaitLoadAsync(LoadedImageSurface lis, Uri uri, Action<string>? log)
+        /// <summary>
+        /// Waits for <see cref="LoadedImageSurface.LoadCompleted"/>, bounded by
+        /// <see cref="LoadedImageSurfaceLoadTimeoutMs"/>. Returns <c>true</c> when
+        /// the surface decoded successfully, <c>false</c> on a decode failure OR
+        /// when the event never arrived within the timeout (the two documented
+        /// LoadCompleted failure modes described on
+        /// <see cref="LoadFromLoadedImageSurfaceAsync"/>).
+        /// </summary>
+        private static async Task<bool> AwaitLoadAsync(LoadedImageSurface lis, Uri uri, Action<string>? log)
         {
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             void Handler(LoadedImageSurface s, LoadedImageSourceLoadCompletedEventArgs e)
@@ -621,7 +669,16 @@ public abstract class ObjTextureSource
                 tcs.TrySetResult(e.Status == LoadedImageSourceLoadStatus.Success);
             }
             lis.LoadCompleted += Handler;
-            return tcs.Task;
+
+            var winner = await Task.WhenAny(tcs.Task, Task.Delay(LoadedImageSurfaceLoadTimeoutMs)).ConfigureAwait(true);
+            if (winner == tcs.Task)
+                return tcs.Task.Result;
+
+            // Timed out — the completion event was never delivered to us. Stop
+            // listening and report failure so the caller can fall back.
+            lis.LoadCompleted -= Handler;
+            log?.Invoke($"[ObjTextureSource] LoadCompleted never fired within {LoadedImageSurfaceLoadTimeoutMs}ms for {uri}");
+            return false;
         }
 #endif
     }
