@@ -444,6 +444,41 @@ public sealed class Combobulate : Control
                 global::Combobulate.Rendering.RenderingMode.SpritePainter,
                 (d, _) => { var c = (Combobulate)d; c.OnRenderingModeChanged(); }));
 
+    /// <summary>
+    /// The anti-seam "conservative outset", in on-screen pixels, applied to
+    /// every die face so neighbouring faces OVERLAP instead of meeting at a
+    /// shared anti-aliased edge (two abutting AA edges composite to only ~75%
+    /// coverage, letting the window background bleed through as a ~1px dark
+    /// hairline seam — worst on the oblique interior folds of the triangle
+    /// dice d8/d12/d20). Grows each face outward and expands its brush UVs in
+    /// lock-step so the interior texels stay registered. See
+    /// <see cref="global::Combobulate.Rendering.FaceEdgeOutset"/> for the
+    /// derivation.
+    ///
+    /// <para>Defaults to
+    /// <see cref="global::Combobulate.Rendering.FaceEdgeOutset.DefaultPx"/>,
+    /// which reliably closes the seam on most dice. Consuming apps can override
+    /// it — e.g. lower it to avoid the faint silhouette scalloping the outset
+    /// introduces on the outermost boundary faces of high-face-count dice, or
+    /// raise it if a wider seam persists at their model scale. Setting <c>0</c>
+    /// disables the treatment entirely. Applied live: changing it re-renders
+    /// the current frame without a geometry rebuild.</para>
+    /// </summary>
+    public double FaceEdgeOutsetPx
+    {
+        get => (double)GetValue(FaceEdgeOutsetPxProperty);
+        set => SetValue(FaceEdgeOutsetPxProperty, value);
+    }
+
+    public static readonly DependencyProperty FaceEdgeOutsetPxProperty =
+        DependencyProperty.Register(
+            nameof(FaceEdgeOutsetPx),
+            typeof(double),
+            typeof(Combobulate),
+            new PropertyMetadata(
+                (double)global::Combobulate.Rendering.FaceEdgeOutset.DefaultPx,
+                (d, _) => { var c = (Combobulate)d; c.Rebuild(); }));
+
     #endregion
 
 #if !COMBOBULATE_NO_XAML
@@ -1204,6 +1239,14 @@ public sealed class Combobulate : Control
     // toggles IsVisible and (when needed) sibling order.
     private SpriteVisual?[]? _spritePool;
     private bool[]? _lastVisible;
+    // Anti-seam conservative outset (see FaceEdgeOutset): the UVs EXPANDED to
+    // match each sprite grown by the outset pad, cached per sprite so the brush
+    // TransformMatrix can be refreshed on a pack/theme change (which does not
+    // recompute geometry) without losing the interior texel registration.
+    private Vector2[]? _spritePoolEuv0;
+    private Vector2[]? _spritePoolEuv1;
+    private Vector2[]? _spritePoolEuv2;
+    private Vector2[]? _spritePoolEuv3;
     private int[] _lastOrder = Array.Empty<int>();
     private int _lastOrderCount;
     private global::Combobulate.Sorting.IFaceSorter? _sorter;
@@ -1550,6 +1593,7 @@ public sealed class Combobulate : Control
         Rebuild();
     }
     private float _spritePoolHostH;
+    private float _spritePoolOutset = float.NaN;
     private object? _spritePoolPackKey;
     private ResolvedQuadMaterials? _spritePoolBindings;
     private int[]? _visibleScratch;
@@ -2192,6 +2236,10 @@ public sealed class Combobulate : Control
         {
             _baked = new global::Combobulate.Rendering.BakedAspectGraphRenderer(_compositor, _root);
         }
+        // Share the anti-seam outset (default + any consumer override) with the
+        // bake, exactly as the SpritePainter path reads it, so both renderers
+        // treat seams identically.
+        _baked.EdgeOutsetPx = (float)FaceEdgeOutsetPx;
         var bakedResolved = ResolveCurrentMaterials(geometry, pack);
         var cullMarginCosNow = ComputeCullMarginCos();
         // BAG bake MUST use cameraDistance=0 (orthographic) regardless of
@@ -2297,11 +2345,13 @@ public sealed class Combobulate : Control
         // ---- SpritePainter path ----
 
         var packKey = CurrentMaterialToken(pack) ?? NoPackSentinel;
+        float outsetPx = (float)FaceEdgeOutsetPx;
         bool geometryChanged = !ReferenceEquals(_spritePoolGeometry, geometry);
         bool transformChanged = geometryChanged
             || scale != _spritePoolScale
             || hostW != _spritePoolHostW
-            || hostH != _spritePoolHostH;
+            || hostH != _spritePoolHostH
+            || outsetPx != _spritePoolOutset;
         bool packChanged = geometryChanged || !ReferenceEquals(_spritePoolPackKey, packKey);
 
         if (geometryChanged)
@@ -2310,6 +2360,10 @@ public sealed class Combobulate : Control
             _spritePoolGeometry = geometry;
             _spritePool = new SpriteVisual?[geometry.Quads.Length];
             _lastVisible = new bool[geometry.Quads.Length];
+            _spritePoolEuv0 = new Vector2[geometry.Quads.Length];
+            _spritePoolEuv1 = new Vector2[geometry.Quads.Length];
+            _spritePoolEuv2 = new Vector2[geometry.Quads.Length];
+            _spritePoolEuv3 = new Vector2[geometry.Quads.Length];
             _lastOrder = Array.Empty<int>();
             _lastOrderCount = 0;
             _sorter = null;
@@ -2323,6 +2377,7 @@ public sealed class Combobulate : Control
         _spritePoolScale = scale;
         _spritePoolHostW = hostW;
         _spritePoolHostH = hostH;
+        _spritePoolOutset = outsetPx;
 
         var origin = new Vector3(hostW / 2f, hostH / 2f, 0);
         var cachedQuads = geometry.Quads;
@@ -2363,9 +2418,45 @@ public sealed class Combobulate : Control
                 // keep only rotation+translate in the matrix.
                 var lenX = xAxis.Length();
                 var lenY = yAxis.Length();
-                sprite!.Size = new Vector2(lenX > 0f ? lenX : 1f, lenY > 0f ? lenY : 1f);
                 var nx = lenX > 0f ? xAxis / lenX : Vector3.UnitX;
                 var ny = lenY > 0f ? yAxis / lenY : Vector3.UnitY;
+
+                // ── Anti-seam conservative outset ────────────────────────────
+                // Grow every face outward by a few on-screen pixels so
+                // neighbouring faces OVERLAP instead of meeting at a shared
+                // anti-aliased edge (two abutting AA edges sum to only ~75%
+                // coverage, letting the window background bleed through as a
+                // ~1px hairline seam — worst on the oblique interior folds of
+                // the triangle dice d8/d12/d20). v0/lenX/lenY are grown in
+                // lock-step with the GeometricClip (rebuilt from the inflated
+                // lenX/lenY below) and the brush UVs (expanded to euv* and
+                // cached so the interior texels stay exactly registered). See
+                // FaceEdgeOutset for the full derivation.
+                Vector2 euv0 = cq.Uv0, euv1 = cq.Uv1, euv2 = cq.Uv2, euv3 = cq.Uv3;
+                if (outsetPx > 0f && lenX > 0.5f && lenY > 0.5f)
+                {
+                    if (cq.IsTriangle)
+                    {
+                        FaceEdgeOutset.InflateTriangle(
+                            cq.Uv0, cq.Uv1, cq.Uv2, outsetPx, nx, ny,
+                            ref v0, ref lenX, ref lenY,
+                            out euv0, out euv1, out euv2);
+                        euv3 = euv2; // triangle: V3==V2
+                    }
+                    else
+                    {
+                        FaceEdgeOutset.InflateQuad(
+                            cq.Uv0, cq.Uv1, cq.Uv2, cq.Uv3, outsetPx, nx, ny,
+                            ref v0, ref lenX, ref lenY,
+                            out euv0, out euv1, out euv2, out euv3);
+                    }
+                }
+                _spritePoolEuv0![i] = euv0;
+                _spritePoolEuv1![i] = euv1;
+                _spritePoolEuv2![i] = euv2;
+                _spritePoolEuv3![i] = euv3;
+
+                sprite!.Size = new Vector2(lenX > 0f ? lenX : 1f, lenY > 0f ? lenY : 1f);
                 // Guard against degenerate cross (sliver triangles where xAxis ∥ yAxis):
                 // Vector3.Normalize divides by Length() which underflows to 0 for
                 // very thin slivers, producing NaN basis vectors that break the
@@ -2386,7 +2477,9 @@ public sealed class Combobulate : Control
                 // (lenX,0), (0,lenY). A GeometricClip referencing the shared
                 // unit-triangle path (scaled by Matrix3x2.CreateScale(lenX,lenY))
                 // masks the other half of the rectangle. Quads (V3!=V2) keep
-                // sprite.Clip == null and render the full parallelogram.
+                // sprite.Clip == null and render the full parallelogram. The clip
+                // uses the INFLATED lenX/lenY so the grown triangle is masked
+                // (not the original), keeping the anti-seam overlap.
                 if (cq.IsTriangle && lenX > 0f && lenY > 0f)
                 {
                     sprite.Clip = TriangleClipFactory.CreateTriangleClip(_compositor, lenX, lenY);
@@ -2410,11 +2503,15 @@ public sealed class Combobulate : Control
             // (ApplySurfaceBrush) and would otherwise sample the whole atlas.
             // The condition here therefore mirrors the brush-assignment
             // condition above (isNew || packChanged) plus transformChanged.
+            // Pass the anti-seam EXPANDED UVs (cached above) matched to the
+            // inflated sprite.Size so the interior texels stay registered.
             if ((isNew || transformChanged || packChanged) && resolved != null)
             {
                 var binding = resolved.Bindings[i];
                 MaterialResolver.UpdateBrushTransformForSprite(
-                    binding.Brush, cachedQuads[i].WithCanonicalAxisAlignedUv(), binding.Material, sprite!.Size);
+                    binding.Brush,
+                    _spritePoolEuv0![i], _spritePoolEuv1![i], _spritePoolEuv2![i], _spritePoolEuv3![i],
+                    cachedQuads[i].IsTriangle, binding.Material, sprite!.Size);
             }
         }
 
@@ -2707,6 +2804,10 @@ public sealed class Combobulate : Control
         }
         _spritePool = null;
         _lastVisible = null;
+        _spritePoolEuv0 = null;
+        _spritePoolEuv1 = null;
+        _spritePoolEuv2 = null;
+        _spritePoolEuv3 = null;
         _lastOrder = Array.Empty<int>();
         _lastOrderCount = 0;
         _sorter = null;
@@ -2716,6 +2817,7 @@ public sealed class Combobulate : Control
         _spritePoolScale = 0;
         _spritePoolHostW = 0;
         _spritePoolHostH = 0;
+        _spritePoolOutset = float.NaN;
         // Sprites (and their per-face Opacity animations) are disposed above;
         // just reset the ConvexLiveCull install tracking so a later rebuild
         // reinstalls cleanly.
