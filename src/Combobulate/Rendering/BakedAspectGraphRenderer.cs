@@ -265,36 +265,12 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
     /// fully opaque. The brush UV crop is expanded by the same fraction (see
     /// MaterialiseChunk) so interior texels stay exactly registered.
     ///
-    /// Overridable per-bake via the file <c>C:\Users\Public\combobulate_outset.txt</c>
-    /// (diagnostic sweep knob, read fresh each bake so it survives the packaged-app
-    /// environment-block cache); falls back to the default below when the file is
-    /// absent or unparseable. The value actually used is echoed to
-    /// <c>combobulate_outset_used.txt</c> next to it for test verification.
+    /// Set by the owning <see cref="Combobulate"/> control from its
+    /// <see cref="Combobulate.FaceEdgeOutsetPx"/> property before each bake, so
+    /// this shares one default (<see cref="FaceEdgeOutset.DefaultPx"/>) and one
+    /// override path with the SpritePainter renderer. Snapshotted once per bake.
     /// </summary>
-    private const float EdgeOutsetPxDefault = 3.0f;
-
-    private static float EdgeOutsetPx
-    {
-        get
-        {
-            float v = EdgeOutsetPxDefault;
-            try
-            {
-                var p = @"C:\Users\Public\combobulate_outset.txt";
-                if (System.IO.File.Exists(p))
-                {
-                    var s = System.IO.File.ReadAllText(p).Trim();
-                    if (float.TryParse(s, System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture, out var parsed) && parsed >= 0f)
-                        v = parsed;
-                }
-                System.IO.File.WriteAllText(@"C:\Users\Public\combobulate_outset_used.txt",
-                    v.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            }
-            catch { }
-            return v;
-        }
-    }
+    public float EdgeOutsetPx { get; set; } = FaceEdgeOutset.DefaultPx;
 
     private void Materialise(
         ComputedBake computed,
