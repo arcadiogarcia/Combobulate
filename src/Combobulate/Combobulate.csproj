@@ -154,6 +154,7 @@
     <Compile Include="Rendering\AspectGraphBake.cs" />
     <Compile Include="Rendering\BakedAspectGraphRenderer.cs" />
     <Compile Include="Rendering\EventFunctions.cs" />
+    <Compile Include="Rendering\FaceEdgeOutset.cs" />
     <Compile Include="Rendering\PredicateCompiler.cs" />
     <Compile Include="Rendering\RenderingMode.cs" />
     <Compile Include="Rendering\SignatureBake.cs" />
