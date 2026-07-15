@@ -520,9 +520,14 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
             // expanded by the SAME fraction so interior texels stay exactly
             // registered and the overlap samples the neighbour's continuous
             // texels (same-face → invisible) or edge-clamps (cross-face → a
-            // ~1px overhang, far better than a background gap). Triangles keep
-            // exact geometry: their GeometricClip path is sized to lenX/lenY
-            // and would need matching inflation, and the book has none.
+            // ~1px overhang, far better than a background gap).
+            //
+            // Triangle faces get the SAME treatment (see the triangle branch
+            // below): every non-quad die (d4/d8/d12/d20) is a triangle mesh, so
+            // without it every triangle edge shows the hairline seam. Their
+            // GeometricClip path is grown in lock-step (it is rebuilt from the
+            // inflated lenX/lenY a few lines down), so the clip masks to the
+            // grown triangle and neighbours overlap exactly like quads do.
             Vector2 euv0 = cq.Uv0, euv1 = cq.Uv1, euv2 = cq.Uv2, euv3 = cq.Uv3;
             if (!cq.IsTriangle && lenX > 0.5f && lenY > 0.5f)
             {
@@ -553,7 +558,56 @@ internal sealed class BakedAspectGraphRenderer : IDisposable
                 lenX += 2f * outsetPx;
                 lenY += 2f * outsetPx;
             }
+            else if (cq.IsTriangle && lenX > 0.5f && lenY > 0.5f)
+            {
+                // ── Triangle anti-seam outset ────────────────────────────────
+                // A triangle sprite renders a right triangle inscribed in its
+                // rectangular sprite: local corners A(0,0)=V0, B(lenX,0)=V1,
+                // C(0,lenY)=V2 (see the clip note below). Push all THREE edges
+                // outward by outsetPx in sprite-local space (the same space the
+                // quad outset uses), mirroring the quad treatment:
+                //   • edge AB (y=0)  → y = -outsetPx
+                //   • edge AC (x=0)  → x = -outsetPx
+                //   • hypotenuse BC  → outward by outsetPx along its normal
+                // The two legs stay axis-aligned, so the inflated triangle is
+                // STILL a right triangle with the right angle at A'=(-d,-d).
+                // That means the sprite origin simply shifts by -d on both local
+                // axes (identical to the quad) and the legs grow to legX/legY,
+                // so the shared unit-triangle clip can be reused at the new size.
+                float d = outsetPx;
+                float invLenX = 1f / lenX;
+                float invLenY = 1f / lenY;
+                // Local-space perpendicular distance factor of the hypotenuse
+                // x/lenX + y/lenY = 1, whose unit normal is (1/lenX, 1/lenY)/g.
+                float g = MathF.Sqrt(invLenX * invLenX + invLenY * invLenY);
 
+                // UVs are a 3-point affine over the sprite plane:
+                //   uv(px,py) = Uv0 + (px/lenX)·du + (py/lenY)·dv
+                // Evaluate it at the three INFLATED corners so the interior
+                // texels stay exactly registered and the grown rim extrapolates
+                // (same-face → invisible) / edge-clamps (cross-face → ~1px
+                // overhang), exactly as the quad path does.
+                var du = cq.Uv1 - cq.Uv0;         // U-axis UV delta across lenX
+                var dv = cq.Uv2 - cq.Uv0;         // V-axis UV delta across lenY
+                float aX = d * invLenX;           // -d along local x, in du units
+                float aY = d * invLenY;           // -d along local y, in dv units
+                float hB = d * (g + invLenY);     // B''s push past lenX (hypotenuse+leg)
+                float hC = d * (g + invLenX);     // C''s push past lenY (hypotenuse+leg)
+                euv0 = cq.Uv0 - aX * du - aY * dv;                 // A'(-d,-d)
+                euv1 = cq.Uv0 + (1f + hB) * du - aY * dv;         // B'
+                euv2 = cq.Uv0 - aX * du + (1f + hC) * dv;         // C'
+                // Clamp to the [0,1] surface domain (see the quad note above).
+                euv0 = Vector2.Clamp(euv0, Vector2.Zero, Vector2.One);
+                euv1 = Vector2.Clamp(euv1, Vector2.Zero, Vector2.One);
+                euv2 = Vector2.Clamp(euv2, Vector2.Zero, Vector2.One);
+
+                // Shift the sprite origin to A' and grow the legs. legX/legY are
+                // the new-local coordinates of B'/C' (the +d converts the origin
+                // shift; the lenX·(g+1/lenY)·d term is the hypotenuse push).
+                v0 = v0 - d * nx - d * ny;
+                lenX = lenX + d + d * lenX * (g + invLenY);
+                lenY = lenY + d + d * lenY * (g + invLenX);
+            }
             sprite.Size = new Vector2(lenX > 0f ? lenX : 1f, lenY > 0f ? lenY : 1f);
             // Guard against degenerate cross (sliver triangles where xAxis ∥ yAxis):
             // Vector3.Normalize divides by Length() which underflows to 0 for
