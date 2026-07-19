@@ -1063,12 +1063,28 @@ public sealed class Combobulate : Control
 
         if (_spritePool != null && ReferenceEquals(_spritePoolGeometry, geometry))
         {
+            var cachedQuads = geometry.Quads;
             foreach (var quadIndex in changedQuads)
             {
                 if ((uint)quadIndex < (uint)_spritePool.Length && _spritePool[quadIndex] is { } sprite)
                 {
-                    var newBrush = _materialSlotBindings.Bindings[quadIndex].Brush;
-                    sprite.Brush = newBrush;
+                    var binding = _materialSlotBindings.Bindings[quadIndex];
+                    sprite.Brush = binding.Brush;
+                    // A freshly resolved/updated binding's brush starts at an
+                    // identity TransformMatrix (ApplySurfaceBrush), so without
+                    // this it would sample the WHOLE atlas onto every face
+                    // instead of that face's UV cell. Re-apply the per-face UV
+                    // crop against the sprite's pixel size using the cached
+                    // anti-seam expanded UVs — exactly as the full sprite-build
+                    // loop does after (re)assigning a brush. CompositionBrush
+                    // TransformMatrix translations are in sprite pixels, not
+                    // normalised UV, so the matrix must be rebuilt here rather
+                    // than reused from the old brush.
+                    MaterialResolver.UpdateBrushTransformForSprite(
+                        binding.Brush,
+                        _spritePoolEuv0![quadIndex], _spritePoolEuv1![quadIndex],
+                        _spritePoolEuv2![quadIndex], _spritePoolEuv3![quadIndex],
+                        cachedQuads[quadIndex].IsTriangle, binding.Material, sprite.Size);
                 }
             }
             _spritePoolBindings = _materialSlotBindings;
