@@ -112,6 +112,49 @@ internal static class MaterialResolver
     /// </summary>
     private static readonly ConditionalWeakTable<CompositionEffectBrush, object> _litInnerBrushes = new();
 
+    /// <summary>
+    /// Cached <see cref="CompositionEffectFactory"/> for a host-supplied effect graph
+    /// (<see cref="ObjMaterial.EffectGraph"/>), keyed by the material instance so every
+    /// face of that material shares ONE factory and creates its own per-face
+    /// <see cref="CompositionEffectBrush"/> from it. Dies with the material.
+    /// </summary>
+    private static readonly ConditionalWeakTable<ObjMaterial, CompositionEffectFactory> _effectFactories = new();
+
+    /// <summary>
+    /// Pins the inner per-source brushes of a host-effect <see cref="CompositionEffectBrush"/>
+    /// to the wrapper's lifetime — same rationale as <see cref="_litInnerBrushes"/>: the
+    /// texture cache only WeakReferences the surface brushes, so without a strong ref a GC
+    /// before the async surface load completes would leave a source unrendered.
+    /// </summary>
+    private static readonly ConditionalWeakTable<CompositionEffectBrush, object> _effectInnerBrushes = new();
+
+    /// <summary>
+    /// Caches the brush produced by <see cref="ObjMaterial.CustomBrushFactory"/>
+    /// for <see cref="BrushMapping.ScreenSpace"/> materials, keyed by the
+    /// material instance, so every face of that material shares ONE brush
+    /// (a screen-space brush has no per-face state, so sharing is both correct
+    /// and cheap — a single backdrop brush drives the whole die). PerFaceUv
+    /// custom brushes are NOT cached here: each face gets its own instance so
+    /// it can carry its own UV transform.
+    /// </summary>
+    private static readonly ConditionalWeakTable<ObjMaterial, CompositionBrush> _sharedCustomBrushes = new();
+
+    /// <summary>
+    /// Resolve a host-supplied custom brush for <paramref name="material"/>.
+    /// ScreenSpace materials share one cached brush across all faces; PerFaceUv
+    /// materials get a fresh instance per call (per face).
+    /// </summary>
+    private static CompositionBrush ResolveCustomBrush(Compositor compositor, ObjMaterial material)
+    {
+        if (material.Mapping == BrushMapping.ScreenSpace)
+        {
+            return _sharedCustomBrushes.GetValue(
+                material, m => m.CustomBrushFactory!(compositor));
+        }
+        return material.CustomBrushFactory!(compositor);
+    }
+
+
     public static void ClearTextures()
     {
         // Snapshot + clear so disposal happens without holding the dictionary lock.
@@ -303,6 +346,38 @@ internal static class MaterialResolver
         var fallback = quad.FallbackColor;
         CompositionBrush brush;
 
+        // Host-supplied effect graph: build a per-face CompositionEffectBrush whose named
+        // sampled sources are each bound per their MaterialLayer. Takes precedence over the
+        // single-brush paths — it can itself CONTAIN screen-projected / per-face sources.
+        if (material?.EffectGraph != null && material.EffectSources != null)
+        {
+            brush = BuildEffectBrush(compositor, quad, material);
+            if (material.DiffuseColor is { } eTint) fallback = eTint;
+            return new QuadBrushBinding(brush, fallback, material);
+        }
+
+        // Screen-projected surface: one CompositionSurfaceBrush per face over the
+        // host surface. Stretch=None so its TransformMatrix (installed later as a
+        // rotation-driven ExpressionAnimation by Combobulate) fully controls
+        // sampling. Takes precedence like the custom-brush path.
+        if (material?.Mapping == BrushMapping.ScreenProjected && material.ScreenProjectedSurface != null)
+        {
+            brush = CreateScreenProjectedBrush(compositor, material);
+            if (material.DiffuseColor is { } spTint) fallback = spTint;
+            return new QuadBrushBinding(brush, fallback, material);
+        }
+
+        // Host-supplied custom brush (e.g. a screen-space backdrop brush).
+        // Takes precedence over texture/color: the host owns the brush, we
+        // only sort/clip/transform the sprite. UV mapping is skipped for
+        // ScreenSpace (see UpdateBrushTransformForSprite).
+        if (material?.CustomBrushFactory != null)
+        {
+            brush = ResolveCustomBrush(compositor, material);
+            if (material.DiffuseColor is { } cbTint) fallback = cbTint;
+            return new QuadBrushBinding(brush, fallback, material);
+        }
+
         // Lit path: material has a NormalMap → wrap in SceneLightingEffect
         if (material?.NormalMap != null)
         {
@@ -338,6 +413,34 @@ internal static class MaterialResolver
         QuadBrushBinding existing)
     {
         var fallback = material.DiffuseColor ?? quad.FallbackColor;
+
+        // Host-supplied effect graph: the brush topology differs from every single-brush
+        // path, so rebuild from scratch (mirrors the lit path). The sprite-update loop
+        // reassigns sprite.Brush and re-installs the per-face transforms/expression.
+        if (material.EffectGraph != null && material.EffectSources != null)
+            return CreateBinding(compositor, quad, material);
+
+        // Screen-projected surface: rebuild if the existing brush isn't already a
+        // surface brush; otherwise repoint it at the (possibly new) surface. The
+        // per-face rotation expression is (re)installed by Combobulate, keyed off
+        // the sprite, so we only own the brush + its surface here.
+        if (material.Mapping == BrushMapping.ScreenProjected && material.ScreenProjectedSurface != null)
+        {
+            if (existing.Brush is CompositionSurfaceBrush spBrush)
+            {
+                spBrush.Surface = material.ScreenProjectedSurface;
+                return new QuadBrushBinding(spBrush, fallback, material);
+            }
+            return new QuadBrushBinding(CreateScreenProjectedBrush(compositor, material), fallback, material);
+        }
+
+        // Host-supplied custom brush: mirror CreateBinding. The shared-brush
+        // cache keeps all faces of a ScreenSpace material on one instance.
+        if (material.CustomBrushFactory != null)
+        {
+            var cbBrush = ResolveCustomBrush(compositor, material);
+            return new QuadBrushBinding(cbBrush, fallback, material);
+        }
 
         // Lit path: if material now has a NormalMap, always rebuild as a lit brush.
         // The effect brush structure differs from plain surface/color brushes,
@@ -480,6 +583,21 @@ internal static class MaterialResolver
             DisposeIfDisposable(oldSurface);
     }
 
+    private static CompositionSurfaceBrush CreateScreenProjectedBrush(Compositor compositor, ObjMaterial material)
+    {
+        var brush = compositor.CreateSurfaceBrush(material.ScreenProjectedSurface);
+        // Stretch=None: the per-face rotation ExpressionAnimation on TransformMatrix
+        // owns all scaling/placement of the surface content, so any built-in
+        // stretch would fight it. Alignment ratios are irrelevant with None.
+        brush.Stretch = CompositionStretch.None;
+        brush.HorizontalAlignmentRatio = 0;
+        brush.VerticalAlignmentRatio = 0;
+        // TransformMatrix is left at identity here; Combobulate installs the
+        // rotation-driven expression once the owning sprite exists.
+        brush.TransformMatrix = Matrix3x2.Identity;
+        return brush;
+    }
+
     private static void PointBrushesAt(TextureEntry entry, ICompositionSurface surface)
     {
         for (int i = entry.Brushes.Count - 1; i >= 0; i--)
@@ -518,6 +636,36 @@ internal static class MaterialResolver
     {
         if (brush == null) return;
         if (spriteSize.X <= 0f || spriteSize.Y <= 0f) return;
+        // Screen-space custom brushes (e.g. backdrop brushes) are never UV-
+        // mapped — their sampling is global/screen space by construction.
+        if (material?.CustomBrushFactory != null && material.Mapping == BrushMapping.ScreenSpace) return;
+
+        // Host-supplied effect graph: crop each PerFaceUv named source to this face's UV
+        // cell. ScreenProjected sources are expression-driven (installed by Combobulate)
+        // and ScreenSpace sources are global — both are skipped here.
+        if (material?.EffectGraph != null && material.EffectSources != null
+            && brush is CompositionEffectBrush effectSrcBrush)
+        {
+            foreach (var kv in material.EffectSources)
+            {
+                var layer = kv.Value;
+                if (layer.Mapping != BrushMapping.PerFaceUv) continue;
+                if (effectSrcBrush.GetSourceParameter(kv.Key) is not CompositionSurfaceBrush srcBrush) continue;
+                var m = isTriangle
+                    ? BrushTransformMath.BuildTriangleAffine(
+                        uv0, uv1, uv2, layer.UvScale, layer.UvOffset, spriteSize)
+                    : BrushTransformMath.BuildQuadAxisAlignedCrop(
+                        uv0, uv1, uv2, uv3, layer.UvScale, layer.UvOffset, spriteSize);
+                if (Matrix3x2.Invert(m, out var srcInv)) m = srcInv;
+                srcBrush.TransformMatrix = m;
+            }
+            return;
+        }
+
+        // Screen-projected surface brushes have their TransformMatrix driven by a
+        // per-face rotation ExpressionAnimation (installed by Combobulate) — the
+        // static UV crop must not overwrite it.
+        if (material?.Mapping == BrushMapping.ScreenProjected) return;
         // Only meaningful when the binding has a textured surface — the
         // matrix is a no-op on solid color brushes.
         if (material?.DiffuseTexture == null && material?.NormalMap == null) return;
@@ -708,5 +856,87 @@ internal static class MaterialResolver
             $"globals.{sourceProperty}");
         expr.SetReferenceParameter("globals", source);
         effectBrush.StartAnimation(effectProperty, expr);
+    }
+
+    // ── Host-supplied effect graph support (SetEffect) ───────────────────────
+
+    /// <summary>
+    /// Build one per-face <see cref="CompositionEffectBrush"/> for a material carrying a
+    /// host <see cref="ObjMaterial.EffectGraph"/>: create (or reuse) the material's cached
+    /// factory, then wire each named source per its <see cref="MaterialLayer"/>. PerFaceUv
+    /// sources get a fresh surface brush (UV crop applied later by
+    /// <see cref="UpdateBrushTransformForSprite"/>); ScreenProjected sources get a surface
+    /// brush whose transform Combobulate expression-drives per face; ScreenSpace sources
+    /// get the host brush directly.
+    /// </summary>
+    private static CompositionBrush BuildEffectBrush(
+        Compositor compositor, CachedQuad quad, ObjMaterial material)
+    {
+        var factory = _effectFactories.GetValue(material, m =>
+        {
+            var animatable = m.BoundEffectProperties is { Count: > 0 } bound
+                ? System.Linq.Enumerable.ToArray(bound)
+                : Array.Empty<string>();
+            return compositor.CreateEffectFactory(m.EffectGraph!, animatable);
+        });
+
+        var effectBrush = factory.CreateBrush();
+
+        // Pin every inner source brush to the wrapper's lifetime (see _effectInnerBrushes).
+        var inner = new List<CompositionBrush>();
+        foreach (var kv in material.EffectSources!)
+        {
+            var name = kv.Key;
+            var layer = kv.Value;
+            CompositionBrush src;
+            switch (layer.Mapping)
+            {
+                case BrushMapping.ScreenProjected:
+                    var psb = compositor.CreateSurfaceBrush(layer.ProjectedSurface);
+                    // Stretch=None: the per-face rotation expression owns all placement.
+                    psb.Stretch = CompositionStretch.None;
+                    psb.HorizontalAlignmentRatio = 0;
+                    psb.VerticalAlignmentRatio = 0;
+                    psb.TransformMatrix = Matrix3x2.Identity;
+                    src = psb;
+                    break;
+
+                case BrushMapping.ScreenSpace:
+                    // Host-owned brush (e.g. a backdrop); Combobulate never disposes it.
+                    src = layer.BrushFactory!(compositor);
+                    break;
+
+                default: // PerFaceUv
+                    var sb = compositor.CreateSurfaceBrush();
+                    sb.Stretch = CompositionStretch.Fill;
+                    sb.HorizontalAlignmentRatio = 0;
+                    sb.VerticalAlignmentRatio = 0;
+                    // UV crop applied by UpdateBrushTransformForSprite once the sprite size
+                    // is known; identity until then so it samples the whole atlas sanely.
+                    sb.TransformMatrix = Matrix3x2.Identity;
+                    if (layer.Texture != null)
+                        GetOrLoadSurface(compositor, layer.Texture, sb);
+                    src = sb;
+                    break;
+            }
+            effectBrush.SetSourceParameter(name, src);
+            inner.Add(src);
+        }
+        _effectInnerBrushes.Add(effectBrush, inner);
+
+        // Bind animatable effect scalars to the host's shared property set so a single
+        // host animation drives every face. Each bound name's last dotted segment is the
+        // property read from the shared set (e.g. "blur.BlurAmount" -> "BlurAmount").
+        if (material.SharedEffectProperties is { } shared && material.BoundEffectProperties is { } boundNames)
+        {
+            foreach (var prop in boundNames)
+            {
+                int dot = prop.LastIndexOf('.');
+                var sourceProp = dot >= 0 ? prop.Substring(dot + 1) : prop;
+                BindScalar(effectBrush, prop, shared, sourceProp);
+            }
+        }
+
+        return effectBrush;
     }
 }

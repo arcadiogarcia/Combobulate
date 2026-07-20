@@ -1064,6 +1064,12 @@ public sealed class Combobulate : Control
         if (_spritePool != null && ReferenceEquals(_spritePoolGeometry, geometry))
         {
             var cachedQuads = geometry.Quads;
+            // Screen-projected materials index a per-face property set for their
+            // rotation-driven brush transform; ensure the array exists (the full
+            // sprite-build loop allocates it on a geometry change, but this fast
+            // material-swap path can run first when a die is re-textured in place).
+            if (_screenProjProps == null || _screenProjProps.Length != _spritePool.Length)
+                _screenProjProps = new CompositionPropertySet?[_spritePool.Length];
             foreach (var quadIndex in changedQuads)
             {
                 if ((uint)quadIndex < (uint)_spritePool.Length && _spritePool[quadIndex] is { } sprite)
@@ -1085,6 +1091,13 @@ public sealed class Combobulate : Control
                         _spritePoolEuv0![quadIndex], _spritePoolEuv1![quadIndex],
                         _spritePoolEuv2![quadIndex], _spritePoolEuv3![quadIndex],
                         cachedQuads[quadIndex].IsTriangle, binding.Material, sprite.Size);
+
+                    // Screen-projected faces (plain surface OR a host-effect brush's
+                    // screen-projected source): (re)install the rotation-driven
+                    // TransformMatrix expression so the swapped-in surface samples this
+                    // face's on-screen position (UpdateBrushTransformForSprite no-ops for
+                    // that mapping, leaving the brush at identity otherwise).
+                    InstallScreenProjection(quadIndex, sprite, binding);
                 }
             }
             _spritePoolBindings = _materialSlotBindings;
@@ -1255,6 +1268,12 @@ public sealed class Combobulate : Control
     // toggles IsVisible and (when needed) sibling order.
     private SpriteVisual?[]? _spritePool;
     private bool[]? _lastVisible;
+    // Screen-projected face brushes (BrushMapping.ScreenProjected): one property
+    // set per face holding the live 2D screen affine "A" (extract2D(Ts*Root)*SS),
+    // referenced by the face brush's TransformMatrix inverse expression. Parallel
+    // to _spritePool; torn down in ClearSpritePool. Null entries for faces that
+    // don't use a screen-projected material.
+    private CompositionPropertySet?[]? _screenProjProps;
     // Anti-seam conservative outset (see FaceEdgeOutset): the UVs EXPANDED to
     // match each sprite grown by the outset pad, cached per sprite so the brush
     // TransformMatrix can be refreshed on a pack/theme change (which does not
@@ -1447,6 +1466,7 @@ public sealed class Combobulate : Control
             // (6 cube faces from the SpritePainter pool).
             _root.Children.RemoveAll();
             _spritePool = null;
+            _screenProjProps = null;
             _spritePoolGeometry = null;
             _lastVisible = null;
             _lastOrder = Array.Empty<int>();
@@ -1601,6 +1621,7 @@ public sealed class Combobulate : Control
         _bakedInstalledTransform = null;
         if (_root != null) _root.Children.RemoveAll();
         _spritePool = null;
+        _screenProjProps = null;
         _spritePoolGeometry = null;
         _lastVisible = null;
         _lastOrder = Array.Empty<int>();
@@ -2376,6 +2397,7 @@ public sealed class Combobulate : Control
             _spritePoolGeometry = geometry;
             _spritePool = new SpriteVisual?[geometry.Quads.Length];
             _lastVisible = new bool[geometry.Quads.Length];
+            _screenProjProps = new CompositionPropertySet?[geometry.Quads.Length];
             _spritePoolEuv0 = new Vector2[geometry.Quads.Length];
             _spritePoolEuv1 = new Vector2[geometry.Quads.Length];
             _spritePoolEuv2 = new Vector2[geometry.Quads.Length];
@@ -2528,6 +2550,13 @@ public sealed class Combobulate : Control
                     binding.Brush,
                     _spritePoolEuv0![i], _spritePoolEuv1![i], _spritePoolEuv2![i], _spritePoolEuv3![i],
                     cachedQuads[i].IsTriangle, binding.Material, sprite!.Size);
+
+                // Screen-projected faces: (re)install the rotation-driven
+                // TransformMatrix expression whenever the sprite transform (Ts)
+                // or brush changed. Handles both a plain screen-projected surface
+                // brush and a host-effect brush's screen-projected source(s).
+                // Cheap no-op for every other material.
+                InstallScreenProjection(i, sprite!, binding);
             }
         }
 
@@ -2807,8 +2836,148 @@ public sealed class Combobulate : Control
     }
 
 
+    /// <summary>
+    /// Installs (or re-installs) the per-face composition expression that drives a
+    /// <see cref="BrushMapping.ScreenProjected"/> face brush's
+    /// <c>TransformMatrix</c> so the face samples its host surface at the texel
+    /// sitting under it on screen — fully on the compositor thread, in lockstep
+    /// with the live rotation on <c>_root.TransformMatrix</c>.
+    ///
+    /// <para>Math (row-vector affine, ignoring the perspective divide): a face's
+    /// on-screen 2D affine is <c>M2d = extract2D(Ts · Root)</c> where <c>Ts</c> is
+    /// the sprite's constant bake transform and <c>Root</c> is the live rotation
+    /// matrix. The output→content ("sprite-pixel → texel") map is
+    /// <c>A = M2d · SS</c> (SS = host screen→texel), so the brush transform
+    /// (content→output) is <c>A⁻¹</c>. A shared per-face property set holds the
+    /// live <c>A</c>; the brush expression inverts it.</para>
+    /// </summary>
+    /// <summary>
+    /// Installs the screen-projection transform expression(s) for a face binding,
+    /// dispatching by brush kind:
+    /// <list type="bullet">
+    ///   <item>a plain <see cref="BrushMapping.ScreenProjected"/> surface brush drives the
+    ///   sprite's own brush;</item>
+    ///   <item>a host-effect <see cref="CompositionEffectBrush"/> drives each of its named
+    ///   <see cref="BrushMapping.ScreenProjected"/> source brushes.</item>
+    /// </list>
+    /// Cheap no-op for every other material.
+    /// </summary>
+    private void InstallScreenProjection(int index, SpriteVisual sprite, in QuadBrushBinding binding)
+    {
+        var material = binding.Material;
+        if (material == null) return;
+
+        // Host-effect material: drive each ScreenProjected-mapped named source's inner brush.
+        if (material.EffectGraph != null && material.EffectSources != null
+            && binding.Brush is CompositionEffectBrush effectBrush)
+        {
+            foreach (var kv in material.EffectSources)
+            {
+                var layer = kv.Value;
+                if (layer.Mapping != global::Combobulate.BrushMapping.ScreenProjected) continue;
+                if (effectBrush.GetSourceParameter(kv.Key) is CompositionSurfaceBrush innerBrush)
+                {
+                    EnsureScreenProjectedExpression(index, sprite, innerBrush,
+                        layer.ScreenToSurfaceSet, layer.ScreenToSurfaceProperty, layer.ScreenToSurface);
+                }
+            }
+            return;
+        }
+
+        if (material.Mapping == global::Combobulate.BrushMapping.ScreenProjected
+            && binding.Brush is CompositionSurfaceBrush spBrush)
+        {
+            EnsureScreenProjectedExpression(index, sprite, spBrush,
+                material.ScreenToSurfaceSet, material.ScreenToSurfaceProperty, material.ScreenToSurface);
+        }
+    }
+
+    private void EnsureScreenProjectedExpression(
+        int index, SpriteVisual sprite, CompositionSurfaceBrush brush,
+        CompositionPropertySet? ssSet, string? ssProp, Matrix3x2 ssConst)
+    {
+        if (_compositor == null || _root == null || _screenProjProps == null) return;
+
+        var ts = sprite.TransformMatrix; // constant per bake (face basis + origin)
+
+        var props = _screenProjProps[index];
+        if (props == null)
+        {
+            props = _compositor.CreatePropertySet();
+            props.InsertMatrix4x4("TsR", Matrix4x4.Identity);
+            props.InsertMatrix3x2("A", Matrix3x2.Identity);
+            _screenProjProps[index] = props;
+        }
+        else
+        {
+            props.StopAnimation("TsR");
+            props.StopAnimation("A");
+        }
+
+        // The composition expression language only allows subchannel access
+        // (._11 etc.) on a NAMED parameter/property, never on a parenthesised
+        // sub-expression like "(Ts*R.TransformMatrix)._11". So compute the live
+        // sprite-local → screen matrix product into its own Matrix4x4 property
+        // first, then read that property's subchannels in the next stage.
+        var tsrExpr = _compositor.CreateExpressionAnimation("Ts * R.TransformMatrix");
+        tsrExpr.SetMatrix4x4Parameter("Ts", ts);
+        tsrExpr.SetReferenceParameter("R", _root);
+        props.StartAnimation("TsR", tsrExpr);
+
+        // A = extract2D(TsR) * SS  (row-vector: sprite-local → screen → texel).
+        // extract2D keeps the 2D linear part (rows/cols 1-2) and the row-4
+        // translation, dropping perspective/z. SS is either a constant supplied at
+        // apply time, or -- when the host wants the sampled region to track the die's
+        // LIVE screen position (window moves, on-mat slides) without re-baking -- a
+        // Matrix3x2 property the host animates on its own property set, referenced here
+        // so the whole map stays on the compositor thread.
+        const string aHead =
+            "Matrix3x2(P.TsR._11, P.TsR._12, P.TsR._21, P.TsR._22, " +
+            "P.TsR._41, P.TsR._42) * ";
+        CompositionAnimation aExpr;
+        if (ssSet is { } ssSetRef &&
+            !string.IsNullOrEmpty(ssProp))
+        {
+            aExpr = _compositor.CreateExpressionAnimation(aHead + "S." + ssProp);
+            aExpr.SetReferenceParameter("P", props);
+            aExpr.SetReferenceParameter("S", ssSetRef);
+        }
+        else
+        {
+            aExpr = _compositor.CreateExpressionAnimation(aHead + "SS");
+            aExpr.SetReferenceParameter("P", props);
+            aExpr.SetMatrix3x2Parameter("SS", ssConst);
+        }
+        props.StartAnimation("A", aExpr);
+
+        // brush.TransformMatrix = Invert(A). D = det(A); components per
+        // System.Numerics.Matrix3x2.Invert. Referencing props.A keeps the die
+        // rotation and the sampled wallpaper in perfect lockstep on the GPU.
+        const string d = "(P.A._11*P.A._22 - P.A._12*P.A._21)";
+        var bExpr = _compositor.CreateExpressionAnimation(
+            "Matrix3x2(" +
+            $"P.A._22/{d}," +
+            $"-P.A._12/{d}," +
+            $"-P.A._21/{d}," +
+            $"P.A._11/{d}," +
+            $"(P.A._21*P.A._32 - P.A._31*P.A._22)/{d}," +
+            $"(P.A._31*P.A._12 - P.A._11*P.A._32)/{d})");
+        bExpr.SetReferenceParameter("P", props);
+        brush.StopAnimation("TransformMatrix");
+        brush.StartAnimation("TransformMatrix", bExpr);
+    }
+
     private void ClearSpritePool()
     {
+        if (_screenProjProps != null)
+        {
+            for (int i = 0; i < _screenProjProps.Length; i++)
+            {
+                _screenProjProps[i]?.Dispose();
+                _screenProjProps[i] = null;
+            }
+            _screenProjProps = null;
+        }
         if (_spritePool != null)
         {
             if (_root != null) _root.Children.RemoveAll();
