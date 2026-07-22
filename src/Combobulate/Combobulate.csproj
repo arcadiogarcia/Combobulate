@@ -125,9 +125,11 @@
     <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="BrushMapping.cs" />
     <Compile Include="Combobulate.cs" />
     <Compile Include="CombobulateSceneVisual.cs" />
     <Compile Include="GlobalUsings.cs" />
+    <Compile Include="MaterialLayer.cs" />
     <Compile Include="MaterialMode.cs" />
     <Compile Include="MaterialSlotController.cs" />
     <Compile Include="Caching\BrushTransformMath.cs" />
