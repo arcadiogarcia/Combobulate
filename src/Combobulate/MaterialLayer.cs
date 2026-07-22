@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using Combobulate.Caching;
+using Windows.UI;
 
 #if WINAPPSDK
 using Microsoft.UI.Composition;
@@ -129,4 +130,35 @@ public sealed class MaterialLayer
             BrushFactory = brushFactory,
         };
     }
+
+    /// <summary>
+    /// A whole host surface sampled identically on every face (no per-face UV crop,
+    /// no screen projection) — e.g. a flat tangent-space normal map or a shared
+    /// relief surface feeding a host lighting graph. Thin sugar over
+    /// <see cref="ScreenSpace"/>: creates one <c>CompositionSurfaceBrush</c> with the
+    /// given <paramref name="stretch"/>, centred, shared across faces. Combobulate
+    /// does not dispose <paramref name="surface"/>.
+    /// </summary>
+    public static MaterialLayer Surface(ICompositionSurface surface, CompositionStretch stretch = CompositionStretch.Fill)
+    {
+        if (surface == null) throw new ArgumentNullException(nameof(surface));
+        return ScreenSpace(c =>
+        {
+            var brush = c.CreateSurfaceBrush(surface);
+            brush.Stretch = stretch;
+            brush.HorizontalAlignmentRatio = 0.5f;
+            brush.VerticalAlignmentRatio = 0.5f;
+            return brush;
+        });
+    }
+
+    /// <summary>
+    /// A constant solid colour sampled identically on every face — e.g. a flat
+    /// <c>(128,128,255)</c> normal (Z-up) or a solid diffuse tint feeding a host
+    /// lighting/effect graph. Thin sugar over <see cref="ScreenSpace"/> that creates a
+    /// <c>CompositionColorBrush</c>; works identically on the lifted and system
+    /// compositors (no surface/decode needed).
+    /// </summary>
+    public static MaterialLayer Color(Color color)
+        => ScreenSpace(c => c.CreateColorBrush(color));
 }

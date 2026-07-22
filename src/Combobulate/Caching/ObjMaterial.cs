@@ -32,12 +32,18 @@ public sealed class ObjMaterial
     /// illumination. When null (default), the face uses a flat brush with no
     /// lighting overhead.
     /// </summary>
+    [Obsolete("The built-in lit path is deprecated. Build your own lighting graph " +
+        "(e.g. ArithmeticCompositeEffect(diffuse × SceneLightingEffect(normal))) and pass " +
+        "it to MaterialSlotController.SetEffect instead. See docs/migration-lit-to-effect.md.")]
     public ICompositionSurface? NormalMap { get; init; }
 
     /// <summary>
     /// Per-material lighting coefficients. When null, the face uses
     /// <see cref="LightingDefaults"/> (process-wide shared values).
     /// </summary>
+    [Obsolete("The built-in lit path is deprecated. Drive lighting scalars via " +
+        "ObjMaterial.SharedEffectProperties / BoundEffectProperties on a host SetEffect graph " +
+        "instead. See docs/migration-lit-to-effect.md.")]
     public LightingParams? Lighting { get; init; }
 
     /// <summary>

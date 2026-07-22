@@ -15,6 +15,9 @@ namespace Combobulate.Caching;
 /// <para>Lazily initialized on the first lit material resolve — apps that
 /// never set <see cref="ObjMaterial.NormalMap"/> pay zero cost.</para>
 /// </summary>
+[Obsolete("The built-in lit path is deprecated. Own the lighting property set in the host " +
+    "app and bind it via ObjMaterial.SharedEffectProperties / BoundEffectProperties on a " +
+    "SetEffect graph. See docs/migration-lit-to-effect.md.")]
 public static class LightingDefaults
 {
     private static CompositionPropertySet? _props;

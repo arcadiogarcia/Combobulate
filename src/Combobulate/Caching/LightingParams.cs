@@ -4,6 +4,8 @@ namespace Combobulate.Caching;
 /// Per-material lighting coefficients for <c>SceneLightingEffect</c>.
 /// All values are optional; nulls fall through to <see cref="LightingDefaults"/>.
 /// </summary>
+[Obsolete("The built-in lit path is deprecated. Express per-material lighting coefficients " +
+    "in the host effect graph passed to MaterialSlotController.SetEffect. See docs/migration-lit-to-effect.md.")]
 public sealed class LightingParams
 {
     /// <summary>Ambient light contribution [0..1]. Default via <see cref="LightingDefaults"/>: 0.6.</summary>

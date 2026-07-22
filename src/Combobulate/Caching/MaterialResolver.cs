@@ -17,6 +17,12 @@ using Windows.UI.Composition;
 using Windows.UI.Composition.Effects;
 #endif
 
+// The built-in lit path (ObjMaterial.NormalMap / Lighting, LightingDefaults,
+// LightingParams) is deprecated in favour of the host-supplied SetEffect graph.
+// It is kept functional for existing consumers during the deprecation window, so
+// this file legitimately references those [Obsolete] members internally.
+#pragma warning disable CS0618
+
 namespace Combobulate.Caching;
 
 /// <summary>Per-quad brush + fallback colour binding produced by <see cref="MaterialResolver"/>.</summary>
